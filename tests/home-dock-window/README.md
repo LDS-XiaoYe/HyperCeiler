@@ -1,5 +1,9 @@
 # HyperOS 4 Dock window regression checks
 
+Current native implementation: [v8 dynamic resolution and verification](NATIVE_DYNAMIC_RESOLUTION.md).
+The probe/v7 sections below are historical investigation notes; their address
+profiles and opt-in probe have been removed and are not used by current builds.
+
 The September 4 device log shows `Loaded HyperOS Runtime native module` for
 HyperCeiler, but no launcher Java hook entry. An `Activity.onCreate` hook cannot
 create the Dock view in this dex-free launcher. `HomeDockWindow` instead runs in
@@ -26,16 +30,16 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
-  tests/home-dock-window/DockWallpaperEndpointTest.java
-java -cp "$dock_test_dir" DockWindowPolicyTest
-java -cp "$dock_test_dir" DockGlassPresetTest
-java -cp "$dock_test_dir" DockRecentsMotionTest
-java -cp "$dock_test_dir" DockGlassRetryPolicyTest
-java -cp "$dock_test_dir" DockWallpaperEndpointTest
+  tests/home-dock-window/DockWallpaperEndpointTest.java \
+  tests/home-dock-window/DockNativeMotionTest.java
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockWallpaperEndpoint DockNativeMotion; do
+  java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
+done
 ```
 
 ## Required device verification (not covered by host tests)
