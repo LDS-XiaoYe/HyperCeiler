@@ -55,7 +55,6 @@ dock_motion_scale_entry:
     b.ne .Lscale_done
     layout 16, DOCK_DOUBLE_VALUE_OFFSET
     ldr x10, [x2, x16]
-    and x10, x10, #-4
     adrp x17, dock_motion_value
     add x17, x17, :lo12:dock_motion_value
 .Lscale_retry:
