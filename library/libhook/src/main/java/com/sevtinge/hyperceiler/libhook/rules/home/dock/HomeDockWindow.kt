@@ -32,6 +32,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class HomeDockWindow : BaseHook() {
     private companion object {
         const val LOG_TAG = "system"
+        const val METHOD_CLOSE = "close"
+        const val METHOD_RELEASE = "release"
         const val WM_HANDLER = "mH"
         const val WM_LOCK = "mGlobalLock"
         const val IS_VALID = "isValid"
@@ -59,7 +61,7 @@ class HomeDockWindow : BaseHook() {
                     transaction.callMethod("apply")
                 }
             } finally {
-                try { transaction.callMethod("close") } finally { surface.callMethod("release") }
+                try { transaction.callMethod(METHOD_CLOSE) } finally { surface.callMethod(METHOD_RELEASE) }
             }
         }
 

@@ -6,9 +6,12 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <stdexcept>
 
 template<class T> T read(const std::vector<char> &bytes, size_t offset) {
-    assert(offset <= bytes.size() && sizeof(T) <= bytes.size() - offset);
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) {
+        throw std::out_of_range("read: offset out of range");
+    }
     T result;
     std::memcpy(&result, bytes.data() + offset, sizeof(result));
     return result;

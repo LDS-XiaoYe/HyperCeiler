@@ -176,7 +176,11 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             changed()
             // Parent first, then wait for the vendor background texture, not just a drawn buffer.
             checkBackground(ticket, 0, generation)
-        } catch (error: Exception) {
+        } catch (error: IllegalStateException) {
+            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+        } catch (error: RemoteException) {
+            recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
+        } catch (error: SecurityException) {
             recover(ticket, "create ${error.javaClass.simpleName}: ${error.message?.take(160)}")
         }
     }
@@ -251,9 +255,11 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         try {
             val lease = ticket.lease
             if (lease != null) lease.close() else ticket.parcel?.release()
-        } catch (error: RuntimeException) {
+        } catch (error: IllegalStateException) {
             // Keep the last handle and do not create another host until cleanup
             // succeeds. Recovery's bounded backoff retries this same retirement.
+            record("glass detach failed id=${ticket.id}: ${error.javaClass.simpleName}")
+        } catch (error: SecurityException) {
             record("glass detach failed id=${ticket.id}: ${error.javaClass.simpleName}")
             return false
         }
