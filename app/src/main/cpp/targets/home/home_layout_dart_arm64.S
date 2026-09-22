@@ -145,6 +145,80 @@ HC_LAYOUT_KNOBS(HC_ASM_KNOB)
 #undef HC_ASM_KNOB
 
 /*
+ * Dart consumer of the Rust-owned ratio: the shared `getAnimDurationRatio` entry when it binds,
+ * else the flight-only `FlightCohort.animDurationRatio` (see bind_animation_consumer). The
+ * original Dart function still runs, including its object and state checks; the enabled path
+ * replaces only the returned double. A Dart boundary is used because the LSPosed backend on
+ * launcher 7719 refuses the Rust owner's SIMD-save prologue, while it already handles these
+ * ordinary Dart prologues for the working geometry hooks above.
+ */
+.globl hc_layout_animation_ratio_entry
+.p2align 4
+hc_layout_animation_ratio_entry:
+    dart_save
+    adrp x9, hc_layout_animation_ratio_hits
+    add x9, x9, :lo12:hc_layout_animation_ratio_hits
+    ldr x10, [x9]
+    add x10, x10, #1
+    str x10, [x9]
+    stp x30, xzr, [x15, #-16]!
+    adrp x9, hc_layout_animation_ratio_original
+    add x9, x9, :lo12:hc_layout_animation_ratio_original
+    ldr x9, [x9]
+    blr x9
+    ldp x30, xzr, [x15], #16
+    adrp x9, hc_layout_animation_ratio_original_bits
+    add x9, x9, :lo12:hc_layout_animation_ratio_original_bits
+    str d0, [x9]
+    adrp x9, hc_layout_animation_ratio_enabled
+    add x9, x9, :lo12:hc_layout_animation_ratio_enabled
+    ldar w10, [x9]
+    cbz w10, 1f
+    adrp x9, hc_layout_animation_ratio_bits
+    add x9, x9, :lo12:hc_layout_animation_ratio_bits
+    ldr d0, [x9]
+1:
+    dart_restore
+    ret
+
+/*
+ * The gear-derived duration factor (`Utilities.getDefaultGestureAnimMagicSpeed`). Measured on
+ * device: the app open/close window springs scale 1:1 with this value (gear 0/1/2 => 1.0/0.86/0.75
+ * and the close band moved 0.609s => 0.463s), while `getAnimDurationRatio` does not reach the
+ * window transition at all. Same replacement semantics as the ratio stub above - both are
+ * "1.0 = nominal duration" scales - but a fully independent enable gate, duration value, original
+ * slot and hit counter: open/close and recents are separate product controls.
+ */
+.globl hc_layout_magic_entry
+.p2align 4
+hc_layout_magic_entry:
+    dart_save
+    adrp x9, hc_layout_magic_hits
+    add x9, x9, :lo12:hc_layout_magic_hits
+    ldr x10, [x9]
+    add x10, x10, #1
+    str x10, [x9]
+    stp x30, xzr, [x15, #-16]!
+    adrp x9, hc_layout_magic_original
+    add x9, x9, :lo12:hc_layout_magic_original
+    ldr x9, [x9]
+    blr x9
+    ldp x30, xzr, [x15], #16
+    adrp x9, hc_layout_magic_original_bits
+    add x9, x9, :lo12:hc_layout_magic_original_bits
+    str d0, [x9]
+    adrp x9, hc_layout_magic_enabled
+    add x9, x9, :lo12:hc_layout_magic_enabled
+    ldar w10, [x9]
+    cbz w10, 1f
+    adrp x9, hc_layout_magic_bits
+    add x9, x9, :lo12:hc_layout_magic_bits
+    ldr d0, [x9]
+1:
+    dart_restore
+    ret
+
+/*
  * Minimal pass-through stub, used to separate "my instrumentation is wrong" from "the inline hook
  * itself cannot be trusted here". It saves exactly the registers the Dart ABI requires a callee to
  * preserve, calls the original, and returns whatever it returned - nothing else, no counter, no

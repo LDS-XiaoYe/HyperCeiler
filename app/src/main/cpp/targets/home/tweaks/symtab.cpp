@@ -73,6 +73,28 @@ const TargetFunction kTargets[] = {
          "布局 搜索框底部边距"},
         {"GridController.searchBarWidthPx", "GridController.searchBarWidthPx", "布局 搜索框宽度"},
         /*
+         * The app-open duration ratio has two Dart boundaries. `getAnimDurationRatio` is the shared
+         * entry every consumer funnels through (flight, Folme spring, blur, wallpaper), so replacing
+         * its result keeps the whole app-open move in step; `FlightCohort.animDurationRatio` only
+         * feeds the icon flight and is kept as the fallback because it is the boundary already
+         * proven to bind on launcher 7719. The hook tries them in this order.
+         */
+        {"getAnimDurationRatio", "getAnimDurationRatio", "动画 时长倍率统一入口"},
+        {"FlightCohort.animDurationRatio", "FlightCohort.animDurationRatio",
+         "动画 应用打开时长倍率"},
+        /*
+         * The gear-derived speed factor of the launcher's own animation-rate setting
+         * (`miui_home_animation_rate`). Measured on device: app open/close transitions respond to
+         * the official gear (~1.27x between the slowest and fastest) but do not respond to
+         * `getAnimDurationRatio`, because `TaskFlightAnimationDriver._calculateResponse` takes both
+         * inputs and the flight/spring families weight this one. `Utilities
+         * .getDefaultGestureAnimMagicSpeed` is also read by `SpringParamsProvider
+         * .generateSpringBundlesByAnimType`, `_TaskWidgetState._enterSpringDescription` and the
+         * shortcut-menu parameter update, so it is the shared lever for open/close and recents feel.
+         */
+        {"Utilities.getDefaultGestureAnimMagicSpeed", "Utilities.getDefaultGestureAnimMagicSpeed",
+         "动画 手势动画速率因子"},
+        /*
          * Candidate accessors for calibration. The debug probe can point a knob at any of these by
          * name, so the layout geometry can be re-calibrated on a new launcher build without a code
          * change; only the eight above ship as wired knobs. Resolving a name costs one comparison in
@@ -95,6 +117,8 @@ const TargetFunction kTargets[] = {
         {"GridController.iconTopPadding", "GridController.iconTopPadding", "候选 图标上内边距"},
         {"GridController.titleHeight", "GridController.titleHeight", "候选 标题高度"},
         {"GridController.folderCellHeight", "GridController.folderCellHeight", "候选 文件夹格高"},
+        {"FolderGridViewGetxController.folderCellHeight",
+         "FolderGridViewGetxController.folderCellHeight", "文件夹行间距"},
         {"GridController.folderCellWidth", "GridController.folderCellWidth", "候选 文件夹格宽"},
         {"GridController.screenMarginBottom", "GridController.screenMarginBottom",
          "候选 屏幕下边距"},

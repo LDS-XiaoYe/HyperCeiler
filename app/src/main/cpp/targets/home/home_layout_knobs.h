@@ -35,7 +35,7 @@
  */
 #define HC_LAYOUT_KNOBS(X)                                                                       \
     X(HotseatMargin, HotseatMargin, "GridController.hotSeatsMarginBottom", 70, 0, 150)           \
-    X(HotseatHeight, HotseatHeight, "HotSeatsConstants2.hotSeatsHeight", 80, 60, 150)            \
+    X(FolderRowSpacing, FolderRowSpacing, "FolderGridViewGetxController.folderCellHeight", 0, 0, 100) \
     X(WorkspaceTop, WorkspaceTop, "GridSizeCalRules.stableWorkspaceCellPaddingTop", 30, 0, 150)   \
     X(WorkspaceBottom, WorkspaceBottom, "GridController.workspaceCellPaddingBottom", 120, 0, 240) \
     X(WorkspaceSide, WorkspaceSide, "GridController.workspaceCellPaddingSide", 20, 0, 100)        \

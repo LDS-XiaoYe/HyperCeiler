@@ -35,6 +35,13 @@ struct TweaksConfig {
     int icon_scale_code = 0x66;
     bool recents_hide_clear = false;
     bool recents_no_clear = false;
+    /* Two fully independent animation families, each with its own gate and duration ratio
+     * (30..200 percent, 100 = identity): open feeds the gear-derived launcher speed factor
+     * (app open/close), recents feeds the Rust ratio (recents, gestures, blur, wallpaper). */
+    bool animation_open_enabled = false;
+    int animation_open_rate_percent = 100;
+    bool animation_recents_enabled = false;
+    int animation_recents_rate_percent = 100;
 };
 
 inline bool operator==(const TweaksConfig &a, const TweaksConfig &b) {
@@ -45,7 +52,11 @@ inline bool operator==(const TweaksConfig &a, const TweaksConfig &b) {
         && a.icon_scale_enabled == b.icon_scale_enabled
         && a.icon_scale_code == b.icon_scale_code
         && a.recents_hide_clear == b.recents_hide_clear
-        && a.recents_no_clear == b.recents_no_clear;
+        && a.recents_no_clear == b.recents_no_clear
+        && a.animation_open_enabled == b.animation_open_enabled
+        && a.animation_open_rate_percent == b.animation_open_rate_percent
+        && a.animation_recents_enabled == b.animation_recents_enabled
+        && a.animation_recents_rate_percent == b.animation_recents_rate_percent;
 }
 
 struct Config {

@@ -30,9 +30,16 @@ public final class HomeLayoutNativeEndpointOS4Test {
         rows.put("prefs_key_home_layout_workspace_padding_top", 60);
         rows.put("prefs_key_home_layout_hotseats_margin_bottom_enable", 1);
         rows.put("prefs_key_home_layout_hotseats_margin_bottom", 0);
+        rows.put("prefs_key_home_folder_vertical_spacing_enable", 1);
+        rows.put("prefs_key_home_folder_vertical_spacing", 12);
+        rows.put("prefs_key_home_folder_columns", 5);
         rows.put("prefs_key_home_layout_searchbar_width_enable", 1);
         // 430 is outside the page's 0..400 range, so it must fall back to the neutral default.
         rows.put("prefs_key_home_layout_searchbar_width", 430);
+        rows.put("prefs_key_home_animation_open_rate_enable", 1);
+        rows.put("prefs_key_home_animation_open_rate", 65);
+        rows.put("prefs_key_home_animation_recents_enable", 1);
+        rows.put("prefs_key_home_animation_recents_rate", 40);
         ContentResolver.setRows(rows);
 
         HomeLayoutNativeEndpointOS4.refreshFromProvider();
@@ -47,13 +54,45 @@ public final class HomeLayoutNativeEndpointOS4Test {
         // index 0 = hotseat margin: (0 - 70) * 2.75 = -192.5 -> Math.round rounds toward +inf
         check(snapshot.knobEnabled()[0] == 1);
         check(snapshot.knobDeltaPx()[0] == -192);
+        // index 1 = folder row spacing: 12 dp is an additive value, so 12 * 2.75 = 33 px
+        check(snapshot.knobEnabled()[1] == 1);
+        check(snapshot.knobDeltaPx()[1] == 33);
         // index 7 = search bar width: out of range -> default -> neutral
         check(snapshot.knobEnabled()[7] == 1);
         check(snapshot.knobDeltaPx()[7] == 0);
         // Plus the tweaks run the provider also carries.
         check(snapshot.tweaks().length == HomeLayoutNativeEndpointOS4.TWEAK_COUNT);
-        check(snapshot.tweaks()[0] == 3); // folder columns default
-        check(snapshot.tweaks()[8] == 0x70); // 100% icon scale
+        check(snapshot.tweaks()[0] == 5);
+        check(snapshot.tweaks()[1] == 1); // a non-default count enables the native patch
+        check(snapshot.tweaks()[8] == 0x66); // level 70, the page's system-default icon scale
+        check(snapshot.tweaks()[12] == 1);
+        check(snapshot.tweaks()[13] == 65);
+        check(snapshot.tweaks()[14] == 1);
+        check(snapshot.tweaks()[15] == 40);
+
+        final java.util.Map<String, Integer> defaults = new java.util.HashMap<>();
+        defaults.put("prefs_key_home_folder_columns", 3);
+        ContentResolver.setRows(defaults);
+        HomeLayoutNativeEndpointOS4.refreshFromProvider();
+        final HomeLayoutNativeEndpointOS4.Snapshot neutral =
+            HomeLayoutNativeEndpointOS4.readPreferences();
+        check(neutral.tweaks()[0] == 3);
+        check(neutral.tweaks()[1] == 0); // default keeps the launcher untouched
+
+        // Out-of-range rates clamp into the page's 30..200 window: the page itself refuses lower
+        // values, and a stale schema must not silently revert a "fast" choice to identity.
+        final java.util.Map<String, Integer> wild = new java.util.HashMap<>();
+        wild.put("prefs_key_home_folder_columns", 0);
+        wild.put("prefs_key_home_animation_open_rate", 5);
+        wild.put("prefs_key_home_animation_recents_rate", 500);
+        ContentResolver.setRows(wild);
+        HomeLayoutNativeEndpointOS4.refreshFromProvider();
+        final HomeLayoutNativeEndpointOS4.Snapshot tame =
+            HomeLayoutNativeEndpointOS4.readPreferences();
+        check(tame.tweaks()[0] == 3);
+        check(tame.tweaks()[1] == 0);
+        check(tame.tweaks()[13] == 30);
+        check(tame.tweaks()[15] == 200);
         ContentResolver.setRows(null);
     }
 
@@ -68,9 +107,9 @@ public final class HomeLayoutNativeEndpointOS4Test {
         return new HomeLayoutNativeEndpointOS4.Snapshot(0, 1, 5, 7, enabled, deltas, tweaksOk());
     }
 
-    /** A tweaks run that is inside every range: folder 5/on, pad 8/5, fold 8/5, icon, no flags. */
+    /** A tweaks run that is inside every range: folder 5/on, pad 8/5, fold 8/5, icon, animation. */
     private static int[] tweaksOk() {
-        return new int[]{5, 1, 8, 5, 0, 8, 5, 0, 0x70, 0, 0, 0};
+        return new int[]{5, 1, 8, 5, 0, 8, 5, 0, 0x70, 0, 0, 0, 0, 100, 0, 100};
     }
 
     private static void checkTransactionBoundary() {
@@ -117,7 +156,7 @@ public final class HomeLayoutNativeEndpointOS4Test {
                 tweaksOk()));
         check(cell.receive(new Parcel(DESCRIPTOR), 0).gridEnabled() == 0);
 
-        // Protocol v3: a short or out-of-range tweaks run must be refused as a whole, because a
+        // A short or out-of-range tweaks run must be refused as a whole, because a
         // partially applied snapshot would patch the launcher with values nobody chose.
         final HomeLayoutNativeEndpointOS4 badTweaks = new HomeLayoutNativeEndpointOS4(
             (uid, pid) -> true,
@@ -132,6 +171,14 @@ public final class HomeLayoutNativeEndpointOS4Test {
             () -> new HomeLayoutNativeEndpointOS4.Snapshot(0, 0, 4, 6, new int[count],
                 new int[count], wildFolder));
         check(badFolder.receive(new Parcel(DESCRIPTOR), 0).gridEnabled() == 0);
+
+        final int[] wildAnimation = tweaksOk();
+        wildAnimation[15] = 201;
+        final HomeLayoutNativeEndpointOS4 badAnimation = new HomeLayoutNativeEndpointOS4(
+            (uid, pid) -> true,
+            () -> new HomeLayoutNativeEndpointOS4.Snapshot(0, 0, 4, 6, new int[count],
+                new int[count], wildAnimation));
+        check(badAnimation.receive(new Parcel(DESCRIPTOR), 0).gridEnabled() == 0);
 
         boolean descriptorRejected = false;
         try {

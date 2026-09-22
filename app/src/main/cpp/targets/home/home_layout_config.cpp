@@ -33,7 +33,7 @@ constexpr char kDescriptor[] = "android.view.IWindowManager";
  *   debug.hyperceiler.layout.override = 1
  *   debug.hyperceiler.layout.grid     = <enabled>,<cellX>,<cellY>
  *   debug.hyperceiler.layout.knobs    = <enabled>:<deltaPx>,...   (HC_LAYOUT_KNOBS order)
- *   debug.hyperceiler.layout.tweaks   = <12 ints, protocol v3 order>
+ *   debug.hyperceiler.layout.tweaks   = <16 ints, protocol order>
  *
  * A malformed or missing property is ignored field by field, never fatal. This is a build-time
  * constant-free diagnostics path: it cannot change behaviour unless the property is set, so a
@@ -77,10 +77,10 @@ void apply_knob_override(Config &config) {
 void apply_tweaks_override(Config &config) {
     const std::string_view text = property_text("debug.hyperceiler.layout.tweaks");
     if (text.empty()) return;
-    int values[12] = {};
+    int values[16] = {};
     size_t cursor = 0;
     size_t count = 0;
-    while (count < 12 && cursor <= text.size()) {
+    while (count < 16 && cursor <= text.size()) {
         const size_t comma = text.find(',', cursor);
         const std::string_view entry = text.substr(cursor,
             comma == std::string_view::npos ? std::string_view::npos : comma - cursor);
@@ -91,13 +91,14 @@ void apply_tweaks_override(Config &config) {
         if (comma == std::string_view::npos) break;
         cursor = comma + 1;
     }
-    if (count != 12) return;
+    if (count != 16) return;
     config.tweaks = TweaksConfig{
         values[1] != 0, values[0],
         values[4] != 0, values[2], values[3],
         values[7] != 0, values[5], values[6],
         values[9] != 0, values[8],
-        values[10] != 0, values[11] != 0};
+        values[10] != 0, values[11] != 0,
+        values[12] != 0, values[13], values[14] != 0, values[15]};
 }
 
 void apply_debug_override(Config &config) {
@@ -154,7 +155,7 @@ const AIBinder_Class *window_class() {
  * are the minority.
  */
 constexpr char kCacheMagic[4] = {'H', 'C', 'L', 'C'};
-constexpr uint32_t kCacheVersion = 1;
+constexpr uint32_t kCacheVersion = 4;
 constexpr const char *kCachePath = "/data/user/0/com.miui.home/files/layout_config_cache.bin";
 constexpr const char *kCacheTmpPath = "/data/user/0/com.miui.home/files/layout_config_cache.bin.tmp";
 
@@ -187,10 +188,14 @@ void serialize_config(const Config &config, std::vector<uint8_t> &out) {
     put_u32(static_cast<uint32_t>(config.tweaks.icon_scale_code));
     put_u32(config.tweaks.recents_hide_clear ? 1 : 0);
     put_u32(config.tweaks.recents_no_clear ? 1 : 0);
+    put_u32(config.tweaks.animation_open_enabled ? 1 : 0);
+    put_u32(static_cast<uint32_t>(config.tweaks.animation_open_rate_percent));
+    put_u32(config.tweaks.animation_recents_enabled ? 1 : 0);
+    put_u32(static_cast<uint32_t>(config.tweaks.animation_recents_rate_percent));
 }
 
 bool parse_config(const std::vector<uint8_t> &data, Config &config) {
-    if (data.size() < 4 + 4 + 4 + 4 + 4 + 8 * 8 + 12 * 4) return false;
+    if (data.size() < 4 + 4 + 4 + 4 + 4 + 8 * 8 + 16 * 4) return false;
     if (std::memcmp(data.data(), kCacheMagic, 4) != 0) return false;
     uint32_t version = 0;
     std::memcpy(&version, data.data() + 4, 4);
@@ -222,12 +227,17 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
     const auto flm = get_u32();       const auto fln = get_u32();
     const auto ie = get_u32();        const auto ic = get_u32();
     const auto rh = get_u32();        const auto rn = get_u32();
-    if (!fe || !fc || !pe || !pm || !pn || !fle || !flm || !fln || !ie || !ic || !rh || !rn)
+    const auto oe = get_u32();        const auto op = get_u32();
+    const auto re = get_u32();        const auto rr = get_u32();
+    if (!fe || !fc || !pe || !pm || !pn || !fle || !flm || !fln || !ie || !ic || !rh || !rn
+        || !oe || !op || !re || !rr || *oe > 1 || *re > 1
+        || *op < 30 || *op > 200 || *rr < 30 || *rr > 200)
         return false;
     config.tweaks = TweaksConfig{*fe != 0, static_cast<int>(*fc), *pe != 0,
         static_cast<int>(*pm), static_cast<int>(*pn), *fle != 0,
         static_cast<int>(*flm), static_cast<int>(*fln), *ie != 0,
-        static_cast<int>(*ic), *rh != 0, *rn != 0};
+        static_cast<int>(*ic), *rh != 0, *rn != 0,
+        *oe != 0, static_cast<int>(*op), *re != 0, static_cast<int>(*rr)};
     return true;
 }
 
@@ -325,11 +335,11 @@ static bool query_binder(Config &result) {
         candidate.knobs[static_cast<size_t>(index)] = KnobConfig{enabled != 0, delta_px};
     }
     /*
-     * Protocol v3 appends the code-patch features as a fixed run of values. A fixed order is used
+     * The protocol appends the code-patch features as a fixed run of values. A fixed order is used
      * rather than a key/value list so every field has a range that can be checked here: a value
      * outside its range is refused outright instead of being applied to the launcher.
      */
-    int32_t tweaks[12] = {};
+    int32_t tweaks[16] = {};
     for (int32_t &value : tweaks) {
         if (!valid || AParcel_readInt32(output, &value) != STATUS_OK) {
             valid = false;
@@ -344,7 +354,9 @@ static bool query_binder(Config &result) {
         && flag(tweaks[4]) && within(tweaks[2], 2, 16) && within(tweaks[3], 2, 16)
         && flag(tweaks[7]) && within(tweaks[5], 2, 16) && within(tweaks[6], 2, 16)
         && flag(tweaks[9]) && within(tweaks[8], 0, 0xFF)
-        && flag(tweaks[10]) && flag(tweaks[11]);
+        && flag(tweaks[10]) && flag(tweaks[11])
+        && flag(tweaks[12]) && within(tweaks[13], 30, 200)
+        && flag(tweaks[14]) && within(tweaks[15], 30, 200);
     if (output != nullptr) AParcel_delete(output);
     if (!valid || !tweaks_ok) {
         /*
@@ -365,7 +377,8 @@ static bool query_binder(Config &result) {
         tweaks[4] != 0, tweaks[2], tweaks[3],
         tweaks[7] != 0, tweaks[5], tweaks[6],
         tweaks[9] != 0, tweaks[8],
-        tweaks[10] != 0, tweaks[11] != 0};
+        tweaks[10] != 0, tweaks[11] != 0,
+        tweaks[12] != 0, tweaks[13], tweaks[14] != 0, tweaks[15]};
     result = candidate;
     return true;
 }

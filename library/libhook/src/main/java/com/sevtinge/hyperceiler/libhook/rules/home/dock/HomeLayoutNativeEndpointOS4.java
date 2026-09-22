@@ -51,8 +51,8 @@ public final class HomeLayoutNativeEndpointOS4 {
         {"integer", "home_layout_unlock_grids_cell_y"},
         {"boolean", "home_layout_hotseats_margin_bottom_enable"},
         {"integer", "home_layout_hotseats_margin_bottom"},
-        {"boolean", "home_layout_hotseats_height_enable"},
-        {"integer", "home_layout_hotseats_height"},
+        {"boolean", "home_folder_vertical_spacing_enable"},
+        {"integer", "home_folder_vertical_spacing"},
         {"boolean", "home_layout_workspace_padding_top_enable"},
         {"integer", "home_layout_workspace_padding_top"},
         {"boolean", "home_layout_workspace_padding_bottom_enable"},
@@ -66,7 +66,6 @@ public final class HomeLayoutNativeEndpointOS4 {
         {"boolean", "home_layout_searchbar_width_enable"},
         {"integer", "home_layout_searchbar_width"},
         {"integer", "home_folder_columns"},
-        {"boolean", "home_layout_folder_cols_enable"},
         {"boolean", "home_layout_pad_grid_enable"},
         {"integer", "home_layout_pad_major"},
         {"integer", "home_layout_pad_minor"},
@@ -77,6 +76,10 @@ public final class HomeLayoutNativeEndpointOS4 {
         {"integer", "home_layout_icon_scale"},
         {"boolean", "home_layout_recents_hide_clear"},
         {"boolean", "home_layout_recents_no_clear"},
+        {"boolean", "home_animation_open_rate_enable"},
+        {"integer", "home_animation_open_rate"},
+        {"boolean", "home_animation_recents_enable"},
+        {"integer", "home_animation_recents_rate"},
     };
 
     private static void ensureRefresher() {
@@ -158,7 +161,7 @@ public final class HomeLayoutNativeEndpointOS4 {
      */
     private static final Object[][] KNOB_ROWS = {
         {"prefs_key_home_layout_hotseats_margin_bottom", 70, 0, 150},
-        {"prefs_key_home_layout_hotseats_height", 80, 60, 150},
+        {"prefs_key_home_folder_vertical_spacing", 0, 0, 100},
         {"prefs_key_home_layout_workspace_padding_top", 30, 0, 150},
         {"prefs_key_home_layout_workspace_padding_bottom", 120, 0, 240},
         {"prefs_key_home_layout_workspace_padding_horizontal", 20, 0, 100},
@@ -299,15 +302,6 @@ public final class HomeLayoutNativeEndpointOS4 {
             final int fallback = (Integer) KNOB_ROWS[index][1];
             final int min = (Integer) KNOB_ROWS[index][2];
             final int max = (Integer) KNOB_ROWS[index][3];
-            /*
-             * Index 1 (dock height) is retired: hotSeatsHeight is read once by
-             * GlobalHotseatWindowManager.updateInsets at window build time, so a live delta does
-             * nothing to an already-built window, and a pending delta lands all at once at the
-             * next rebuild, jumping the dock (7695 probe: d=228 published, 0 hits). The settings
-             * entry is gone; the row stays in this table only to keep the v3 protocol's 8-slot
-             * shape, and is forced off here so a stale preference cannot resurrect it.
-             */
-            if (index == 1) continue;
             if (!readBoolean(key + "_enable", false)) continue;
             int value = readInt(key, fallback);
             if (value < min || value > max) value = fallback;
@@ -315,18 +309,16 @@ public final class HomeLayoutNativeEndpointOS4 {
             deltas[index] = toPixels(value - fallback, density);
         }
         final int[] tweaks = new int[TWEAK_COUNT];
-        /*
-         * The folder column count is the one value that already had a settings entry of its own, so
-         * the count is read from there and only the switch is new: that keeps the existing page the
-         * single place the number lives, and keeps a page nobody touched from changing the desktop.
-         */
-        tweaks[0] = readInt("home_folder_columns", 3);
-        tweaks[1] = readBoolean("home_layout_folder_cols_enable", false) ? 1 : 0;
-        tweaks[2] = readInt("home_layout_pad_major", 8);
-        tweaks[3] = readInt("home_layout_pad_minor", 5);
+        /* The existing folder-column slider is the single control. Its default keeps the launcher
+         * untouched; choosing any other value enables the native patch automatically. */
+        final int folderColumns = readIntInRange("home_folder_columns", 3, 0);
+        tweaks[0] = folderColumns;
+        tweaks[1] = folderColumns != 3 ? 1 : 0;
+        tweaks[2] = readIntInRange("home_layout_pad_major", 8, 2);
+        tweaks[3] = readIntInRange("home_layout_pad_minor", 5, 3);
         tweaks[4] = readBoolean("home_layout_pad_grid_enable", false) ? 1 : 0;
-        tweaks[5] = readInt("home_layout_fold_major", 8);
-        tweaks[6] = readInt("home_layout_fold_minor", 5);
+        tweaks[5] = readIntInRange("home_layout_fold_major", 8, 5);
+        tweaks[6] = readIntInRange("home_layout_fold_minor", 5, 6);
         tweaks[7] = readBoolean("home_layout_fold_grid_enable", false) ? 1 : 0;
         /* Default level 70 = the page's "system default size" level; must match the SeekBar's
          * android:defaultValue and the native kIconScaleCodeDefault (both 0x66 for this level). */
@@ -334,14 +326,22 @@ public final class HomeLayoutNativeEndpointOS4 {
         tweaks[9] = readBoolean("home_layout_icon_scale_enable", false) ? 1 : 0;
         tweaks[10] = readBoolean("home_layout_recents_hide_clear", false) ? 1 : 0;
         tweaks[11] = readBoolean("home_layout_recents_no_clear", false) ? 1 : 0;
+        /* Two fully independent animation controls, each with its own gate and duration ratio.
+         * The page enforces 30..200 on both sliders (above 100 deliberately allowed so animations
+         * can run slower); a stale or hand-edited value is clamped into that window here rather
+         * than falling back to identity, so "as fast as allowed" survives a schema change. */
+        tweaks[12] = readBoolean("home_animation_open_rate_enable", false) ? 1 : 0;
+        tweaks[13] = Math.max(30, Math.min(200, readInt("home_animation_open_rate", 100)));
+        tweaks[14] = readBoolean("home_animation_recents_enable", false) ? 1 : 0;
+        tweaks[15] = Math.max(30, Math.min(200, readInt("home_animation_recents_rate", 100)));
         return new Snapshot(ACK, gridEnabled ? 1 : 0, cellX, cellY, enabled, deltas, tweaks);
     }
 
     /** Number of code-patch feature values, in the order the native side reads them. */
-    static final int TWEAK_COUNT = 12;
+    static final int TWEAK_COUNT = 16;
     /** Accepted range per entry, so a bad value is refused here rather than applied to the launcher. */
-    private static final int[] TWEAK_MIN = {1, 0, 2, 2, 0, 2, 2, 0, 0, 0, 0, 0};
-    private static final int[] TWEAK_MAX = {16, 1, 16, 16, 1, 16, 16, 1, 0xFF, 1, 1, 1};
+    private static final int[] TWEAK_MIN = {1, 0, 2, 2, 0, 2, 2, 0, 0, 0, 0, 0, 0, 30, 0, 30};
+    private static final int[] TWEAK_MAX = {16, 1, 16, 16, 1, 16, 16, 1, 0xFF, 1, 1, 1, 1, 200, 1, 200};
 
     /**
      * The launcher stores an icon scale as a packed code, not as a size, so the percentage shown on
@@ -408,6 +408,20 @@ public final class HomeLayoutNativeEndpointOS4 {
         final Integer value = cached(key);
         if (value != null) return value;
         return PrefsBridge.getInt(key, def);
+    }
+
+    /**
+     * Reads an int for tweaks slot `index`, in that slot's own accepted range.
+     *
+     * The transaction refuses a whole snapshot whose tweaks run holds an out-of-range value, and a
+     * snapshot refused here means every knob falls back to the stale cache with it. The settings
+     * pages cannot write such a value, but a debug write or an older schema can, so the same
+     * out-of-range condition the knob rows already treat as "use the default" is resolved here
+     * rather than being allowed to take the whole snapshot down.
+     */
+    private static int readIntInRange(String key, int def, int index) {
+        final int value = readInt(key, def);
+        return value < TWEAK_MIN[index] || value > TWEAK_MAX[index] ? def : value;
     }
 
     /** The file stores every key with the module's prefix, whether or not the caller wrote one. */

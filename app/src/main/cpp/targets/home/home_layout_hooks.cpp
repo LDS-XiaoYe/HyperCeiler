@@ -99,6 +99,18 @@ void *hc_layout_passthrough_original = nullptr;
 uint64_t hc_layout_probe_caller = 0;
 uint64_t hc_layout_probe_value = 0;
 uint32_t hc_layout_probe_hits = 0;
+uint8_t hc_layout_animation_ratio_enabled = 0;
+uint64_t hc_layout_animation_ratio_bits = 0;
+uint64_t hc_layout_animation_ratio_hits = 0;
+uint64_t hc_layout_animation_ratio_original_bits = 0;
+void *hc_layout_animation_ratio_original = nullptr;
+void hc_layout_animation_ratio_entry();
+uint64_t hc_layout_magic_hits = 0;
+uint64_t hc_layout_magic_original_bits = 0;
+void *hc_layout_magic_original = nullptr;
+uint8_t hc_layout_magic_enabled = 0;
+uint64_t hc_layout_magic_bits = 0;
+void hc_layout_magic_entry();
 /* Called by both trampolines before they return, so the caller reads already-adjusted fields.
    `caller` is the Dart return address, recorded so the calibration can see which functions run. */
 void hc_layout_apply_now(uint64_t config, uintptr_t caller);
@@ -119,11 +131,14 @@ constexpr uint64_t kPassIntervalMs = 500;
 constexpr uint64_t kPanelQueryIntervalMs = 1000;
 constexpr uint64_t kDozingIterationMs = 10000;
 constexpr uint64_t kGenerationCheckMs = 30000;
+constexpr uint32_t kDartPrologue = 0xA9BF79FDu;
 /* Slots: 0/1 the Rust grid handlers, 2/3 the two Dart object captures, then one per hook knob. */
 constexpr size_t kConfigCaptureSlot = 2;
 constexpr size_t kDockCaptureSlot = 3;
 constexpr size_t kKnobHookSlotBase = 4;
-constexpr size_t kSlotCount = kKnobHookSlotBase + HC_LAYOUT_KNOB_COUNT;
+constexpr size_t kAnimationHookSlot = kKnobHookSlotBase + HC_LAYOUT_KNOB_COUNT;
+constexpr size_t kAnimationMagicSlot = kAnimationHookSlot + 1;
+constexpr size_t kSlotCount = kAnimationMagicSlot + 1;
 using Slot = nhk::InlineSlot<kPatchWords>;
 using Words = nhk::SlotWords<kPatchWords>;
 using HookFunction = int (*)(void *, void *, void **);
@@ -144,6 +159,8 @@ HookFunction g_hook_function = nullptr;
 UnhookFunction g_unhook_function = nullptr;
 void *g_original_x = nullptr;
 void *g_original_y = nullptr;
+bool g_animation_hook_armed = false;
+bool g_magic_hook_armed = false;
 std::array<Slot, kSlotCount> g_slots{};
 std::string g_container_path;
 uint64_t g_view_begin = 0;
@@ -162,6 +179,26 @@ int cell_y_replacement() {
     if (g_ready.load(std::memory_order_acquire)) return g_cell_y.load(std::memory_order_relaxed);
     const auto original = reinterpret_cast<int (*)()>(g_original_y);
     return original != nullptr ? original() : g_cell_y.load(std::memory_order_relaxed);
+}
+
+void publish_animation_rate(const home_layout::TweaksConfig &tweaks) {
+    /* Fully independent families: each gate and each duration ratio (30..200 percent, values
+     * above 100 deliberately allowed so animations can run slower) publish separately. `recents`
+     * feeds the Rust ratio consumers (recents, gestures, blur, wallpaper); `open` feeds the
+     * gear-derived speed factor that app open/close actually follows. */
+    const int open_percent = std::clamp(tweaks.animation_open_rate_percent, 30, 200);
+    const int recents_percent = std::clamp(tweaks.animation_recents_rate_percent, 30, 200);
+    uint64_t bits = 0;
+    const double open_ratio = static_cast<double>(open_percent) / 100.0;
+    std::memcpy(&bits, &open_ratio, sizeof(bits));
+    __atomic_store_n(&hc_layout_magic_bits, bits, __ATOMIC_RELAXED);
+    const double recents_ratio = static_cast<double>(recents_percent) / 100.0;
+    std::memcpy(&bits, &recents_ratio, sizeof(bits));
+    __atomic_store_n(&hc_layout_animation_ratio_bits, bits, __ATOMIC_RELAXED);
+    __atomic_store_n(&hc_layout_animation_ratio_enabled,
+        static_cast<uint8_t>(tweaks.animation_recents_enabled ? 1 : 0), __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_layout_magic_enabled,
+        static_cast<uint8_t>(tweaks.animation_open_enabled ? 1 : 0), __ATOMIC_RELEASE);
 }
 
 /*
@@ -268,21 +305,34 @@ constexpr const char *kKnobHookSymbols[HC_LAYOUT_KNOB_COUNT] = {
      * accessor was a dead lever (overwritten by the Rust side), which is why this entry sat null;
      * a launcher OTA changed the consumer, so the null is gone.
      *
-     * Hotseat height stays deliberately null: `HotSeatsConstants2.hotSeatsHeight` is read once by
-     * `GlobalHotseatWindowManager.updateInsets` when the dock window is (re)built. A probe with a
-     * live delta published (d=228) recorded **0 hits** — patching the getter changes nothing for
-     * an already-built window, and the pending delta would land all at once at the next window
-     * rebuild, jumping the dock. Real-time height needs re-running updateDockHierarchy, which is
-     * outside a getter hook's reach.
+     * Protocol slot 1 used to be the retired hotseat-height knob. It now carries folder row
+     * spacing. On launcher 7719 a zero-delta probe recorded 0 calls on the workspace and exactly
+     * one call while opening a folder: the original result was 92.2699 px and the caller was
+     * 0x146da4c, the return site immediately after `_buildScrollableGrid` calls
+     * `FolderGridViewGetxController.folderCellHeight` at 0x146da48. The same value then enters
+     * `_applyViewPropertiesWithoutPadding` and `_buildGrid`, so the hook changes the grid's row
+     * extent at its stable accessor instead of patching a render offset.
      */
     /* HotseatMargin   */ "GridController.hotSeatsMarginBottom",
-    /* HotseatHeight  */ nullptr,
+    /* FolderRowSpacing */ "FolderGridViewGetxController.folderCellHeight",
     /* WorkspaceTop    */ nullptr,
     /* WorkspaceBottom */ nullptr,
     /* WorkspaceSide   */ nullptr,
-    /* IndicatorMargin */ nullptr,
+    /*
+     * IndicatorMargin: `GridController.workspaceIndicatorMarginBottom` — the page indicator's
+     * bottom margin accessor. Symbol present in the launcher's .gnu_debugdata; if Dart AOT inlines
+     * it (small getter), bind_dart_target will reject the prologue and the knob stays inert — safe.
+     * The field-path decode in bind_knobs() may also resolve it for field-write mode.
+     *
+     * SearchBarMargin: wired on 7695, confirmed with hook hit=1 on device.
+     *
+     * SearchBarWidth: `GridController.searchBarWidthPx` — the search bar width accessor. Same
+     * strategy as IndicatorMargin: enable the symbol, let the framework validate the prologue.
+     * If inlined, falls back to field-path decode or stays inert.
+     */
+    /* IndicatorMargin */ "GridController.workspaceIndicatorMarginBottom",
     /* SearchBarMargin */ "GridController.searchBarMarginBottom",
-    /* SearchBarWidth  */ nullptr,
+    /* SearchBarWidth  */ "GridController.searchBarWidthPx",
 };
 
 /*
@@ -300,13 +350,13 @@ constexpr const char *kKnobHookSymbols[HC_LAYOUT_KNOB_COUNT] = {
  */
 constexpr double kKnobDeltaGain[HC_LAYOUT_KNOB_COUNT] = {
     1.0,             // HotseatMargin   (inert)
-    1.0,             // HotseatHeight   (inert)
+    1.0,             // FolderRowSpacing: extra row extent in px
     -1.0 / 1.5,      // WorkspaceTop   : titleMarginTop, inverted with a 1.5x gain
     1.0,             // WorkspaceBottom (inert)
     1.0,             // WorkspaceSide   (inert)
-    1.0,             // IndicatorMargin (inert)
-    1.0,             // SearchBarMargin : startup-only, uncalibrated
-    1.0,             // SearchBarWidth  (inert)
+    1.0,             // IndicatorMargin : workspaceIndicatorMarginBottom, uncalibrated
+    1.0,             // SearchBarMargin : searchBarMarginBottom, confirmed hit=1
+    1.0,             // SearchBarWidth  : searchBarWidthPx, uncalibrated
 };
 
 std::array<KnobRuntime, HC_LAYOUT_KNOB_COUNT> g_knobs = {{
@@ -314,6 +364,31 @@ std::array<KnobRuntime, HC_LAYOUT_KNOB_COUNT> g_knobs = {{
     HC_LAYOUT_KNOBS(HC_KNOB_ROW)
 #undef HC_KNOB_ROW
 }};
+
+/*
+ * Apply the property-gated read-only calibration targets before the launcher's first Dart layout.
+ * The worker also calls this helper as a fallback, but that is too late for values cached while the
+ * folder widget is first built. Keeping one parser for both paths prevents an early probe and the
+ * worker from silently testing different symbols.
+ */
+void apply_debug_hook_overrides() {
+    for (size_t index = 0; index < g_knobs.size(); ++index) {
+        char name[PROP_VALUE_MAX] = {};
+        const std::string key = "debug.hyperceiler.layout.hook" + std::to_string(index);
+        if (__system_property_get(key.c_str(), name) <= 0 || name[0] == '\0') continue;
+        if (name[0] == '-' || std::strcmp(name, "off") == 0) {
+            if (g_knobs[index].hook_mode) {
+                g_knobs[index].hook_mode = false;
+                g_knobs[index].hook_address = 0;
+                g_knobs[index].hook_armed = false;
+                g_knobs[index].symbol.clear();
+            }
+            continue;
+        }
+        g_knobs[index].hook_mode = true;
+        g_knobs[index].symbol = name;
+    }
+}
 
 /* Bind the per-knob trampoline pointers from the same list, so the two can never drift apart. */
 bool g_hook_globals_inited = false;
@@ -554,6 +629,13 @@ struct Located {
     nhk::CodeSource y_source{};
     Words x_words{};
     Words y_words{};
+    uintptr_t animation = 0;
+    nhk::CodeSource animation_source{};
+    Words animation_words{};
+    uint64_t animation_owner_va = 0;
+    uintptr_t magic = 0;
+    nhk::CodeSource magic_source{};
+    Words magic_words{};
     std::string container_path;
     uint64_t view_begin = 0;
     uint64_t view_end = 0;
@@ -749,6 +831,63 @@ bool bind_target(const Library &library, uint64_t va, uintptr_t &address,
     return true;
 }
 
+bool bind_animation_consumer(Located &located) {
+    if (located.animation != 0) return true;
+    if (located.animation_owner_va == 0 || !g_dart) return false;
+    /*
+     * Prefer the shared ratio entry over the flight-only accessor: the app-open move blends the
+     * icon flight with Folme spring, blur and wallpaper timings that all read the same upstream,
+     * and replacing only the flight's share lets the rest run ahead or behind it. Each candidate
+     * still has to earn its binding with the standard Dart prologue, so a launcher build that
+     * inlines or restyles either one simply falls through to the next.
+     */
+    static constexpr const char *kCandidates[] = {
+        "getAnimDurationRatio",
+        "FlightCohort.animDurationRatio",
+    };
+    for (const char *name : kCandidates) {
+        uint32_t va = 0;
+        uint32_t size = 0;
+        if (!hometweaks::HomeTweaksFindSymbol(name, &va, &size) || size < 16) continue;
+        if (!bind_dart_target(va, located.animation, located.animation_source,
+                located.animation_words)
+            || located.animation_words[0] != kDartPrologue) {
+            located.animation = 0;
+            continue;
+        }
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "animation duration Dart consumer target=%p va=%#x size=%u symbol=%s",
+            reinterpret_cast<void *>(located.animation), va, size, name);
+        return true;
+    }
+    located.animation = 0;
+    return false;
+}
+
+/*
+ * The gear-derived duration factor, the second animation boundary. App open/close responds to this
+ * value and not to the ratio above: the window springs scale 1:1 with it (measured through the
+ * official three gears), so replacing its result is what puts open/close on the custom rate. Both
+ * boundaries are "1.0 = nominal duration" doubles and share the one published value.
+ */
+bool bind_magic_consumer(Located &located) {
+    if (located.magic != 0) return true;
+    if (!g_dart) return false;
+    uint32_t va = 0;
+    uint32_t size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("Utilities.getDefaultGestureAnimMagicSpeed", &va, &size)
+        || size < 16
+        || !bind_dart_target(va, located.magic, located.magic_source, located.magic_words)
+        || located.magic_words[0] != kDartPrologue) {
+        located.magic = 0;
+        return false;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "animation magic Dart consumer target=%p va=%#x size=%u",
+        reinterpret_cast<void *>(located.magic), va, size);
+    return true;
+}
+
 std::optional<Located> locate() {
     std::ifstream maps("/proc/self/maps");
     if (!maps) return {};
@@ -758,9 +897,8 @@ std::optional<Located> locate() {
 
     Located located;
     if (const auto rust = open_library(*path, "libapp_launcher.so", all)) {
-        const auto image = home_layout::elf_targets::parse(rust->bytes);
         const auto targets = home_layout::elf_targets::resolve(rust->bytes);
-        if (image && targets
+        if (targets
             && bind_target(*rust, targets->cell_count_x, located.x, located.x_source,
                 located.x_words)
             && bind_target(*rust, targets->cell_count_y, located.y, located.y_source,
@@ -772,13 +910,26 @@ std::optional<Located> locate() {
                 "layout rust targets X=%p Y=%p", reinterpret_cast<void *>(located.x),
                 reinterpret_cast<void *>(located.y));
         }
+        const auto animation_owner = home_layout::elf_targets::resolve_animation_duration_update(
+            rust->bytes);
+        if (animation_owner) {
+            located.animation_owner_va = *animation_owner;
+            located.container_path = rust->path;
+            located.view_begin = rust->view_begin;
+            located.view_end = rust->view_end;
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "animation duration owner validated va=%#llx",
+                static_cast<unsigned long long>(*animation_owner));
+        }
     }
     if (ensure_dart_library()) {
         located.dart_container_path = g_dart->path;
         located.dart_view_begin = g_dart->view_begin;
         located.dart_view_end = g_dart->view_end;
+        (void) bind_animation_consumer(located);
+        (void) bind_magic_consumer(located);
     }
-    if (located.x == 0 && located.dart_container_path.empty()) return {};
+    if (located.x == 0 && located.animation == 0 && located.dart_container_path.empty()) return {};
     return located;
 }
 
@@ -861,8 +1012,6 @@ void push_tweaks(const home_layout::Config &values) {
 // ---------------------------------------------------------------------------
 // Field path derivation.
 // ---------------------------------------------------------------------------
-
-constexpr uint32_t kDartPrologue = 0xA9BF79FDu;
 
 bool is_ldur_double(uint32_t word) {
     return (word & 0xFFE00C00u) == 0xFC400000u;
@@ -1032,6 +1181,14 @@ size_t bind_knobs() {
         if (!decode_path(code, va, g_config_capture_va, g_dock_capture_va, path)) continue;
         knob.getter = va;
         knob.path.store(pack_path(path.object, path.off0, path.off1), std::memory_order_release);
+        /*
+         * The decoded path, printed once when it binds. The startup snapshot prints each knob before
+         * `bind_knobs` has run, so without this line the offset that is actually written - the one
+         * thing a field-write experiment has to get right - is never visible on the device.
+         */
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "layout field path %s object=%u off0=%d off1=%#x va=%#x",
+            knob.symbol.c_str(), static_cast<unsigned>(path.object), path.off0, path.off1, va);
         if (path.off0 > 0 && g_device_object_offset < 0) g_device_object_offset = path.off0;
     }
     /*
@@ -1054,12 +1211,34 @@ size_t bind_knobs() {
 }
 
 size_t arm_captures() {
+    /*
+     * Every refusal says which one it was, once per distinct reason.
+     *
+     * The pair is all-or-nothing - one failing `bind_dart_target` leaves both capture slots out - and
+     * the worker's startup snapshot prints `captures=0` either way. That made "the field-write path
+     * was never enabled" and "the path was enabled but a bind failed" indistinguishable on a live
+     * device, which cost a whole calibration round.
+     */
+    const auto decline = [](const char *why) -> size_t {
+        static const char *last = nullptr;
+        if (last != why) {
+            last = why;
+            __android_log_print(ANDROID_LOG_WARN, kTag, "layout capture arm declined: %s", why);
+        }
+        return 0;
+    };
     if (g_captures_armed) return 0;
-    if (g_config_capture_va == 0 || g_dock_capture_va == 0) return 0;
+    if (g_config_capture_va == 0 || g_dock_capture_va == 0) {
+        return decline("capture symbol unresolved");
+    }
     if (!bind_dart_target(g_config_capture_va, g_config_capture_address, g_config_capture_source,
-            g_config_capture_words)) return 0;
+            g_config_capture_words)) {
+        return decline("config bind_dart_target failed");
+    }
     if (!bind_dart_target(g_dock_capture_va, g_dock_capture_address, g_dock_capture_source,
-            g_dock_capture_words)) return 0;
+            g_dock_capture_words)) {
+        return decline("dock bind_dart_target failed");
+    }
     g_slots[kConfigCaptureSlot] = {g_config_capture_address,
         reinterpret_cast<void *>(hc_layout_config_capture_entry),
         &hc_layout_config_capture_original, g_config_capture_source, g_config_capture_words};
@@ -1067,6 +1246,8 @@ size_t arm_captures() {
         reinterpret_cast<void *>(hc_layout_dock_capture_entry),
         &hc_layout_dock_capture_original, g_dock_capture_source, g_dock_capture_words};
     g_captures_armed = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "layout captures armed config_va=%#x dock_va=%#x",
+        g_config_capture_va, g_dock_capture_va);
     return 2;
 }
 
@@ -1124,6 +1305,22 @@ size_t publish_hooks() {
  * fresh launcher value. Switching a knob off stops writing, which leaves the launcher's own value in
  * place.
  */
+/*
+ * Field-write telemetry, read out by the worker's periodic line.
+ *
+ * `applied` counts the fields we put at the wanted value, `same` counts the calls that found the
+ * field already carrying it, and `refused` counts the backstop rejections. `same` is the only
+ * in-process proof that a write landed *and persisted*: the launcher rewrites these fields whenever
+ * it rebuilds the config, so a field that still holds our value on a later call can only be ours.
+ * Without it, "the write landed but nothing consumed it" and "the write never landed" look the same
+ * from outside - which is exactly the ambiguity that stalled the previous round.
+ *
+ * Plain counters written from the Dart thread inside the trampoline, like the capture hit counters.
+ */
+uint64_t hc_layout_field_writes_applied = 0;
+uint64_t hc_layout_field_writes_same = 0;
+uint64_t hc_layout_field_writes_refused = 0;
+
 size_t apply_knob_fields() {
     const uintptr_t config = static_cast<uintptr_t>(hc_layout_config_object);
     const uintptr_t dock = static_cast<uintptr_t>(hc_layout_dock_object);
@@ -1164,8 +1361,17 @@ size_t apply_knob_fields() {
          * display density, so a value outside this window means the field is not what it was assumed
          * to be - refuse it instead of letting one bad write take the launcher's layout out.
          */
-        if (!(wanted > -4000.0 && wanted < 4000.0)) continue;
-        if (current != wanted) *field = wanted;
+        if (!(wanted > -4000.0 && wanted < 4000.0)) {
+            ++hc_layout_field_writes_refused;
+            continue;
+        }
+        if (current == wanted) {
+            ++hc_layout_field_writes_same;
+            ++applied;
+            continue;
+        }
+        *field = wanted;
+        ++hc_layout_field_writes_applied;
         ++applied;
     }
     return applied;
@@ -1264,13 +1470,15 @@ void *worker(void *) {
      */
     const bool any_tweak = config.tweaks.folder_enabled || config.tweaks.pad_enabled
         || config.tweaks.fold_enabled || config.tweaks.icon_scale_enabled
-        || config.tweaks.recents_hide_clear || config.tweaks.recents_no_clear;
+        || config.tweaks.recents_hide_clear || config.tweaks.recents_no_clear
+        || config.tweaks.animation_open_enabled || config.tweaks.animation_recents_enabled;
     if (!config.grid_enabled && !any_knob && !top_probe && !any_tweak) {
         __android_log_print(ANDROID_LOG_INFO, kTag, "layout preferences disabled; no hooks installed");
         return attempt_finished();
     }
     g_cell_x.store(config.cell_x, std::memory_order_relaxed);
     g_cell_y.store(config.cell_y, std::memory_order_relaxed);
+    publish_animation_rate(config.tweaks);
     push_tweaks(config);
 
     std::optional<Located> located;
@@ -1344,29 +1552,7 @@ void *worker(void *) {
          * the layout aggregator it should hook. This is the calibration path for the values whose
          * accessor Dart inlines away.
          */
-        for (size_t index = 0; index < g_knobs.size(); ++index) {
-            char name[PROP_VALUE_MAX] = {};
-            const std::string key = "debug.hyperceiler.layout.hook" + std::to_string(index);
-            if (__system_property_get(key.c_str(), name) <= 0 || name[0] == '\0') continue;
-            // "-" is the off switch: a system property cannot be unset from adb, so a knob has to be
-            // able to leave hook mode again without a reboot.
-            if (name[0] == '-' || std::strcmp(name, "off") == 0) {
-                /*
-                 * The off switch has to actually leave hook mode: skipping the assignment kept a
-                 * knob hooked under its previous target forever, and a later arm attempt would
-                 * keep installing a site the calibration had already abandoned.
-                 */
-                if (g_knobs[index].hook_mode) {
-                    g_knobs[index].hook_mode = false;
-                    g_knobs[index].hook_address = 0;
-                    g_knobs[index].hook_armed = false;
-                    g_knobs[index].symbol.clear();
-                }
-                continue;
-            }
-            g_knobs[index].hook_mode = true;
-            g_knobs[index].symbol = name;
-        }
+        apply_debug_hook_overrides();
         /*
          * There is deliberately no "write this offset" calibration property here any more. Such a
          * channel was used once to sweep the configuration object for a field, and because it wrote an
@@ -1396,11 +1582,20 @@ void *worker(void *) {
      * its one-time layout, so the wait is short and tight; anything resolved after that layout is only
      * seen once something forces the desktop to lay out again.
      */
-    for (int attempt = 0; attempt < 200 && !all_bound(); ++attempt) {
-        if (bind_knobs() == g_knobs.size() || all_bound()) break;
-        delay_ms(25);
+    if (any_knob || top_probe) {
+        for (int attempt = 0; attempt < 200 && !all_bound(); ++attempt) {
+            if (bind_knobs() == g_knobs.size() || all_bound()) break;
+            delay_ms(25);
+        }
+        bind_knobs();
     }
-    bind_knobs();
+    if ((config.tweaks.animation_open_enabled || config.tweaks.animation_recents_enabled)
+        && located) {
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (bind_animation_consumer(*located) && bind_magic_consumer(*located)) break;
+            delay_ms(25);
+        }
+    }
 
     std::vector<size_t> order;
     if (config.grid_enabled && located && located->x != 0 && located->y != 0) {
@@ -1410,6 +1605,22 @@ void *worker(void *) {
             located->y_source, located->y_words};
         order.push_back(0);
         order.push_back(1);
+    }
+    if (config.tweaks.animation_recents_enabled && located && located->animation != 0) {
+        g_slots[kAnimationHookSlot] = {located->animation,
+            reinterpret_cast<void *>(hc_layout_animation_ratio_entry),
+            &hc_layout_animation_ratio_original, located->animation_source,
+            located->animation_words};
+        order.push_back(kAnimationHookSlot);
+        g_animation_hook_armed = true;
+    }
+    if (config.tweaks.animation_open_enabled && located && located->magic != 0) {
+        g_slots[kAnimationMagicSlot] = {located->magic,
+            reinterpret_cast<void *>(hc_layout_magic_entry),
+            &hc_layout_magic_original, located->magic_source,
+            located->magic_words};
+        order.push_back(kAnimationMagicSlot);
+        g_magic_hook_armed = true;
     }
     /*
      * The field-rewriting path is opt-in while it is still being validated, and off by default.
@@ -1441,20 +1652,30 @@ void *worker(void *) {
             if (knob_ready(knob)) ++bound;
         }
         __android_log_print(ANDROID_LOG_INFO, kTag,
-            "layout hooks live grid=%d cell=%dx%d knobs=%zu/%zu captures=%d age=%llums",
+            "layout hooks live grid=%d cell=%dx%d knobs=%zu/%zu captures=%d "
+            "animation=%d/%d m%d%% r%d%% age=%llums",
             config.grid_enabled ? 1 : 0, config.cell_x, config.cell_y, bound, g_knobs.size(),
-            g_captures_armed ? 1 : 0, static_cast<unsigned long long>(process_age_or_zero()));
+            g_captures_armed ? 1 : 0, g_animation_hook_armed ? 1 : 0, g_magic_hook_armed ? 1 : 0,
+            config.tweaks.animation_open_rate_percent,
+            config.tweaks.animation_recents_rate_percent,
+            static_cast<unsigned long long>(process_age_or_zero()));
         for (const KnobRuntime &knob : g_knobs) {
             const uint32_t packed = knob.path.load(std::memory_order_relaxed);
+            double last = 0.0;
+            if (knob.hook_last != nullptr) std::memcpy(&last, knob.hook_last, sizeof(last));
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "layout knob %s mode=%s va=%#x sym_size=%u w0=%08x addr=%p object=%u off0=%d "
-                "off1=%d delta=%d",
+                "off1=%d delta=%d hits=%llu last=%.4f caller=%#llx",
                 knob.symbol.c_str(), knob.hook_mode ? "hook" : "field", knob.getter,
                 knob.getter_size, knob.hook_words[0],
                 reinterpret_cast<void *>(knob.hook_address), packed & 0xFFu,
                 static_cast<int>((packed >> 8) & 0xFFu) - 1,
                 static_cast<int>((packed >> 16) & 0xFFFFu),
-                knob.delta_px.load(std::memory_order_relaxed));
+                knob.delta_px.load(std::memory_order_relaxed),
+                static_cast<unsigned long long>(knob.hook_hits != nullptr ? *knob.hook_hits : 0),
+                last,
+                static_cast<unsigned long long>(
+                    knob.hook_caller != nullptr ? *knob.hook_caller : 0));
         }
     }
 
@@ -1529,6 +1750,26 @@ void *worker(void *) {
                     order.push_back(1);
                     g_ready.store(true, std::memory_order_release);
                 }
+                if (located) {
+                    if (latest.tweaks.animation_recents_enabled && !g_animation_hook_armed
+                        && bind_animation_consumer(*located)) {
+                        g_slots[kAnimationHookSlot] = {located->animation,
+                            reinterpret_cast<void *>(hc_layout_animation_ratio_entry),
+                            &hc_layout_animation_ratio_original, located->animation_source,
+                            located->animation_words};
+                        order.push_back(kAnimationHookSlot);
+                        g_animation_hook_armed = true;
+                    }
+                    if (latest.tweaks.animation_open_enabled && !g_magic_hook_armed
+                        && bind_magic_consumer(*located)) {
+                        g_slots[kAnimationMagicSlot] = {located->magic,
+                            reinterpret_cast<void *>(hc_layout_magic_entry),
+                            &hc_layout_magic_original, located->magic_source,
+                            located->magic_words};
+                        order.push_back(kAnimationMagicSlot);
+                        g_magic_hook_armed = true;
+                    }
+                }
                 const bool cell_changed = latest.cell_x != config.cell_x
                     || latest.cell_y != config.cell_y || latest.grid_enabled != config.grid_enabled;
                 const bool knobs_changed = latest.knobs != config.knobs;
@@ -1540,7 +1781,10 @@ void *worker(void *) {
                     g_ready.store(config.grid_enabled && located && located->x != 0
                         && located->y != 0, std::memory_order_release);
                 }
-                if (tweaks_changed) push_tweaks(config);
+                if (tweaks_changed) {
+                    publish_animation_rate(config.tweaks);
+                    push_tweaks(config);
+                }
                 (void) knobs_changed;
             }
             any_knob = sync_requested();
@@ -1548,7 +1792,7 @@ void *worker(void *) {
                 g_dart_ready.store(true, std::memory_order_release);
             }
         }
-        if (!all_bound()) bind_knobs();
+        if ((any_knob || top_probe) && !all_bound()) bind_knobs();
         if (any_knob && !g_captures_armed) {
             if (arm_captures() != 0) {
                 order.push_back(kConfigCaptureSlot);
@@ -1564,14 +1808,51 @@ void *worker(void *) {
                 if (knob_ready(knob)) ++bound;
                 if (knob.delta_px.load(std::memory_order_relaxed) != 0) ++deltas;
             }
+            /*
+             * `writes=applied/same/refused` is the field-write read-back: `same` non-zero means a
+             * written value survived to a later call. `path0` is the first decoded field path as
+             * `object|off0|off1`, so the offset actually being written is visible without a reboot.
+             */
+            uint32_t path0 = 0;
+            for (const KnobRuntime &knob : g_knobs) {
+                const uint32_t packed = knob.path.load(std::memory_order_relaxed);
+                if (packed != 0) {
+                    path0 = packed;
+                    break;
+                }
+            }
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "layout captures config=%#llx dock=%#llx heap=%#llx hits=%llu/%llu bound=%zu "
-                "deltas=%d",
+                "deltas=%d writes=%llu/%llu/%llu path0=%#x recents=%d/%llu/%.4f/%d%% "
+                "open=%d/%llu/%.4f/%d%%",
                 static_cast<unsigned long long>(hc_layout_config_object),
                 static_cast<unsigned long long>(hc_layout_dock_object),
                 static_cast<unsigned long long>(hc_layout_heap_base),
                 static_cast<unsigned long long>(hc_layout_config_capture_hits),
-                static_cast<unsigned long long>(hc_layout_dock_capture_hits), bound, deltas);
+                static_cast<unsigned long long>(hc_layout_dock_capture_hits), bound, deltas,
+                static_cast<unsigned long long>(hc_layout_field_writes_applied),
+                static_cast<unsigned long long>(hc_layout_field_writes_same),
+                static_cast<unsigned long long>(hc_layout_field_writes_refused), path0,
+                g_animation_hook_armed ? 1 : 0,
+                static_cast<unsigned long long>(hc_layout_animation_ratio_hits),
+                [&] {
+                    double value = 0.0;
+                    const uint64_t bits = __atomic_load_n(
+                        &hc_layout_animation_ratio_original_bits, __ATOMIC_RELAXED);
+                    std::memcpy(&value, &bits, sizeof(value));
+                    return value;
+                }(),
+                config.tweaks.animation_recents_rate_percent,
+                g_magic_hook_armed ? 1 : 0,
+                static_cast<unsigned long long>(hc_layout_magic_hits),
+                [&] {
+                    double value = 0.0;
+                    const uint64_t bits = __atomic_load_n(
+                        &hc_layout_magic_original_bits, __ATOMIC_RELAXED);
+                    std::memcpy(&value, &bits, sizeof(value));
+                    return value;
+                }(),
+                config.tweaks.animation_open_rate_percent);
             /*
              * Per-knob probe readout. `hits` alone can only say "the hook runs"; the verdict a
              * read-only probe has to support is "this function is the control point for that value",
@@ -1700,6 +1981,18 @@ bool adopt_layout_state() {
     g_field_writes_enabled.store(false, std::memory_order_release);
     g_cell_x.store(0, std::memory_order_relaxed);
     g_cell_y.store(0, std::memory_order_relaxed);
+    __atomic_store_n(&hc_layout_animation_ratio_enabled, uint8_t{0}, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_layout_animation_ratio_bits, uint64_t{0}, __ATOMIC_RELAXED);
+    __atomic_store_n(&hc_layout_animation_ratio_original_bits, uint64_t{0}, __ATOMIC_RELAXED);
+    hc_layout_animation_ratio_hits = 0;
+    hc_layout_animation_ratio_original = nullptr;
+    g_animation_hook_armed = false;
+    __atomic_store_n(&hc_layout_magic_enabled, uint8_t{0}, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_layout_magic_bits, uint64_t{0}, __ATOMIC_RELAXED);
+    __atomic_store_n(&hc_layout_magic_original_bits, uint64_t{0}, __ATOMIC_RELAXED);
+    hc_layout_magic_hits = 0;
+    hc_layout_magic_original = nullptr;
+    g_magic_hook_armed = false;
     g_captures_armed = false;
     g_probe_primed = false;
     g_hook_globals_inited = false;
@@ -1746,6 +2039,11 @@ void prime_home_layout_knobs(HookFunction hook, UnhookFunction unhook) {
     g_hook_function = hook;
     g_unhook_function = unhook;
     if (!ensure_dart_library()) return;
+    char debug_gate[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.hyperceiler.layout.override", debug_gate) > 0
+        && debug_gate[0] == '1') {
+        apply_debug_hook_overrides();
+    }
     // Shipped hook targets, the same pass the worker runs later.
     for (size_t index = 0; index < g_knobs.size(); ++index) {
         if (kKnobHookSymbols[index] == nullptr || g_knobs[index].hook_mode) continue;

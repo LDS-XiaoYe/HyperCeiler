@@ -131,12 +131,7 @@
     </PreferenceCategory>
 
     <PreferenceCategory android:title="@string/home_layout_hotseats_title">
-        <!--
-            底栏高度已下线（7695）：hotSeatsHeight 只在底栏窗口重建时被
-            GlobalHotseatWindowManager.updateInsets 读取，运行时拖滑块不生效，
-            且挂着的 delta 会在下次窗口重建时一次性生效造成底栏突变。
-            endpoint 的 KNOB_ROWS 保留该槽位以维持 v3 协议的 8 组结构（恒发 disabled）。
-        -->
+        <!-- 底栏高度已下线；其 v3 协议槽位已复用于上面的文件夹行间距。 -->
         <SwitchPreference
             android:defaultValue="false"
             android:key="prefs_key_home_layout_hotseats_margin_bottom_enable"
@@ -269,19 +264,8 @@
             app:stepValue="1" />
     </PreferenceCategory>
 
-    <!--
-        Experimental group: the features whose sites are located from the launcher image's own
-        symbol table. Kept apart from the groups above because they rewrite constants inside the
-        launcher rather than redirecting an accessor, and because the folder column count they
-        change already has a home in the folder settings page.
-    -->
+    <!-- Features whose sites are located from the launcher image's own symbol table. -->
     <PreferenceCategory android:title="@string/home_layout_experimental_title">
-
-        <SwitchPreference
-            android:defaultValue="false"
-            android:key="prefs_key_home_layout_folder_cols_enable"
-            android:summary="@string/home_layout_folder_cols_desc"
-            android:title="@string/home_layout_folder_cols_title" />
 
         <SwitchPreference
             android:defaultValue="false"

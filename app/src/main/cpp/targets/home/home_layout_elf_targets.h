@@ -127,6 +127,39 @@ inline std::optional<unwind::FunctionBounds> unique_function(
     return selected;
 }
 
+/*
+ * Resolve the Rust owner of the system animation-duration ratio independently of the grid
+ * resolver.  The animation feature must keep working on an OTA where the grid log labels move.
+ *
+ * The log literal is only the first locator.  The candidate is accepted only when its unwind
+ * bounds describe one reasonably-sized function which preserves the receiver in X19 and writes
+ * the computed float to receiver+0x10.  That is the state transition established from 7719's
+ * caller/callee analysis; refusing a changed shape is safer than writing an unrelated Rust object.
+ */
+inline std::optional<uint64_t> resolve_animation_duration_update(
+    std::span<const std::byte> bytes) {
+    const auto image = parse(bytes);
+    if (!image) return {};
+    const auto literal = unique_literal(*image, "update_anim_duration_ratio:duration_ratio=");
+    if (!literal) return {};
+    const auto function = unique_function(*image, *literal);
+    if (!function || function->end <= function->begin) return {};
+    const uint64_t size = function->end - function->begin;
+    if (size < 0x80 || size > 0x400) return {};
+
+    bool receiver = false;
+    bool state_store = false;
+    for (uint64_t site = function->begin; site + 4 <= function->end; site += 4) {
+        const auto instruction = image->word(site);
+        if (!instruction) return {};
+        if (site - function->begin < 0x60 && *instruction == 0xaa0003f3u) {
+            receiver = true; // MOV X19, X0
+        }
+        if (*instruction == 0xbd001260u) state_store = true; // STR S0, [X19,#0x10]
+    }
+    return receiver && state_store ? std::optional<uint64_t>(function->begin) : std::nullopt;
+}
+
 struct GetterShape {
     uint64_t lock = 0;
     uint64_t value = 0;
