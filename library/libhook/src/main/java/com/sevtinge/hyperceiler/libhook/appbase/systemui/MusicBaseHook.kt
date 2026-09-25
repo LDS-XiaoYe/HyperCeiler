@@ -149,6 +149,8 @@ abstract class MusicBaseHook : BaseHook() {
     private fun registerLyricReceiver() {
         if (lyricReceiverRegistered) return
         runCatching {
+            // The Binder service is optional; absence means there is nothing to register with.
+            if (!SuperLyricHelper.isAvailable()) return@runCatching
             SuperLyricHelper.registerReceiver(receiver)
             lyricReceiverRegistered = true
             BaseHook.registerHotReloadCleanup {
