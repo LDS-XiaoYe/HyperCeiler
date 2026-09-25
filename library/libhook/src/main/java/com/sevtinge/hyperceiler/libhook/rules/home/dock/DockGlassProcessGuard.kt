@@ -59,8 +59,14 @@ internal class DockGlassProcessGuard {
                         catchingRecoverableOr(-1) { pidUid.invoke(null, pid) as Int }
                     }
                     if (filtered !== original) {
-                        if (filtered.isEmpty()) param.result = ArrayList<Int>()
-                        else param.args[0] = filtered
+                        // Both hooked methods are AIDL entry points on a Java service (`freezeUids`
+                        // and `freezePids` are prototyped by the stub as void), so setting
+                        // `param.result` on Xposed's MethodHookParam - which is what Xposed uses
+                        // for a *non-void* replacement - would fail the invocation instead of
+                        // protecting the renderer. An emptied request therefore has to be
+                        // forwarded as an empty array, which is the one representation the service
+                        // already treats as "nothing to freeze".
+                        param.args[0] = filtered
                     }
                 }
             }

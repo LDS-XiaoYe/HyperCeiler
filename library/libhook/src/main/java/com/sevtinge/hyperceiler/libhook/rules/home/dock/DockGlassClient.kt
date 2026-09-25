@@ -20,6 +20,7 @@ package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
 import android.content.ContentProviderClient
+import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
@@ -31,9 +32,11 @@ import android.util.Log
 import android.view.SurfaceControl
 import android.view.SurfaceControlViewHost
 import com.sevtinge.hyperceiler.common.log.XposedLog
+import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.common.utils.prefs.PrefType
 import com.sevtinge.hyperceiler.common.utils.prefs.PrefsChangeObserver
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
+import java.util.ArrayList
 import java.util.UUID
 
 /**
@@ -109,6 +112,35 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         const val REVEAL_STYLE_KEY = "prefs_key_home_dock_unlock_style"
 
         /**
+         * Bounds on the geometry snapshot read.
+         *
+         * <p>The knobs are polled by the one-second sweep, so this is deliberately more
+         * aggressive than [STYLE_QUERY_INTERVAL_MS]: a height change has to land on the next
+         * sweep, not up to half a minute later. One cursor carries every value, so the cost is
+         * a single cross-process query rather than one per knob.
+         */
+        const val GEOMETRY_QUERY_INTERVAL_MS = 900L
+
+        /**
+         * The geometry keys and the preference type each one is stored as, matching
+         * {@code SharedPrefsProvider.DOCK_GEOMETRY_KEYS}.
+         *
+         * <p>The names are bare (no {@code PrefsBridge} prefix): [PrefsChangeObserver] builds the
+         * provider URI from them itself, and {@link com.sevtinge.hyperceiler.common.utils.PrefsBridge}
+         * adds the prefix on every other path.
+         */
+        val GEOMETRY_WATCH_KEYS = listOf(
+            "home_dock_bg_custom_enable" to PrefType.Boolean,
+            "home_dock_add_blur" to PrefType.String,
+            "home_dock_bg_color" to PrefType.Integer,
+            "home_dock_bg_height" to PrefType.Integer,
+            "home_dock_bg_margin_horizontal" to PrefType.Integer,
+            "home_dock_bg_margin_bottom" to PrefType.Integer,
+            "home_dock_bg_radius" to PrefType.Integer,
+            "home_other_home_mode" to PrefType.String
+        )
+
+        /**
          * Fallback interval for the style read, now that the provider pushes its changes.
          *
          * <p>This used to be the primary path at two seconds: one cross-process query and one
@@ -170,6 +202,14 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     /** Dropped by [close], so a hot reload cannot accumulate observer registrations. */
     @Volatile private var styleObserver: PrefsChangeObserver? = null
     private var styleQueryAt = 0L
+    /**
+     * One observer per geometry key, also dropped by [close].
+     *
+     * <p>Without these the geometry only moves on the sweep, and the sweep backs off to 8 s while
+     * the desktop is idle - which is exactly when a user is on the settings page and expects a drag
+     * to land immediately. Measured worst case was ~12.9 s before this existed.
+     */
+    private val geometryObservers = ArrayList<PrefsChangeObserver>()
     private val journal = Journal { worker }
 
     private class Journal(private val worker: () -> Handler) {
@@ -211,7 +251,12 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
          * keeps the progression readable at ~7 Hz; a full-rate diagnostic is a one-line revert.
          */
         private val noisyPrefixes = listOf(
-            "reveal dbg frame", "reveal dbg pose", "reveal dbg layout", "motion position")
+            "reveal dbg frame", "reveal dbg pose", "reveal dbg layout", "motion position",
+            // "native motion scene" belongs here as much as the four above: it is emitted from
+            // the frame loop, so an OS4 build that keeps re-publishing one scene/scale pair
+            // writes it every frame - measured at 68 records/second on device, which is what
+            // made this endpoint look like it had no useful log at all.
+            "native motion scene")
         private val frameNoiseSampleMs = 150L
         @Volatile private var lastNoisyAtMs = 0L
 
@@ -250,6 +295,13 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         if (!closed) {
             journal.bind(context)
             watchRevealStyle(context)
+            watchGeometry(context)
+            // Kick the first provider read from here as well. Callers reach this from a traversal,
+            // and their own refreshGeometry() call runs *before* this one (the traversal reads the
+            // parameters first), so at that point styleContext was still null and the read was
+            // dropped. Without this the first geometry snapshot would wait for the observers to
+            // fire or for the next sweep - and the sweep only re-reads, it never bootstraps.
+            refreshGeometry()
         }
     }
 
@@ -283,8 +335,169 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
 
     fun record(event: String) { if (!closed) journal.record(event) }
 
+    /**
+     * Follow the geometry keys instead of waiting for the sweep.
+     *
+     * <p>Each key gets its own observer because the provider publishes a per-key URI, so one
+     * observer on [PrefType.Any] would have to filter the notification itself anyway. The
+     * callback does no reading: it clears the throttle and asks for the provider snapshot, which
+     * is what [refreshGeometry] already does for the sweep.
+     */
+    private fun watchGeometry(context: Context) {
+        if (geometryObservers.isNotEmpty() || closed) return
+        catchingRecoverable({
+            for ((key, type) in GEOMETRY_WATCH_KEYS) {
+                geometryObservers.add(object : PrefsChangeObserver(context, Handler(worker.looper),
+                    false, type, key, null) {
+                    override fun onChange(changedType: PrefType, changed: Uri?, name: String?, def: Any?) {
+                        geometryQueryAt = 0L
+                        refreshGeometry()
+                    }
+                })
+            }
+            record("geometry observers registered=${geometryObservers.size}")
+        }) {
+            record("geometry observers unavailable=${it.javaClass.simpleName}: " +
+                "${it.message?.take(120)}")
+            geometryObservers.clear()
+        }
+    }
+
     /** Latest reveal style name read from the module's own preferences, or null before the first read. */
     fun liveRevealStyle(): String? = liveRevealStyle
+
+    /**
+     * The Dock geometry knobs as the settings file actually holds them.
+     *
+     * <p>Every field is nullable on purpose: a key the user never touched answers {@code null}
+     * so the caller keeps the value it read through [PrefsBridge], which still resolves the
+     * settings page's own default. Materialising an absent preference as a zero would silently
+     * replace that default - the height would jump to 0 rather than staying at its 150 fallback.
+     */
+    data class GeometrySnapshot(
+        val customEnable: Boolean? = null,
+        val addBlur: Int? = null,
+        val bgColor: Int? = null,
+        val bgHeight: Int? = null,
+        val marginHorizontal: Int? = null,
+        val marginBottom: Int? = null,
+        val bgRadius: Int? = null,
+        val homeMode: Int? = null
+    ) {
+        /**
+         * Mirror this snapshot into [PrefsBridge]'s hook-process cache.
+         *
+         * <p>The geometry keys are read twice per refresh: once here through the provider, and
+         * once through [PrefsBridge] from inside the settings object. Those two reads must not
+         * disagree. If the cache is left empty, [PrefsBridge.getInt] falls back to LSPosed's
+         * remote snapshot - the very handle that stays frozen for the whole process lifetime and
+         * was the original defect - and [PrefsBridge.getBoolean] / [PrefsBridge.getString] answer
+         * the *settings page's* default for a key the user never touched, which is not the same
+         * default this window uses. Filling the cache makes both reads answer from the same
+         * source, and a null field is left out on purpose so an untouched key keeps resolving
+         * its documented default instead of being pinned to a zero.
+         */
+        fun applyToHookCache() {
+            customEnable?.let { PrefsBridge.putHookCache("home_dock_bg_custom_enable", it) }
+            addBlur?.let { PrefsBridge.putHookCache("home_dock_add_blur", it.toString()) }
+            bgColor?.let { PrefsBridge.putHookCache("home_dock_bg_color", it) }
+            bgHeight?.let { PrefsBridge.putHookCache("home_dock_bg_height", it) }
+            marginHorizontal?.let { PrefsBridge.putHookCache("home_dock_bg_margin_horizontal", it) }
+            marginBottom?.let { PrefsBridge.putHookCache("home_dock_bg_margin_bottom", it) }
+            bgRadius?.let { PrefsBridge.putHookCache("home_dock_bg_radius", it) }
+            homeMode?.let { PrefsBridge.putHookCache("home_other_home_mode", it.toString()) }
+        }
+    }
+
+    /** Latest geometry read from the provider, or null before the first successful one. */
+    @Volatile private var liveGeometry: GeometrySnapshot? = null
+    private var geometryQueryAt = 0L
+    /** Last distinct geometry failure, so a per-sweep refusal is logged once, not every second. */
+    @Volatile private var geometryFailReason: String? = null
+
+    fun liveGeometry(): GeometrySnapshot? = liveGeometry
+
+    /**
+     * Re-read the Dock geometry snapshot from the module provider.
+     *
+     * <p>This exists for exactly the reason [refreshRevealStyle] does, applied to the knobs that
+     * one missed. The geometry is consumed in system_server, where LSPosed's remote preferences
+     * are a snapshot pushed by the daemon: when that push is lost - which a package replacement,
+     * an upgrade or a daemon restart all cause - every value stays frozen for the rest of the
+     * process lifetime. A launcher restart does not help, because the stale handle lives in
+     * system_server, not in the launcher. The only thing that recovered it before was rebooting
+     * the device, which is why the same build "sometimes" honoured a height change.
+     *
+     * <p>All eight values arrive in one cursor, so a sweep costs one cross-process query rather
+     * than eight synchronous Binder round trips through system_server.
+     */
+    fun refreshGeometry() {
+        val context = styleContext ?: return
+        if (closed) return
+        val now = SystemClock.uptimeMillis()
+        if (now - geometryQueryAt < GEOMETRY_QUERY_INTERVAL_MS) return
+        geometryQueryAt = now
+        worker.post {
+            guard("geometry query") {
+                catchingRecoverable({
+                    context.contentResolver.query(
+                        Uri.parse("$uri/dock_geometry"), null, null, null, null
+                    )?.use { cursor ->
+                        if (!cursor.moveToFirst()) return@use
+                        // Column order must match SharedPrefsProvider.DOCK_GEOMETRY_COLUMNS.
+                        val snapshot = GeometrySnapshot(
+                            customEnable = cursor.optInt(0)?.let { it != 0 },
+                            addBlur = cursor.optInt(1),
+                            bgColor = cursor.optInt(2),
+                            bgHeight = cursor.optInt(3),
+                            marginHorizontal = cursor.optInt(4),
+                            marginBottom = cursor.optInt(5),
+                            bgRadius = cursor.optInt(6),
+                            homeMode = cursor.optInt(7)
+                        )
+                        if (snapshot != liveGeometry) {
+                            liveGeometry = snapshot
+                            // The provider answered from the settings file, so it is the most
+                            // trustworthy source this process has. Publishing the same values into
+                            // PrefsBridge's hook cache is what makes the *next* synchronous
+                            // refreshSettings() - and every other DockGlass read - agree with it
+                            // instead of falling back to LSPosed's frozen snapshot.
+                            snapshot.applyToHookCache()
+                            record("geometry queried height=${snapshot.bgHeight} " +
+                                "margin=${snapshot.marginHorizontal} bottom=${snapshot.marginBottom} " +
+                                "radius=${snapshot.bgRadius} color=${snapshot.bgColor}")
+                            // Apply on the next traversal instead of waiting for the sweep, and
+                            // reset the throttle so the very next sweep re-reads it too.
+                            changed()
+                        }
+                    }
+                }) {
+                    // Report the refusal once per distinct reason. Silently swallowing it is what
+                    // hid the FLAG_ONEWAY rejection: the exception never reached any log we read,
+                    // so the failure looked like "no output" rather than "rejected".
+                    val reason = "${it.javaClass.simpleName}: ${it.message?.take(100)}"
+                    if (geometryFailReason != reason) {
+                        geometryFailReason = reason
+                        record("geometry query refused=$reason")
+                    }
+                }
+            }
+        }
+    }
+
+    /** A null column means "the user never set this", as opposed to a stored zero. */
+    private fun Cursor.optInt(index: Int): Int? {
+        if (isNull(index)) return null
+        return try {
+            getInt(index)
+        } catch (mismatch: ClassCastException) {
+            try {
+                getString(index)?.trim()?.toIntOrNull()
+            } catch (alsoMismatch: ClassCastException) {
+                null
+            }
+        }
+    }
 
     /**
      * Re-read the unlock fly-in style from the module provider.
@@ -997,6 +1210,10 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             catchingRecoverable({ styleContext?.contentResolver?.unregisterContentObserver(observer) })
         }
         styleObserver = null
+        geometryObservers.forEach { observer ->
+            catchingRecoverable({ styleContext?.contentResolver?.unregisterContentObserver(observer) })
+        }
+        geometryObservers.clear()
         if (workerDelegate.isInitialized()) worker.post {
             guard("closing") {
                 journal.record("glass client closing")

@@ -113,6 +113,34 @@ class HomeDockWindow : BaseHook() {
         const val MATERIAL_SETTLE_MS = 1_600L
         /** Slack added to the rotation settle window before asking for the resuming traversal. */
         const val ROTATION_RESUME_MARGIN_MS = 80L
+        /** "No scene accepted yet" for [Layer.nativeScene]; never written by the frame loop. */
+        const val NO_SCENE = -1
+        /**
+         * Rate limit for the one scene record the frame loop still writes.
+         *
+         * <p>A scene transition is the only interesting event in that loop, so it is kept - but a
+         * scene/scale pair that oscillates would otherwise write one record per flip at 120 Hz.
+         * 150 ms matches the sampling window [DockGlassClient.Journal] uses for its frame noise.
+         */
+        const val SCENE_LOG_MIN_GAP_MS = 150L
+    }
+
+    /**
+     * Sample-by-time console for a record whose interesting events are transitions.
+     *
+     * <p>Lives outside the companion because it carries mutable state; a plain object with an
+     * `@Volatile` stamp is enough for the frame loop, which is single-threaded under the layer lock.
+     */
+    private object SCENE_LOG {
+        @Volatile private var lastAtMs = 0L
+
+        /** @return true when this event should be recorded, and arms the window when it should. */
+        fun sample(): Boolean {
+            val now = SystemClock.uptimeMillis()
+            if (now - lastAtMs < SCENE_LOG_MIN_GAP_MS) return false
+            lastAtMs = now
+            return true
+        }
     }
     private object Surfaces {
         fun buildLayer(name: String, parent: Any, color: Boolean): Any {
@@ -179,7 +207,17 @@ class HomeDockWindow : BaseHook() {
         val nativeMotion: DockNativeMotion = DockNativeMotion(),
         var nativeUid: Int = -1, var nativePid: Int = -1,
         var nativeApplied: Boolean = false, var overview: Boolean = false,
-        var nativeScene: Int = -1,
+        /**
+         * Last scene this layer reacted to, or [NO_SCENE] when there is none.
+         *
+         * <p>Deliberately *not* the same thing as "not initialised". Every place that used to
+         * write `-1` here is a place that either dropped the identity or lost the sample, and
+         * writing the same sentinel from the frame loop's invisible branch made the value flip
+         * between `-1` and a real scene on alternating frames - one `native motion scene=` record
+         * per flip. Clearing the identity clears this along with it, so the sentinel keeps its
+         * intended meaning: no sample has been accepted for this layout.
+         */
+        var nativeScene: Int = NO_SCENE,
         var overviewGeneration: Long = 0, var nativeOverviewGeneration: Long = 0,
         var lastOverviewValidationNs: Long = 0,
         var lastVisible: Boolean? = null,
@@ -207,12 +245,28 @@ class HomeDockWindow : BaseHook() {
         fun resetNativeMotion() {
             nativeMotion.reset()
             nativeApplied = false
-            nativeScene = -1
+            nativeScene = NO_SCENE
             nativeSampleDeadlineNs = 0
             motionSamples = 0
             motionEndPending = false
             nativeUid = -1
             nativePid = -1
+            resetAutoAim()
+        }
+
+        /**
+         * Drop everything that authenticates a native sample, keeping the layout state.
+         *
+         * <p>This is the half of [resetNativeMotion] that a layer which merely stopped being
+         * visible needs: the sample it was following is gone, so the next accepted one must not be
+         * compared against a scene from the previous session - but the window is still the same
+         * window, so re-resolving its Session on every hidden frame would be pure churn.
+         */
+        fun clearNativeSample() {
+            nativeMotion.reset()
+            nativeApplied = false
+            nativeScene = NO_SCENE
+            nativeSampleDeadlineNs = 0
             resetAutoAim()
         }
 
@@ -416,12 +470,29 @@ class HomeDockWindow : BaseHook() {
      */
     private fun refreshSettings(): Boolean {
         val latest = runCatching { Settings.read() }.getOrNull() ?: return false
-        // The provider reads the file the settings UI wrote, so it is the source of truth for
-        // the reveal style; the remote snapshot system_server sees can be stale for a whole
-        // process lifetime when the daemon's push is lost.
-        val live = glassClient.liveRevealStyle()
-        val resolved = if (live == null) latest
-            else latest.copy(revealStyle = DockUnlockReveal.Style.of(live))
+        // The provider reads the file the settings UI wrote, so it is the source of truth. The
+        // remote snapshot system_server sees can be stale for a whole process lifetime when the
+        // daemon's push is lost, and nothing below the daemon - not a launcher restart, not a
+        // desktop reload - ever refreshes it. Both the style and the geometry are therefore
+        // overlaid from the provider; PrefsBridge remains the fallback for an unset key and for
+        // the window before the first successful query.
+        val liveStyle = glassClient.liveRevealStyle()
+        val liveGeometry = glassClient.liveGeometry()
+        var resolved = if (liveStyle == null) latest
+            else latest.copy(revealStyle = DockUnlockReveal.Style.of(liveStyle))
+        if (liveGeometry != null) {
+            resolved = resolved.copy(
+                enabled = liveGeometry.customEnable ?: resolved.enabled,
+                mode = liveGeometry.addBlur
+                    ?.let { DockWindowPolicy.normalizeBackgroundMode(it) } ?: resolved.mode,
+                color = liveGeometry.bgColor ?: resolved.color,
+                height = liveGeometry.bgHeight ?: resolved.height,
+                margin = liveGeometry.marginHorizontal ?: resolved.margin,
+                bottom = liveGeometry.marginBottom ?: resolved.bottom,
+                radius = liveGeometry.bgRadius ?: resolved.radius,
+                nightMode = liveGeometry.homeMode ?: resolved.nightMode
+            )
+        }
         if (resolved == settings) return false
         val previousStyle = settings.revealStyle
         settings = resolved
@@ -543,6 +614,7 @@ class HomeDockWindow : BaseHook() {
             // rebuilds the WindowState and traverses into here, but it never re-creates the hook.
             // The style query is asynchronous and throttled; its result lands on a later traversal.
             glassClient.refreshRevealStyle()
+            glassClient.refreshGeometry()
             refreshSettings()
             val title = attrs.title.toString()
             synchronized(layers) {
@@ -552,7 +624,16 @@ class HomeDockWindow : BaseHook() {
                 }
                 if (!isLauncher(window, attrs)) return
                 service = window.getObjectFieldAs<Any>("mWmService")
-                if (settings.enabled) glassClient.bindDiagnostics(service!!.getObjectFieldAs<Context>("mContext"))
+                // Unconditional on purpose: this is the *bootstrap* for the provider channel, so
+                // gating it on settings.enabled would deadlock. settings.enabled is itself only
+                // trustworthy once the provider has answered (see refreshSettings()), and the
+                // provider read needs styleContext, which only bindDiagnostics() assigns. Whenever
+                // LSPosed's remote push is lost - the exact failure this whole path exists to
+                // survive - the snapshot stays frozen at its old value, the gate never opens, and
+                // the geometry knobs can never be refreshed again. The context is only used for
+                // read-only content queries, so binding it while the dock is disabled costs one
+                // object reference and nothing else.
+                glassClient.bindDiagnostics(service!!.getObjectFieldAs<Context>("mContext"))
                 registerDisplayListener()
                 updateLayer(window)
                 scheduleNativeBindSweep()
@@ -828,10 +909,7 @@ class HomeDockWindow : BaseHook() {
             bindNativeMotion(window, layer)
             if (!visible) {
                 layer.motion.finish()
-                layer.nativeMotion.reset()
-                layer.nativeApplied = false
-                layer.nativeScene = -1
-                layer.nativeSampleDeadlineNs = 0
+                layer.clearNativeSample()
                 layer.resetAutoAim()
             } else if (!animationAvailable && !layer.nativeApplied) {
                 layer.motion.finish()
@@ -1682,11 +1760,7 @@ class HomeDockWindow : BaseHook() {
                         layer.motionTime = now
                         if (window.callMethod("isVisible") != true || layer.effect.callMethod(IS_VALID) != true) {
                             layer.motion.finish()
-                            layer.nativeMotion.reset()
-                            layer.nativeApplied = false
-                            layer.nativeScene = -1
-                            layer.nativeSampleDeadlineNs = 0
-                            layer.resetAutoAim()
+                            layer.clearNativeSample()
                             if (layer.reveal.needsFrame(now)) needsFrame = true
                             continue
                         }
@@ -1795,7 +1869,7 @@ class HomeDockWindow : BaseHook() {
             if (uid != layer.nativeUid || pid != layer.nativePid) {
                 layer.nativeMotion.reset()
                 layer.nativeApplied = false
-                layer.nativeScene = -1
+                layer.nativeScene = NO_SCENE
                 layer.nativeSampleDeadlineNs = 0
                 layer.resetAutoAim()
                 layer.nativeUid = uid
@@ -1855,6 +1929,15 @@ class HomeDockWindow : BaseHook() {
                     return@runCatching
                 }
                 val changed = refreshSettings()
+                // The provider read is what actually advances the geometry: the values
+                // refreshSettings() reads through PrefsBridge can be frozen for the whole
+                // process lifetime. It is posted, so its result lands on the next sweep - the
+                // cadence is the knob's own latency, not this tick's.
+                //
+                // This is the backstop, not the fast path: the geometry observers ask for the
+                // same read the moment the settings file changes. This tick is what covers a
+                // build whose provider notification never arrives.
+                glassClient.refreshGeometry()
                 // The rotation gate has to be polled here: a rotated app hides the launcher window,
                 // WMS stops traversing it, and nothing else observes the display while that lasts.
                 val rotationChanged = layerUpdate.refreshRotationGate()
@@ -1908,7 +1991,7 @@ class HomeDockWindow : BaseHook() {
             if (layer.nativeApplied) {
                 layer.nativeMotion.reset()
                 layer.nativeApplied = false
-                layer.nativeScene = -1
+                layer.nativeScene = NO_SCENE
                 layer.nativeSampleDeadlineNs = 0
                 layer.motion.finish()
             }
@@ -1925,7 +2008,11 @@ class HomeDockWindow : BaseHook() {
                 layer.nativeScene = sample.scene()
                 layer.motionSamples = 0
                 layer.motionEndPending = true
-                glassClient.record("native motion scene=${sample.scene()} scale=${sample.scale()}")
+                // Sampled, not verbatim: this is the one diagnostic in the frame loop that is not
+                // already in noisyPrefixes-form, and it still fires on every scene transition.
+                if (SCENE_LOG.sample()) {
+                    glassClient.record("native motion scene=${sample.scene()} scale=${sample.scale()}")
+                }
             }
             return layer.nativeMotion.offsetY(layer.density, layer.baseY)
         }
@@ -1937,7 +2024,7 @@ class HomeDockWindow : BaseHook() {
             layer.motion.resumeFrom(layer.nativeMotion.progress(), false, now)
             layer.nativeApplied = false
             layer.nativeMotion.reset()
-            layer.nativeScene = -1
+            layer.nativeScene = NO_SCENE
             layer.nativeSampleDeadlineNs = 0
             layer.motionSamples = 0
             layer.motionEndPending = true
