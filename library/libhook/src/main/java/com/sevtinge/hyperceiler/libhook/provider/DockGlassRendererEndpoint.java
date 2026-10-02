@@ -14,8 +14,12 @@ public final class DockGlassRendererEndpoint extends Binder {
     private volatile boolean closed;
 
     public DockGlassRendererEndpoint(Context context) {
-        if (Process.myUid() != Process.SYSTEM_UID
-            || !"com.android.systemui".equals(context.getPackageName())) {
+        // Do NOT gate on Process.myUid() == Process.SYSTEM_UID. That value is a fixed 1000 in
+        // AOSP, but OEM builds may host SystemUI under a dedicated app UID (observed: uid 10229
+        // / platform_app on HyperOS 4.0.0.28 for nezha, while dada still runs it as 1000).
+        // Identity is established by the package name plus the Broker's calling-side checks
+        // (/proc/<pid>/cmdline == com.android.systemui AND the uid is system or owned by it).
+        if (!"com.android.systemui".equals(context.getPackageName())) {
             throw new SecurityException("Renderer must run in SystemUI");
         }
         this.context = context;

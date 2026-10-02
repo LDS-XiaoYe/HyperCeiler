@@ -5,6 +5,7 @@ import android.app.Application
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Process
 import android.util.Log
 import com.sevtinge.hyperceiler.libhook.base.BaseHook
 import com.sevtinge.hyperceiler.libhook.provider.DockGlassRendererEndpoint
@@ -21,7 +22,14 @@ class DockGlassRendererSystemUI : BaseHook() {
     private var registrationThread: HandlerThread? = null
 
     override fun init() {
-        if (Application.getProcessName() != "com.android.systemui") return
+        val processName = Application.getProcessName()
+        if (processName != "com.android.systemui") {
+            // Unconditional logcat: raw Log bypasses the module log-level gate. A silent return
+            // here made a previous failure mode invisible for an entire investigation round.
+            Log.i("HyperCeiler.DockGlass",
+                "SystemUI renderer skipped: process=$processName uid=${Process.myUid()}")
+            return
+        }
         // OEM SystemUI Application names are obfuscated on newer builds. Use the framework
         // lifecycle dispatcher, after the real Application finished initialization.
         loadClass("android.app.Instrumentation").getDeclaredMethod(
@@ -39,13 +47,21 @@ class DockGlassRendererSystemUI : BaseHook() {
     }
 
     private fun install(context: Context) {
-        if (closed || !installed.compareAndSet(false, true)) return
-        val renderer = try { DockGlassRendererEndpoint(context) }
-        catch (error: Exception) {
+        // Wrap the whole body, not just the endpoint constructor: anything thrown before the
+        // register loop starts must still leave a trace, otherwise the renderer silently never
+        // appears and only the client-side "dependency unavailable" retries are visible.
+        try {
+            installLocked(context)
+        } catch (error: Exception) {
             installed.set(false)
-            Log.w("HyperCeiler.DockGlass", "SystemUI renderer setup failed", error)
-            return
+            Log.w("HyperCeiler.DockGlass",
+                "SystemUI renderer setup failed uid=${Process.myUid()} pkg=${context.packageName}", error)
         }
+    }
+
+    private fun installLocked(context: Context) {
+        if (closed || !installed.compareAndSet(false, true)) return
+        val renderer = DockGlassRendererEndpoint(context)
         endpoint = renderer
         val thread = HandlerThread("HC-DockRenderer-Register").apply { start() }
         registrationThread = thread
@@ -57,13 +73,15 @@ class DockGlassRendererSystemUI : BaseHook() {
                     "getService", String::class.java).invoke(null, "window") as? IBinder
                     ?: error("Window service not ready")
                 DockGlassRendererProtocol.register(window, renderer)
-                Log.i("HyperCeiler.DockGlass", "SystemUI renderer registered; app process not required")
+                Log.i("HyperCeiler.DockGlass",
+                    "SystemUI renderer registered; app process not required uid=${Process.myUid()}")
                 thread.quitSafely()
             } catch (error: Exception) {
                 if (attempt < 8) handler.postDelayed({ register(attempt + 1) },
                     minOf(500L shl attempt, 8_000L))
                 else {
-                    Log.w("HyperCeiler.DockGlass", "SystemUI renderer registration failed", error)
+                    Log.w("HyperCeiler.DockGlass",
+                        "SystemUI renderer registration failed uid=${Process.myUid()}", error)
                     thread.quitSafely()
                 }
             }
