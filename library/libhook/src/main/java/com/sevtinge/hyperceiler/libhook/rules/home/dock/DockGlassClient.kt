@@ -19,7 +19,6 @@
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
-import android.content.ContentProviderClient
 import android.database.Cursor
 import android.database.ContentObserver
 import android.net.Uri
@@ -36,6 +35,7 @@ import com.sevtinge.hyperceiler.common.log.XposedLog
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge
 import com.sevtinge.hyperceiler.common.utils.prefs.PrefType
 import com.sevtinge.hyperceiler.common.utils.prefs.PrefsChangeObserver
+import com.sevtinge.hyperceiler.libhook.provider.DockGlassRendererProtocol
 import io.github.lingqiqi5211.ezhooktool.core.callMethod
 import java.util.ArrayList
 import java.util.UUID
@@ -48,13 +48,14 @@ import java.util.UUID
  * "FATAL EXCEPTION IN SYSTEM PROCESS". Every asynchronous entry point therefore goes through
  * [guard], and recoverable failures are turned into a bounded retry instead of an escape.
  */
-internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, private val changed: () -> Unit,
+internal class DockGlassClient(private val rendererBroker: DockGlassRendererBroker, private val changed: () -> Unit,
     /** True while the display is rotated or has only just returned to natural rotation. */
     private val rotationSettling: () -> Boolean = { false },
     /** A retained texture needs only a portrait display, not the new-host settle delay. */
     private val rotationActive: () -> Boolean = { false }) {
     class Ticket(val key: String, val context: Context,
-        val bounds: DockWindowPolicy.Bounds, val dark: Boolean) {
+        val bounds: DockWindowPolicy.Bounds, val dark: Boolean,
+        private val rendererBroker: DockGlassRendererBroker) {
         val id: String = UUID.randomUUID().toString()
 
         /**
@@ -86,18 +87,13 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         var parcel: SurfaceControlViewHost.SurfacePackage? = null
         var lifetime: IBinder? = null
         var death: IBinder.DeathRecipient? = null
-        var client: ContentProviderClient? = null
+        var renderer: IBinder? = null
         var refreshes = 0
 
         fun request(method: String, args: Bundle? = null): Bundle {
-            // Keep an UNSTABLE reference for the lifetime of the active windowless host,
-            // instead of acquiring/releasing its process around every readiness check.
-            // Renderer death still never makes system_server a stable provider dependent.
-            val activeClient = client ?: context.contentResolver.acquireUnstableContentProviderClient(uri)
-                ?.also { client = it } ?: error("HyperCeiler provider unavailable")
-            // All callers recover/dispose on failure. Let dispose try releasing an
-            // existing live host before closing the reference, even after a failed call.
-            return activeClient.call(method, id, args) ?: Bundle.EMPTY
+            val active = renderer ?: rendererBroker.renderer()?.also { renderer = it }
+                ?: error("SystemUI renderer unavailable")
+            return DockGlassRendererProtocol.call(active, method, id, args)
         }
     }
 
@@ -150,15 +146,6 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
          * notification.
          */
         const val STYLE_QUERY_INTERVAL_MS = 30_000L
-
-        /**
-         * How long a burst of ring entries waits before it is handed to the provider.
-         *
-         * <p>Animations record per frame, so the previous 250 ms debounce turned a gesture into
-         * about four cross-process calls per second, each carrying up to 96 strings. The ring
-         * contents are unchanged - only the flush cadence is - so nothing is lost for diagnosis.
-         */
-        const val DIAGNOSTIC_FLUSH_MS = 1_000L
 
         /**
          * Bound of geometry-stale re-probes after a return.
@@ -214,20 +201,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     private val journal = Journal { worker }
 
     private class Journal(private val worker: () -> Handler) {
-        @Volatile private var diagnosticContext: Context? = null
         private val events = ArrayDeque<String>() // IPC worker only; no frame-by-frame history.
-        private var diagnosticFlushScheduled = false
-        private val diagnosticFlush = Runnable {
-            diagnosticFlushScheduled = false
-            flushDiagnostics()
-        }
-
-        fun bind(context: Context) {
-            if (diagnosticContext != null) return
-            diagnosticContext = context
-            worker().post { flushDiagnostics() }
-        }
-
         fun record(event: String) {
             if (isSampledFrameNoise(event)) return
             val message = "wall=${System.currentTimeMillis()} up=${SystemClock.uptimeMillis()} $event".take(512)
@@ -236,10 +210,6 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             worker().post {
                 if (events.size >= 96) events.removeFirst()
                 events.addLast(message)
-                if (!diagnosticFlushScheduled) {
-                    diagnosticFlushScheduled = true
-                    worker().postDelayed(diagnosticFlush, DIAGNOSTIC_FLUSH_MS)
-                }
             }
         }
 
@@ -269,32 +239,14 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
             return false
         }
 
-        private fun flushDiagnostics() {
-            val context = diagnosticContext ?: return
-            if (events.isEmpty()) return
-            catchingRecoverable({
-                val client = context.contentResolver.acquireUnstableContentProviderClient(uri)
-                    ?: return
-                client.use {
-                    it.call("dock_glass_record", null, Bundle().apply {
-                        putStringArray("events", events.toTypedArray())
-                    }) ?: error("No journal response")
-                }
-                events.clear()
-            })
-            // If boot-time provider acquisition fails, retain the bounded queue for the next event.
-        }
-
         fun finish() {
-            worker().removeCallbacks(diagnosticFlush)
-            flushDiagnostics()
+            events.clear()
         }
     }
 
     fun bindDiagnostics(context: Context) {
         styleContext = context
         if (!closed) {
-            journal.bind(context)
             watchRevealStyle(context)
             watchGeometry(context)
             // Bootstrap the style as well; the caller's pre-bind refresh had no context.
@@ -353,7 +305,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                     false, type, key, null) {
                     override fun onChange(changedType: PrefType, changed: Uri?, name: String?, def: Any?) {
                         geometryQueryAt = 0L
-                        refreshGeometry()
+                        refreshGeometry(force = true)
                     }
                 })
             }
@@ -433,9 +385,10 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
      * <p>All eight values arrive in one cursor, so a sweep costs one cross-process query rather
      * than eight synchronous Binder round trips through system_server.
      */
-    fun refreshGeometry() {
+    fun refreshGeometry(force: Boolean = false) {
         val context = styleContext ?: return
         if (closed) return
+        if (!force && liveGeometry != null) return // No periodic application wakeups after bootstrap.
         val now = SystemClock.uptimeMillis()
         if (now - geometryQueryAt < GEOMETRY_QUERY_INTERVAL_MS) return
         geometryQueryAt = now
@@ -546,6 +499,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     fun refreshRevealStyle(force: Boolean = false) {
         val context = styleContext ?: return
         if (closed) return
+        if (!force && liveRevealStyle != null) return
         if (!styleRefreshGate.request(SystemClock.uptimeMillis(), force)) return
         val posted = worker.post {
             try {
@@ -602,7 +556,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     }
 
     fun create(context: Context, key: String, bounds: DockWindowPolicy.Bounds, dark: Boolean): Ticket {
-        val ticket = Ticket(key, context, bounds, dark)
+        val ticket = Ticket(key, context, bounds, dark, rendererBroker)
         bindDiagnostics(context)
         worker.post { guard("create") { attemptCreate(ticket) } }
         return ticket
@@ -614,9 +568,8 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         record("glass create id=${ticket.id} attempt=${ticket.gate.getAttempts()}")
         try {
             check(dispose(ticket)) { "Previous glass surface could not be detached" }
-            if (!processGuard.acquire(ticket.context, ticket)) {
-                // The package is mid-replacement: nothing is broken and nothing may be
-                // disposed. Park the generation and retry on the dependency cadence.
+            if (rendererBroker.renderer() == null) {
+                // Wait for SystemUI to register; never start/protect the HyperCeiler process.
                 deferForDependency(ticket)
                 return
             }
@@ -627,7 +580,6 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                 putBinder("owner", owner)
             }
             val response = ticket.request("dock_glass_create", args)
-            processGuard.setPid(ticket, response.getInt("rendererPid", -1))
             response.classLoader = SurfaceControlViewHost.SurfacePackage::class.java.classLoader
             ticket.parcel = response.getParcelable("surface", SurfaceControlViewHost.SurfacePackage::class.java)
                 ?: error(response.getString("error") ?: "Renderer returned no surface")
@@ -1197,13 +1149,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         scheduleRetry(ticket, outcome, ticket.gate.getRetryDelayMs())
     }
 
-    /**
-     * The HyperCeiler package itself is momentarily unresolvable, typically because it is
-     * being replaced by an in-place upgrade.
-     *
-     * <p>Nothing is disposed and no compatibility budget is consumed: this is an external,
-     * self-healing outage. The retry cadence is capped, so a long outage stays bounded.
-     */
+    /** Await the SystemUI endpoint without consuming the compatibility retry budget. */
     private fun deferForDependency(ticket: Ticket) {
         val outcome = ticket.gate.requestDependencyDefer(closed)
         if (outcome == DockGlassRecoveryGate.Outcome.IGNORED) return
@@ -1286,11 +1232,9 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
         ticket.parcel = null
         // Do not reacquire/start a renderer merely to release a failed acquisition.
         try {
-            if (ticket.client != null) catchingRecoverable({ ticket.request("dock_glass_release") })
+            if (ticket.renderer != null) catchingRecoverable({ ticket.request("dock_glass_release") })
         } finally {
-            catchingRecoverable({ ticket.client?.close() })
-            ticket.client = null
-            processGuard.release(ticket)
+            ticket.renderer = null
         }
         return true
     }
