@@ -123,9 +123,9 @@ int main() {
 #if SNAPSHOT
     // Bounded entries: no eviction or nested invocation leaks another grid/frame.
     WorkspaceRenderSnapshot bounded;
-    for (uintptr_t i=1; i<=9; ++i) bounded.rendered(i,4,7,90,100,0,0,90,100-i);
-    double g[4]; ++checks; if (bounded.geometry(1,4,7,90,100,g)) ++failed;
-    ++checks; if (!bounded.geometry(9,4,7,90,100,g)) ++failed;
+    for (uintptr_t i=1; i<=9; ++i) bounded.rendered(i,4,7,90,100+i,0,0,90,100-i);
+    double g[4]; ++checks; if (bounded.geometry(1,4,7,90,101,g)) ++failed;
+    ++checks; if (!bounded.geometry(9,4,7,90,109,g)) ++failed;
     eq(g[3],91);
     bounded.begin_preview(100,20); bounded.begin_preview(200,30);
     eq(bounded.finish_preview(100,0),20); eq(bounded.finish_preview(200,0),30);

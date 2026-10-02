@@ -18,8 +18,8 @@ assert 'workspace_write(fp, -0x18, workspace_read<double>(fp, -0x30))' in h
 assert 'workspace_read<double>(fp, -0x18)' in h
 assert 'top & 7' in (root/'app/src/main/cpp/targets/home/home_indicator_pair.h').read_text()
 assert 'thread_local home_layout::WorkspaceRenderSnapshot rendered_workspace' in c
-assert 'folder_ready || g_knobs[2]' in c
-assert c.count('&rendered_workspace') == 2
+assert 'folder_ready || drop_ready || g_knobs[2]' in c
+assert c.count('&rendered_workspace') == 3
 assert 'rendered->begin_preview(fp, valid ? g[1] : 0)' in h
 assert 'rendered->finish_preview(fp, top)' in h
 print('folder original-body guards: PASS (5 windows; whole bodies; +16 outside patches; partial install stock fallback; outgoing argument overwrite; rendered/off-state snapshots; thread-local cache; SP16/Dart8)')
