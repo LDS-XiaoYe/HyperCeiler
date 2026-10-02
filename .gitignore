@@ -19,3 +19,6 @@ signing.properties
 *.apk
 /handover/
 /.workbuddy/
+
+# AI agent working conventions (kept locally, not tracked)
+AGENTS.md
