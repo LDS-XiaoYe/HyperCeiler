@@ -23,6 +23,9 @@ void start_home_layout_hooks(const char *site, int (*hook)(void *, void *, void 
 void prime_home_layout_probe(int (*hook)(void *, void *, void **), int (*unhook)(void *));
 void home_layout_prepare_for_launcher_child();
 void prime_home_layout_knobs(int (*hook)(void *, void *, void **), int (*unhook)(void *));
+void home_layout_set_desktop_title_size(int sp);
+void home_layout_set_drawer_title_size(int sp);
+void home_layout_set_title_color(int argb);
 // Launcher tweaks runtime (symbol-table / signature located code patches, see targets/home/tweaks).
 namespace hometweaks {
 void StartHomeTweaks();
@@ -333,6 +336,42 @@ Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_native
 #ifdef HYPERCEILER_DOCK_NATIVE_MOTION
     set_dock_motion_feature_enabled(enabled == JNI_TRUE);
 #endif
+    return native_status();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_nativeSetDesktopTitleSize(
+    JNIEnv *, jobject, jint sp) {
+    if (is_launcher_process() && sp >= 0 && sp <= 20) {
+        home_layout_set_desktop_title_size(sp);
+        if (g_hook_function != nullptr) {
+            start_home_layout_hooks("title-size", g_hook_function, g_unhook_function);
+        }
+    }
+    return native_status();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_nativeSetDrawerTitleSize(
+    JNIEnv *, jobject, jint sp) {
+    if (is_launcher_process() && sp >= 0 && sp <= 20) {
+        home_layout_set_drawer_title_size(sp);
+        if (g_hook_function != nullptr) {
+            start_home_layout_hooks("drawer-title-size", g_hook_function, g_unhook_function);
+        }
+    }
+    return native_status();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_sevtinge_hyperceiler_libhook_rules_home_other_NativeHomeHooksOS4_nativeSetTitleColor(
+    JNIEnv *, jobject, jint argb) {
+    if (is_launcher_process()) {
+        home_layout_set_title_color(argb);
+        if (argb != -1 && g_hook_function != nullptr) {
+            start_home_layout_hooks("title-color", g_hook_function, g_unhook_function);
+        }
+    }
     return native_status();
 }
 

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "home_layout_config.h"
+#include "home_widget_move.h"
 
 #include <android/binder_ibinder.h>
 #include <android/log.h>
@@ -155,7 +156,7 @@ const AIBinder_Class *window_class() {
  * are the minority.
  */
 constexpr char kCacheMagic[4] = {'H', 'C', 'L', 'C'};
-constexpr uint32_t kCacheVersion = 5;
+constexpr uint32_t kCacheVersion = 9;
 constexpr const char *kCachePath = "/data/user/0/com.miui.home/files/layout_config_cache.bin";
 constexpr const char *kCacheTmpPath = "/data/user/0/com.miui.home/files/layout_config_cache.bin.tmp";
 
@@ -193,6 +194,18 @@ void serialize_config(const Config &config, std::vector<uint8_t> &out) {
     put_u32(config.tweaks.animation_recents_enabled ? 1 : 0);
     put_u32(static_cast<uint32_t>(config.tweaks.animation_recents_rate_percent));
     put_u32(config.tweaks.hotseat_unlimited ? 1 : 0);
+    put_u32(static_cast<uint32_t>(config.title_desktop_sp));
+    put_u32(static_cast<uint32_t>(config.title_drawer_sp));
+    put_u32(static_cast<uint32_t>(config.title_color));
+    put_u32(config.title_hide_new_install ? 1U : 0U);
+    put_u32(static_cast<uint32_t>(config.title_custom_labels.size()));
+    for (const auto &row : config.title_custom_labels) {
+        for (const auto *text : {&row.package, &row.label}) {
+            put_u32(static_cast<uint32_t>(text->size()));
+            for (char16_t unit : *text) put_u32(unit);
+        }
+    }
+    put_u32(config.widget_allow_move ? 1U : 0U);
 }
 
 bool parse_config(const std::vector<uint8_t> &data, Config &config) {
@@ -200,7 +213,9 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
     if (std::memcmp(data.data(), kCacheMagic, 4) != 0) return false;
     uint32_t version = 0;
     std::memcpy(&version, data.data() + 4, 4);
-    if (version != 4 && version != kCacheVersion) return false;
+    if (version != 4 && version != 5 && version != 6 && version != 7 && version != 8
+        && version != kCacheVersion)
+        return false;
     size_t at = 8;
     auto get_u32 = [&]() -> std::optional<uint32_t> {
         if (at + 4 > data.size()) return std::nullopt;
@@ -240,6 +255,36 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
         static_cast<int>(*flm), static_cast<int>(*fln), *ie != 0,
         static_cast<int>(*ic), *rh != 0, *rn != 0,
         *oe != 0, static_cast<int>(*op), *re != 0, static_cast<int>(*rr), *hu != 0};
+    if (version >= 6) {
+        const auto desktop = get_u32();
+        const auto drawer = get_u32();
+        const auto color = get_u32();
+        if (!desktop || !drawer || !color || *desktop > 20 || *drawer > 20) return false;
+        config.title_desktop_sp = static_cast<int>(*desktop);
+        config.title_drawer_sp = static_cast<int>(*drawer);
+        config.title_color = static_cast<int32_t>(*color);
+    }
+    if (version >= 7) {
+        const auto hide = get_u32();
+        if (!hide || *hide > 1) return false;
+        config.title_hide_new_install = *hide != 0;
+    }
+    if (version >= 8) {
+        const auto read = [&](int32_t &value) {
+            const auto next = get_u32();
+            if (!next) return false;
+            value = static_cast<int32_t>(*next); return true;
+        };
+        if (!home_title::read_custom_titles(read, config.title_custom_labels))
+            return false;
+    }
+    config.widget_allow_move = false;
+    if (version >= 9) {
+        const auto move = get_u32();
+        if (!move || *move > 1) return false;
+        config.widget_allow_move = *move != 0;
+    }
+    if (version >= 8 && at != data.size()) return false;
     return true;
 }
 
@@ -263,10 +308,13 @@ bool read_config_cache(Config &config) {
     std::vector<uint8_t> data;
     uint8_t buffer[512];
     size_t read = 0;
-    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0)
+    while ((read = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        if (data.size() + read > 160 * 1024) { std::fclose(file); return false; }
         data.insert(data.end(), buffer, buffer + read);
+    }
+    const bool complete = !std::ferror(file);
     std::fclose(file);
-    return parse_config(data, config);
+    return complete && parse_config(data, config);
 }
 
 } // namespace
@@ -349,6 +397,27 @@ static bool query_binder(Config &result) {
         }
     }
     if (valid && AParcel_readInt32(output, &tweaks[16]) != STATUS_OK) tweaks[16] = 0;
+    int32_t title[4] = {12, 12, -1, 0};
+    if (valid && AParcel_readInt32(output, &title[0]) == STATUS_OK) {
+        valid = AParcel_readInt32(output, &title[1]) == STATUS_OK
+            && AParcel_readInt32(output, &title[2]) == STATUS_OK;
+    } else {
+        title[0] = 12; // AParcel does not guarantee an untouched out-param on old endpoints.
+    }
+    if (valid && AParcel_readInt32(output, &title[3]) != STATUS_OK) title[3] = 0;
+    int32_t custom_magic = 0;
+    if (valid && AParcel_readInt32(output, &custom_magic) == STATUS_OK) {
+        const auto read = [&](int32_t &value) {
+            return AParcel_readInt32(output, &value) == STATUS_OK;
+        };
+        valid = custom_magic == home_title::kCustomMagic
+            && home_title::read_custom_titles(read, candidate.title_custom_labels);
+    } // Older endpoints have no custom block; their authoritative default is an empty list.
+    if (valid) {
+        valid = read_widget_move_extension([&](int32_t &word) {
+            return AParcel_readInt32(output, &word) == STATUS_OK;
+        }, candidate.widget_allow_move);
+    } // Older endpoints default this new feature to off, never consume another field as a flag.
     const auto flag = [](int32_t value) { return value == 0 || value == 1; };
     const auto within = [](int32_t value, int32_t lo, int32_t hi) {
         return value >= lo && value <= hi;
@@ -361,7 +430,8 @@ static bool query_binder(Config &result) {
         && flag(tweaks[12]) && within(tweaks[13], 30, 200)
         && flag(tweaks[14]) && within(tweaks[15], 30, 200) && flag(tweaks[16]);
     if (output != nullptr) AParcel_delete(output);
-    if (!valid || !tweaks_ok) {
+    if (!valid || !tweaks_ok || !within(title[0], 0, 20)
+        || !within(title[1], 0, 20) || !flag(title[3])) {
         /*
          * One line for the whole failure, because "config unavailable" on the launcher side used to be
          * the only symptom and it cannot tell a dead transact from a rejected snapshot.
@@ -382,6 +452,10 @@ static bool query_binder(Config &result) {
         tweaks[9] != 0, tweaks[8],
         tweaks[10] != 0, tweaks[11] != 0,
         tweaks[12] != 0, tweaks[13], tweaks[14] != 0, tweaks[15], tweaks[16] != 0};
+    candidate.title_desktop_sp = title[0];
+    candidate.title_drawer_sp = title[1];
+    candidate.title_color = title[2];
+    candidate.title_hide_new_install = title[3] != 0;
     result = candidate;
     return true;
 }

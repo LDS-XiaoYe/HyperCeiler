@@ -19,8 +19,31 @@ namespace hometweaks {
 namespace {
 
 const TargetFunction kTargets[] = {
+        {"AssistantDragToPAHandler.canDragToPA", "AssistantDragToPAHandler.canDragToPA", "OS4 安卓小部件负一屏原逻辑"},
+        {"AssistantDragToPAHandler._isSpanSupportedByPa", "AssistantDragToPAHandler._isSpanSupportedByPa", "OS4 小部件尺寸校验"},
+        {"AssistantDragToPAHandler._ensureDragSessionId", "AssistantDragToPAHandler._ensureDragSessionId", "OS4 小部件交接校验"},
+        // Only registered names survive the mini-ELF scan. These are validation/render targets,
+        // not UI switches; omitting one makes original-body title injection silently do nothing.
+        {"ShortcutIconWidget._buildTextWidget", "ShortcutIconWidget._buildTextWidget", "OS4 桌面标题原逻辑"},
+        {"GridConfig.getTitleTextSize", "GridConfig.getTitleTextSize", "OS4 抽屉标题字号"},
+        {"AppIcon.build", "AppIcon.build", "OS4 抽屉标题构建"},
+        {"ShortcutIconWidget.getTextColor", "ShortcutIconWidget.getTextColor", "OS4 桌面标题颜色"},
+        {"Color.withAlpha", "Color.withAlpha", "OS4 颜色字段和分配器校验"},
+        {"ShortcutInfoModel.getPackageName", "ShortcutInfoModel.getPackageName", "OS4 自定义标题数据路径校验"},
+        {"ShortcutInfoModel.getComponentName", "ShortcutInfoModel.getComponentName", "OS4 自定义标题数据路径校验"},
+        {"PinShortcutInfoModel.getComponentName", "PinShortcutInfoModel.getComponentName", "OS4 自定义标题数据路径校验"},
+        {"ShortcutInfoModel.copyShortcutModel", "ShortcutInfoModel.copyShortcutModel", "OS4 自定义标题数据路径校验"},
+        {"PinShortcutInfoModel.copyShortcutModel", "PinShortcutInfoModel.copyShortcutModel", "OS4 自定义标题数据路径校验"},
+        {"PinShortcutInfoModel.makePinAppComponentName", "PinShortcutInfoModel.makePinAppComponentName", "OS4 自定义标题数据路径校验"},
+        {"ShortcutIconWidgetConfig.customShortcutIconConfig", "ShortcutIconWidgetConfig.customShortcutIconConfig", "OS4 抽屉文字组件配置"},
+        {"allocateTwoByteString", "allocateTwoByteString", "OS4 自定义标题数据路径校验"},
+        {"ShortcutIconWidget.getPrefixAssetName", "ShortcutIconWidget.getPrefixAssetName", "OS4 新安装标题标记"},
+        {"FolderInfoModel.hasNewInstalledApp", "FolderInfoModel.hasNewInstalledApp", "OS4 文件夹新安装标记"},
+        {"FolderIconGetxController.updateNewInstallNotification", "FolderIconGetxController.updateNewInstallNotification", "OS4 新安装标记调用校验"},
+        {"ShortcutIconWidget._addNewInstallLight", "ShortcutIconWidget._addNewInstallLight", "OS4 新安装光效"},
         {"WidgetPositionUtil.getCellPosition", "WidgetPositionUtil.getCellPosition", "OS4 文件夹动画坐标原逻辑"},
         {"FolderIconGetxController.calOriginPreviewIconLoc", "FolderIconGetxController.calOriginPreviewIconLoc", "OS4 文件夹动画尺寸原逻辑"},
+        {"CellLayoutGetxController.calculateCenterGlobalPosition", "CellLayoutGetxController.calculateCenterGlobalPosition", "OS4 拖放回位中心原逻辑"},
         // OS4 original-body splice/branch guards. Registration does not hook getters.
         {"HotSeatLayoutDelegate.cellLayout", "HotSeatLayoutDelegate.cellLayout", "OS4 原逻辑注入校验"},
         {"LauncherIndicatorState._buildScreenIndicator", "LauncherIndicatorState._buildScreenIndicator", "OS4 原逻辑注入校验"},
@@ -306,13 +329,19 @@ bool VaInExecSegment(const Image& image, uint32_t va) {
     return false;
 }
 
-bool LooksLikeDartFunction(const Image& image, uint32_t va) {
+bool LooksLikeDartFunction(const Image& image, uint32_t va, const char *name, uint32_t size) {
     if (!VaInExecSegment(image, va)) return false;
     if (va < 8) return false;
     const uint32_t* p = reinterpret_cast<const uint32_t*>(
             image.base + static_cast<uintptr_t>(va));
-    return p[0] == 0xA9BF79FDu  &&
-           p[1] == 0xAA0F03FDu ;
+    if (p[0] == 0xA9BF79FDu && p[1] == 0xAA0F03FDu) return true;
+    // These verified leaf/stub functions intentionally have no Dart frame prologue.
+    // Keep the exception exact-name/size/opcode scoped; never accept arbitrary code.
+    if (NameEquals(name, "ShortcutInfoModel.getComponentName") && size == 0x48)
+        return p[0] == 0xd28020f1u && p[1] == 0xb8716822u;
+    if (NameEquals(name, "allocateTwoByteString") && size == 0xec)
+        return p[0] == 0xf94001e2u && p[1] == 0x93407c42u;
+    return false;
 }
 
 void SetStatus(char* buf, size_t cap, const char* fmt, ...) {
@@ -562,7 +591,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
         if (size_[t] == 0 || size_[t] > kMaxFunctionBytes) {
             size_[t] = (size_[t] == 0) ? 0 : kMaxFunctionBytes;
         }
-        if (size_[t] == 0 || !LooksLikeDartFunction(image, va_[t])) {
+        if (size_[t] == 0 || !LooksLikeDartFunction(image, va_[t], kTargets[t].fullName, size_[t])) {
             has_[t] = false;
             size_[t] = 0;
             va_[t] = 0;

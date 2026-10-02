@@ -2,6 +2,7 @@
 #pragma once
 
 #include "home_layout_knobs.h"
+#include "home_title_custom.h"
 
 #include <array>
 
@@ -74,6 +75,12 @@ struct Config {
      */
     std::array<KnobConfig, HC_LAYOUT_KNOB_COUNT> knobs{};
     TweaksConfig tweaks{};
+    int title_desktop_sp = 12;
+    int title_drawer_sp = 12;
+    int title_color = -1;
+    bool title_hide_new_install = false;
+    bool widget_allow_move = false;
+    std::vector<home_title::CustomTitle> title_custom_labels;
 };
 
 /** Read the module preference snapshot through the authenticated WMS Binder endpoint. */

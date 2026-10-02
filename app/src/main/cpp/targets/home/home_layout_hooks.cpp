@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "home_layout_config.h"
+#include "home_title_render.h"
 #include "home_layout_knobs.h"
 #include "home_workspace_geometry.h"
 #include "home_folder_geometry.h"
+#include "home_drop_geometry.h"
 #include "home_indicator_pair.h"
 #include "home_hotseat_capacity.h"
+#include "home_widget_move.h"
 #include "home_layout_elf_targets.h"
 #include "nativehook/hook_bank.h"
 #include "nativehook/memory_io.h"
@@ -51,6 +54,7 @@ bool dock_motion_screen_active();
 #include <cstdlib>
 #include <fstream>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -100,6 +104,45 @@ void hc_layout_config_capture_entry();
 void hc_layout_dock_capture_entry();
 void hc_layout_passthrough_entry();
 void *hc_layout_passthrough_original = nullptr;
+void hc_title_color_entry();
+void *hc_title_color_original = nullptr;
+uintptr_t hc_title_color_continue = 0;
+uint32_t hc_title_color_enabled = 0;
+uint64_t hc_title_color_clone(uint64_t color, uint64_t thread);
+void hc_drawer_title_entry();
+double hc_drawer_title_baseline = 12.0;
+void hc_drawer_title_height_entry();
+void *hc_drawer_title_height_original = nullptr;
+uintptr_t hc_drawer_title_height_continue = 0;
+void *hc_drawer_title_original = nullptr;
+uintptr_t hc_drawer_title_caller = 0;
+uintptr_t hc_drawer_title_continue = 0;
+uint32_t hc_drawer_title_sp = 12;
+uint32_t hc_drawer_title_override = 0;
+void hc_desktop_title_entry();
+void *hc_desktop_title_original = nullptr;
+uintptr_t hc_desktop_title_continue = 0;
+uint32_t hc_desktop_title_sp = 12;
+double hc_shared_drawer_title_baseline = 12.0;
+double hc_desktop_title_baseline = 12.0; // Native scalar only, written by the Dart UI builder.
+void hc_desktop_title_height_entry();
+void *hc_desktop_title_height_original = nullptr;
+uintptr_t hc_desktop_title_height_continue = 0;
+uint32_t hc_title_hide_new_install = 0;
+uint32_t hc_title_custom_enabled = 0;
+void hc_title_custom_entry();
+void *hc_title_custom_original = nullptr;
+uintptr_t hc_title_custom_continue = 0;
+uint64_t hc_title_custom_label(uint64_t original, uint64_t model, uint64_t heap,
+    uint64_t thread, uint64_t dispatch, uint64_t null_object, uint32_t site);
+void hc_title_prefix_entry();
+void *hc_title_prefix_original = nullptr;
+void hc_title_folder_new_entry();
+void *hc_title_folder_new_original = nullptr;
+uintptr_t hc_title_folder_new_caller = 0;
+void hc_title_light_entry();
+void *hc_title_light_original = nullptr;
+uint32_t hc_title_is_new_asset(uint64_t text);
 void hc_layout_capsule_entry();
 void hc_layout_indicator_policy_entry();
 void hc_layout_indicator_edit_result_entry();
@@ -121,6 +164,13 @@ uint64_t hc_layout_folder_hits[5]{};
 void *hc_layout_folder_original[5]{};
 uint32_t hc_layout_folder_enabled = 0;
 void hc_layout_folder_body(uintptr_t frame, uint64_t heap, uintptr_t saved, unsigned kind);
+void hc_layout_drop_0_entry();
+void hc_layout_drop_1_entry();
+uintptr_t hc_layout_drop_resume[2]{};
+uint64_t hc_layout_drop_hits[2]{};
+void *hc_layout_drop_original[2]{};
+uint32_t hc_layout_drop_enabled = 0;
+void hc_layout_drop_body(uintptr_t frame, uint64_t heap, uintptr_t saved, unsigned kind);
 void hc_layout_workspace_entry();
 void hc_layout_workspace_occupied_entry();
 void hc_layout_hotseat_horizontal_entry();
@@ -191,7 +241,17 @@ constexpr size_t kAnimationMagicSlot = kAnimationHookSlot + 1;
  */
 constexpr size_t kIndicatorDotSlot = kAnimationMagicSlot + 1;
 constexpr size_t kFolderGeometrySlotBase = kIndicatorDotSlot + 1;
-constexpr size_t kSlotCount = kFolderGeometrySlotBase + 5;
+constexpr size_t kDropGeometrySlotBase = kFolderGeometrySlotBase + 5;
+constexpr size_t kTitleColorSlot = kDropGeometrySlotBase + 2;
+constexpr size_t kDrawerTitleSlot = kTitleColorSlot + 1;
+constexpr size_t kDesktopTitleSlot = kDrawerTitleSlot + 1;
+constexpr size_t kTitlePrefixSlot = kDesktopTitleSlot + 1;
+constexpr size_t kTitleFolderNewSlot = kTitlePrefixSlot + 1;
+constexpr size_t kTitleLightSlot = kTitleFolderNewSlot + 1;
+constexpr size_t kDesktopTitleHeightSlot = kTitleLightSlot + 1;
+constexpr size_t kDrawerTitleHeightSlot = kDesktopTitleHeightSlot + 1;
+constexpr size_t kTitleCustomSlot = kDrawerTitleHeightSlot + 1;
+constexpr size_t kSlotCount = kTitleCustomSlot + 1;
 using Slot = nhk::InlineSlot<kPatchWords>;
 using Words = nhk::SlotWords<kPatchWords>;
 /* The companion slot's payload, declared here because `Words` only exists from this line down. */
@@ -206,6 +266,53 @@ std::atomic_bool g_started{false};
  * crash, not a no-op. Hook-based knobs (adjust a function's return value) do not need this gate.
  */
 std::atomic_bool g_field_writes_enabled{false};
+/* Only the title-size field is promoted to production: its exact getter and field path are
+ * re-validated against the loaded Dart image before any heap write. Other experimental layout
+ * field rewrites remain behind debug.hyperceiler.layout.knobs_enable. */
+std::atomic_int g_title_desktop_sp{12};
+std::atomic_int g_title_drawer_sp{12};
+std::atomic_int g_title_color{-1};
+bool g_desktop_title_bound = false;
+bool g_title_color_bound = false;
+bool g_drawer_title_bound = false;
+bool g_title_hide_bound = false;
+std::atomic_bool g_title_custom_bound{false};
+uintptr_t g_title_component_method = 0, g_title_pin_method = 0;
+using CustomTitles = std::vector<home_title::CustomTitle>;
+std::shared_ptr<const CustomTitles> g_title_names;
+
+void sync_title_config(const home_layout::Config &config) {
+    const auto previous = std::atomic_load_explicit(&g_title_names, std::memory_order_acquire);
+    if (!previous || *previous != config.title_custom_labels) {
+        std::atomic_store_explicit(&g_title_names, std::make_shared<const CustomTitles>(config.title_custom_labels),
+            std::memory_order_release);
+        __android_log_print(ANDROID_LOG_INFO, kTag, "title custom snapshot entries=%zu",
+            config.title_custom_labels.size());
+    }
+    __atomic_store_n(&hc_title_custom_enabled, !config.title_custom_labels.empty() ? 1U : 0U,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_title_hide_new_install, config.title_hide_new_install ? 1U : 0U,
+        __ATOMIC_RELEASE);
+    const int old_desktop = g_title_desktop_sp.exchange(config.title_desktop_sp,
+        std::memory_order_acq_rel);
+    const int old_drawer = g_title_drawer_sp.exchange(config.title_drawer_sp,
+        std::memory_order_acq_rel);
+    const int old_color = g_title_color.exchange(config.title_color, std::memory_order_acq_rel);
+    __atomic_store_n(&hc_desktop_title_sp, static_cast<uint32_t>(config.title_desktop_sp),
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_drawer_title_sp, static_cast<uint32_t>(config.title_drawer_sp),
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_drawer_title_override,
+        config.title_drawer_sp != 12 ? 1U : 0U,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_title_color_enabled, config.title_color != -1 ? 1U : 0U,
+        __ATOMIC_RELEASE);
+    if (old_desktop != config.title_desktop_sp || old_drawer != config.title_drawer_sp
+        || old_color != config.title_color) {
+        __android_log_print(ANDROID_LOG_INFO, kTag, "title snapshot desktop=%d drawer=%d color=%#x",
+            config.title_desktop_sp, config.title_drawer_sp, config.title_color);
+    }
+}
 std::atomic_int g_attempts{0};
 std::atomic_bool g_ready{false};
 std::atomic_bool g_dart_ready{false};
@@ -1310,6 +1417,41 @@ void bind_folder_geometry() {
     }
 }
 
+void bind_drop_geometry() {
+    if (g_slots[kDropGeometrySlotBase].address != 0 || !g_dart) return;
+    uint32_t va = 0, size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kDropGeometrySymbol, &va, &size)
+        || size != home_layout::kDropGeometrySize) return;
+    std::vector<uint32_t> body;
+    if (!dart_words(va, size / 4, body)) return;
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (const uint32_t word : body) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash ^= (word >> shift) & 0xffu;
+            hash *= 0x100000001b3ULL;
+        }
+    }
+    if (hash != home_layout::kDropGeometryHash || body[0] != kDartPrologue
+        || body[1] != 0xaa0f03fd || body[2] != 0xd10141ef) return;
+    const void *entries[] = {reinterpret_cast<void *>(hc_layout_drop_0_entry),
+        reinterpret_cast<void *>(hc_layout_drop_1_entry)};
+    std::array<Slot, 2> candidates{};
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto &spec = home_layout::kDropGeometrySites[i];
+        if (!std::equal(std::begin(spec.words), std::end(spec.words),
+                body.begin() + spec.offset / 4)) return;
+        auto &slot = candidates[i];
+        if (!bind_dart_target(va + spec.offset, slot.address, slot.source,
+                slot.original_words)) return;
+        slot.replacement = const_cast<void *>(entries[i]);
+        slot.original = &hc_layout_drop_original[i];
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        g_slots[kDropGeometrySlotBase + i] = candidates[i];
+        hc_layout_drop_resume[i] = candidates[i].address + 16;
+    }
+}
+
 size_t bind_knobs() {
     if (!ensure_dart_library()) return 0;
 
@@ -1404,6 +1546,7 @@ size_t bind_knobs() {
     // it binds and arms even when the field-write channel is off (the default).
     bind_indicator_dot_target();
     bind_folder_geometry();
+    bind_drop_geometry();
     if (!g_field_writes_enabled.load(std::memory_order_relaxed)) {
         size_t hooked = 0;
         for (const KnobRuntime &knob : g_knobs) {
@@ -1511,6 +1654,158 @@ size_t arm_captures() {
     return 2;
 }
 
+bool bind_title_color() {
+    if (g_title_color_bound) return true;
+    if (g_title_color.load(std::memory_order_acquire) == -1 || !g_dart) return false;
+    uint32_t getter = 0, getter_size = 0, clone = 0, clone_size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidget.getTextColor", &getter,
+            &getter_size) || getter_size != 0x4c
+        || !hometweaks::HomeTweaksFindSymbol("Color.withAlpha", &clone, &clone_size)
+        || clone_size != 0xd4) return false;
+    std::vector<uint32_t> getter_code, clone_code;
+    if (!dart_words(getter, 4, getter_code) || getter_code.size() != 4
+        || getter_code[0] != kDartPrologue
+        || !dart_words(clone, 50, clone_code) || clone_code.size() != 50
+        || clone_code[0] != kDartPrologue
+        || clone_code[25] != 0xb8027001u || clone_code[27] != 0xfc007000u
+        || clone_code[35] != 0xfc00f002u || clone_code[42] != 0xfc017002u
+        || clone_code[49] != 0xfc01f002u) return false;
+    // Verify the Color allocator tag/size and nursery bounds before using its fast path only.
+    const uint32_t allocation = clone + 0x58;
+    uint32_t call = clone_code[22];
+    if ((call & 0xfc000000u) != 0x94000000u) return false;
+    int32_t displacement = static_cast<int32_t>((call & 0x03ffffffu) << 6) >> 4;
+    const uint32_t factory = allocation + displacement;
+    std::vector<uint32_t> factory_code;
+    if (!dart_words(factory, 3, factory_code) || factory_code.size() != 3
+        || factory_code[0] != 0xd28e6382u || factory_code[1] != 0xf2a047a2u
+        || (factory_code[2] & 0xfc000000u) != 0x14000000u) return false;
+    displacement = static_cast<int32_t>((factory_code[2] & 0x03ffffffu) << 6) >> 4;
+    std::vector<uint32_t> nursery_code;
+    if (!dart_words(factory + 8 + displacement, 7, nursery_code) || nursery_code.size() != 7
+        || nursery_code[0] != 0xd3482c44u || nursery_code[1] != 0xd37cec84u
+        || nursery_code[2] != 0xa9461740u || nursery_code[3] != 0x8b040003u
+        || nursery_code[4] != 0xeb0300bfu || nursery_code[6] != 0xf9003343u) return false;
+    uint32_t builder = 0, builder_size = 0;
+    std::vector<uint32_t> selected;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidget._buildTextWidget", &builder,
+            &builder_size) || builder_size != 0x714
+        || !dart_words(builder + 0xf0, 4, selected)
+        || selected[0] != 0xf81d83a1u || selected[1] != 0xf9403f40u
+        || selected[2] != 0xf9538800u || selected[3] != 0x6b16001fu) return false;
+    uintptr_t address = 0;
+    nhk::CodeSource source{};
+    Words words{};
+    if (!bind_dart_target(builder + 0xf0, address, source, words)
+        || address > UINTPTR_MAX - 16) return false;
+    hc_title_color_continue = address + 16;
+    g_slots[kTitleColorSlot] = {address, reinterpret_cast<void *>(hc_title_color_entry),
+        &hc_title_color_original, source, words};
+    g_title_color_bound = true;
+    return true;
+}
+
+/* Patch the no-call load/store window after AppIcon.build returns from its original font
+ * getter. Its original Dart call PC/frame remain intact even on the initializer/GC path. */
+// Replay only verified non-allocating model fields and the original nursery fast path.
+// Bind once to this AOT image; no title/model/database mutation or relocated Dart BL.
+bool bind_title_custom() {
+    if (g_title_custom_bound) return true;
+    if (!g_dart || !__atomic_load_n(&hc_title_custom_enabled, __ATOMIC_ACQUIRE)) return false;
+    const auto guard = [](const char *name, uint32_t size, uint32_t offset,
+                          std::initializer_list<uint32_t> expected, uint32_t &va) {
+        uint32_t actual_size = 0; std::vector<uint32_t> code;
+        return hometweaks::HomeTweaksFindSymbol(name, &va, &actual_size) && actual_size == size
+            && dart_words(va + offset, expected.size(), code)
+            && std::equal(expected.begin(), expected.end(), code.begin(), code.end());
+    };
+    uint32_t component = 0, pin = 0, ignored = 0, builder = 0;
+    if (!guard("ShortcutInfoModel.getPackageName", 0x70, 0, {
+        0xa9bf79fdu, 0xaa0f03fdu, 0xd10021efu, 0xaa0103e2u, 0xf81f83a1u, 0xf85ff040u, 0xd34c7c00u, 0xaa0203e1u, 0xd13f5c1eu, 0xf87e7abeu, 0xd63f03c0u, 0x6b16001fu, 0x54000061u, 0xaa1603e1u, 0x14000003u, 0xb8407001u, 0x8b1c8021u, 0x6b16003fu, 0x540000c1u, 0xf85f83a2u, 0xb84c3043u, 0x8b1c8063u, 0xaa0303e0u, 0x14000002u, 0xaa0103e0u, 0xaa1d03efu, 0xa8c179fdu, 0xd65f03c0u}, ignored)) return false;
+    if (!guard("ShortcutInfoModel.getComponentName", 0x48, 0, {
+        0xd28020f1u, 0xb8716822u, 0x8b1c8042u, 0x36200062u, 0xaa1603e0u, 0xd65f03c0u, 0xb84bb022u, 0x8b1c8042u, 0xf9402370u, 0x6b10005fu, 0x54000080u, 0xb841f040u, 0x8b1c8000u, 0xd65f03c0u, 0xa9bf79fdu, 0xaa0f03fdu, 0xf97ecf69u, 0x940c1624u}, component)) return false;
+    if (!guard("PinShortcutInfoModel.getComponentName", 0x1c, 0, {
+        0xa9bf79fdu, 0xaa0f03fdu, 0xaa0103e0u, 0x97c2d5c8u, 0xaa1d03efu, 0xa8c179fdu, 0xd65f03c0u}, pin)) return false;
+    if (!guard("allocateTwoByteString", 0xec, 0, {
+        0xf94001e2u, 0x93407c42u, 0x37000362u, 0xb27c37f1u, 0x6b11005fu, 0x54000308u, 0xaa0203e6u, 0x91007c42u, 0x927cec42u, 0xf9403340u, 0xab020001u, 0x54000242u, 0xf9403747u, 0xeb07003fu, 0x540001e2u, 0xf9003341u, 0x91000400u, 0xa93f7c3fu, 0xf103c05fu, 0xd37cec42u, 0x9a9f9042u, 0xd29e0b90u, 0xf2a000b0u, 0xaa100042u, 0xf81ff002u, 0xf800701fu, 0xb8007006u, 0x14000001u, 0xd65f03c0u}, ignored)) return false;
+    // Verify model, Intent and ComponentName class ids through their original factory calls.
+    struct Factory { const char *name; uint32_t size, offset, first, second; };
+    constexpr Factory factories[] = {
+        {"ShortcutInfoModel.copyShortcutModel", 0x314, 0x27c, 0xd28a0382u, 0xf2a00fe2u},
+        {"PinShortcutInfoModel.copyShortcutModel", 0x3d8, 0x340, 0xd2980382u, 0xf2a00fe2u},
+        {"PinShortcutInfoModel.copyShortcutModel", 0x3d8, 0x108, 0xd2906382u, 0xf2a01ae2u},
+        {"PinShortcutInfoModel.makePinAppComponentName", 0x84, 0x64, 0xd2962382u, 0xf2a01ae2u},
+    };
+    for (const auto &factory : factories) {
+        uint32_t va = 0, size = 0, target = 0; std::vector<uint32_t> code;
+        if (!hometweaks::HomeTweaksFindSymbol(factory.name, &va, &size) || size != factory.size
+            || !dart_words(va + factory.offset, 1, code)
+            || !bl_target(code[0], va + factory.offset, &target)
+            || !dart_words(target, 2, code) || code[0] != factory.first
+            || code[1] != factory.second) return false;
+    }
+    if (!guard("ShortcutIconWidget.getPrefixAssetName", 0x74, 0x30,
+        {0xd2802a71u, 0xb8716801u, 0x8b1c8021u}, ignored)
+        || !guard("ShortcutIconWidget._buildTextWidget", 0x714, 0x214,
+        {0xf85e83a2u, 0xb8447043u, 0x8b1c8063u, 0xf81c83a3u}, builder)) return false;
+    uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
+    if (!bind_dart_target(builder + 0x214, address, source, words)
+        || address > UINTPTR_MAX - 16
+        || g_dart->load_base > UINTPTR_MAX - component
+        || g_dart->load_base > UINTPTR_MAX - pin) return false;
+    g_title_component_method = g_dart->load_base + component;
+    g_title_pin_method = g_dart->load_base + pin;
+    hc_title_custom_continue = address + 16;
+    g_slots[kTitleCustomSlot] = {address, reinterpret_cast<void *>(hc_title_custom_entry),
+        &hc_title_custom_original, source, words};
+    g_title_custom_bound = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "title custom original-code bank bound; Dart8; model/database unchanged");
+    return true;
+}
+
+bool bind_drawer_title() {
+    if (g_drawer_title_bound) return true;
+    if (!g_dart || (g_title_drawer_sp.load(std::memory_order_acquire) == 12
+        && !g_title_custom_bound)) return false;
+    uint32_t getter = 0, getter_size = 0, caller = 0, caller_size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("GridConfig.getTitleTextSize", &getter,
+            &getter_size) || getter_size != 0x68
+        || !hometweaks::HomeTweaksFindSymbol("AppIcon.build", &caller, &caller_size)
+        || caller_size != 0x8b8) return false;
+    std::vector<uint32_t> code;
+    if (!dart_words(caller + 0x210, 2, code) || code.size() != 2
+        || code[0] != 0x97e08699u || code[1] != 0xf85f83a0u) return false;
+    std::vector<uint32_t> font;
+    if (!dart_words(caller + 0x214, 4, font)
+        || font[0] != 0xf85f83a0u || font[1] != 0xfc1c03a0u
+        || font[2] != 0xb8413001u || font[3] != 0x8b1c8021u) return false;
+    std::vector<uint32_t> height;
+    if (!dart_words(caller + 0x2b0, 4, height)
+        || height[0] != 0xf85f03a0u || height[1] != 0xfc1b83a0u
+        || height[2] != 0xb845f001u || height[3] != 0x8b1c8021u) return false;
+    uintptr_t height_address = 0;
+    nhk::CodeSource height_source{};
+    Words height_words{};
+    if (!bind_dart_target(caller + 0x2b0, height_address, height_source, height_words)
+        || height_address > UINTPTR_MAX - 16) return false;
+    uintptr_t address = 0;
+    nhk::CodeSource source{};
+    Words words{};
+    if (!bind_dart_target(caller + 0x214, address, source, words)
+        || g_dart->load_base > UINTPTR_MAX - caller - 0x214) return false;
+    hc_drawer_title_caller = static_cast<uintptr_t>(g_dart->load_base + caller + 0x214);
+    hc_drawer_title_continue = address + 16;
+    g_slots[kDrawerTitleSlot] = {address, reinterpret_cast<void *>(hc_drawer_title_entry),
+        &hc_drawer_title_original, source, words};
+    hc_drawer_title_height_continue = height_address + 16;
+    g_slots[kDrawerTitleHeightSlot] = {height_address,
+        reinterpret_cast<void *>(hc_drawer_title_height_entry), &hc_drawer_title_height_original,
+        height_source, height_words};
+    g_drawer_title_bound = true;
+    return true;
+}
+
 /*
  * Install the hook trampolines for every knob calibrated onto a layout aggregator. A knob whose
  * aggregator is not resolved yet is simply skipped and retried by the health loop.
@@ -1572,8 +1867,189 @@ bool sync_hotseat_capacity(bool enabled) {
     return applied;
 }
 
+// One original-body word; all drag state, widget type, span and handoff checks stay native.
+std::atomic_flag g_widget_move_busy = ATOMIC_FLAG_INIT;
+uintptr_t g_widget_move_address = 0;
+bool g_widget_move_checked = false;
+bool g_widget_move_enabled = false;
+bool g_widget_move_known = true;
+
+bool sync_widget_move(bool enabled) {
+    if (g_widget_move_busy.test_and_set(std::memory_order_acquire)) return false;
+    struct Release { ~Release() { g_widget_move_busy.clear(std::memory_order_release); } } release;
+    if (!g_dart || (!enabled && !g_widget_move_address)) return !enabled;
+    if (!g_widget_move_checked) {
+        g_widget_move_checked = true;
+        uint32_t va = 0, size = 0, span = 0, span_size = 0, session = 0, session_size = 0;
+        bool compatible = hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &va, &size)
+            && size == home_layout::kWidgetMoveSize
+            && hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._isSpanSupportedByPa", &span, &span_size)
+            && span == va + 0xbc4 && span_size == 0x108
+            && hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._ensureDragSessionId", &session, &session_size)
+            && session == va + 0xa04 && session_size == 0x144;
+        compatible = compatible && home_layout::widget_move_guards_match(
+            [&](uint32_t offset, uint32_t (&expected)[4]) {
+            std::vector<uint32_t> words;
+            if (!dart_words(va + offset, 4, words)) return false;
+            std::copy(words.begin(), words.end(), std::begin(expected));
+            return true;
+        });
+        if (compatible && g_dart->load_base <= UINTPTR_MAX - va - home_layout::kWidgetMoveOffset) {
+            const uintptr_t address = g_dart->load_base + va + home_layout::kWidgetMoveOffset;
+            const auto file = dart_file_offset(va + home_layout::kWidgetMoveOffset, 4);
+            const auto source = nhk::source_at(g_dart->owned, address, 4);
+            if (file && source && source->file_offset == *file && !(address & 3)) {
+                g_widget_move_address = address;
+            }
+        }
+        __android_log_print(g_widget_move_address ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
+            "widget minus-one original-code compatible=%d symbol=%s offset=%#x",
+            g_widget_move_address != 0, home_layout::kWidgetMoveSymbol, home_layout::kWidgetMoveOffset);
+    }
+    if (!g_widget_move_address) return false;
+    if (g_widget_move_known && enabled == g_widget_move_enabled) return true;
+    const auto read = [](uintptr_t address, uint32_t &word) {
+        return nhk::safe_read(address, std::as_writable_bytes(std::span(&word, 1)));
+    };
+    const auto write = [](uintptr_t address, uint32_t word) {
+        return nhk::write_code_bytes(address, std::as_bytes(std::span(&word, 1)));
+    };
+    const bool applied = home_layout::apply_widget_move_word(g_widget_move_address, enabled, read, write);
+    g_widget_move_known = applied;
+    if (applied) g_widget_move_enabled = enabled;
+    __android_log_print(applied ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
+        "widget minus-one original-code requested=%d applied=%d span=original model=unchanged",
+        enabled ? 1 : 0, applied ? 1 : 0);
+    return applied;
+}
+
+/* Inject the exact inlined load that _buildTextWidget actually uses. It is a different cache
+ * from GridController.textSize; changing that getter's field does not change rendered titles.
+ * No heap/config mutation, allocation, GC call or background writer is involved. */
+bool bind_desktop_title() {
+    if (g_desktop_title_bound) return true;
+    if (!g_dart || (g_title_desktop_sp.load(std::memory_order_acquire) == 12
+        && g_title_drawer_sp.load(std::memory_order_acquire) == 12)) return false;
+    uint32_t va = 0, size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidget._buildTextWidget", &va, &size)
+        || size != 0x714) return false;
+    // Both desktop and modern drawer use this builder. Only the drawer/search creates
+    // customShortcutIconConfig (true at +0xb); preserve independent settings at that branch.
+    uint32_t custom = 0, custom_size = 0, factory = 0;
+    std::vector<uint32_t> custom_code, config_read, factory_code;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidgetConfig.customShortcutIconConfig",
+            &custom, &custom_size) || custom_size != 0x30
+        || !dart_words(custom, 12, custom_code)
+        || custom_code[0] != kDartPrologue || custom_code[6] != 0xb8007001u
+        || custom_code[7] != 0x910082c1u || custom_code[8] != 0xb800b001u
+        || !bl_target(custom_code[4], custom + 0x10, &factory)
+        || !dart_words(factory, 2, factory_code)
+        || factory_code[0] != 0xd29a2382u || factory_code[1] != 0xf2a012c2u
+        || !dart_words(va + 0xc4, 3, config_read)
+        || config_read[0] != 0x8b1c8021u || config_read[1] != 0xb840b022u
+        || config_read[2] != 0x8b1c8042u) return false;
+    std::vector<uint32_t> code;
+    if (!dart_words(va + 0xb4, 4, code) || code.size() != 4
+        || code[0] != 0xfc443000u || code[1] != 0xf85f83a0u
+        || code[2] != 0xfc1a83a0u || code[3] != 0xb8417001u) return false;
+    std::vector<uint32_t> height;
+    if (!dart_words(va + 0x1a0, 4, height) || height.size() != 4
+        || height[0] != 0xb846f001u || height[1] != 0x8b1c8021u
+        || height[2] != 0xfc427020u || height[3] != 0xfc1a03a0u) return false;
+    uintptr_t height_address = 0;
+    nhk::CodeSource height_source{};
+    Words height_words{};
+    if (!bind_dart_target(va + 0x1a0, height_address, height_source, height_words)
+        || height_address > UINTPTR_MAX - 16) return false;
+    uintptr_t address = 0;
+    nhk::CodeSource source{};
+    Words words{};
+    if (!bind_dart_target(va + 0xb4, address, source, words)
+        || address > UINTPTR_MAX - 16) return false;
+    hc_desktop_title_continue = address + 16;
+    g_slots[kDesktopTitleSlot] = {address, reinterpret_cast<void *>(hc_desktop_title_entry),
+        &hc_desktop_title_original, source, words};
+    hc_desktop_title_height_continue = height_address + 16;
+    g_slots[kDesktopTitleHeightSlot] = {height_address,
+        reinterpret_cast<void *>(hc_desktop_title_height_entry), &hc_desktop_title_height_original,
+        height_source, height_words};
+    g_desktop_title_bound = true;
+    return true;
+}
+
+/* Hide appearance only; never clear database flags, shortcut models or installation lists. */
+bool bind_title_hide() {
+    if (g_title_hide_bound) return true;
+    if (!__atomic_load_n(&hc_title_hide_new_install, __ATOMIC_ACQUIRE) || !g_dart) return false;
+    constexpr const char *names[] = {"ShortcutIconWidget.getPrefixAssetName",
+        "FolderInfoModel.hasNewInstalledApp", "ShortcutIconWidget._addNewInstallLight"};
+    constexpr uint32_t sizes[] = {0x74, 0xc8, 0x104};
+    constexpr size_t slots[] = {kTitlePrefixSlot, kTitleFolderNewSlot, kTitleLightSlot};
+    void *entries[] = {reinterpret_cast<void *>(hc_title_prefix_entry),
+        reinterpret_cast<void *>(hc_title_folder_new_entry), reinterpret_cast<void *>(hc_title_light_entry)};
+    void **originals[] = {&hc_title_prefix_original, &hc_title_folder_new_original, &hc_title_light_original};
+    uint32_t vas[3]{}, size = 0, caller = 0, caller_size = 0;
+    std::vector<uint32_t> words;
+    for (unsigned index = 0; index < 3; ++index) {
+        if (!hometweaks::HomeTweaksFindSymbol(names[index], &vas[index], &size)
+            || size != sizes[index] || !dart_words(vas[index], 4, words)
+            || words[0] != kDartPrologue) return false;
+    }
+    if (!hometweaks::HomeTweaksFindSymbol("FolderIconGetxController.updateNewInstallNotification",
+            &caller, &caller_size) || caller_size != 0xec
+        || !dart_words(caller + 0x74, 1, words)) return false;
+    uint32_t target = 0;
+    if (!bl_target(words[0], caller + 0x74, &target) || target != vas[1]) return false;
+    if (g_dart->load_base > UINTPTR_MAX - caller - 0x78) return false;
+    if (!dart_words(vas[0] + 0x60, 1, words) || words[0] != 0xf9407f61u) return false;
+    if (!dart_words(vas[0] + 0x64, 4, words)
+        || words[0] != 0xaa0103e0u || words[1] != 0xaa1d03efu
+        || words[2] != 0xa8c179fdu || words[3] != 0xd65f03c0u) return false;
+    Slot prepared[3]{};
+    for (unsigned index = 0; index < 3; ++index) {
+        uintptr_t address = 0; nhk::CodeSource source{}; Words original{};
+        if (!bind_dart_target(vas[index] + (index == 0 ? 0x64 : 0), address, source, original))
+            return false;
+        prepared[index] = {address, entries[index], originals[index], source, original};
+    }
+    for (unsigned index = 0; index < 3; ++index) g_slots[slots[index]] = prepared[index];
+    hc_title_folder_new_caller = g_dart->load_base + caller + 0x78;
+    g_title_hide_bound = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag, "title hide appearance bank bound=3; database flags preserved");
+    return true;
+}
+
 size_t arm_hooks(std::vector<size_t> &order) {
     size_t added = 0;
+    if (g_title_custom_bound && std::find(order.begin(), order.end(), kTitleCustomSlot) == order.end()) {
+        order.push_back(kTitleCustomSlot);
+        ++added;
+    }
+    if (g_title_hide_bound) {
+        for (size_t index : {kTitlePrefixSlot, kTitleFolderNewSlot, kTitleLightSlot}) {
+            if (std::find(order.begin(), order.end(), index) == order.end()) {
+                order.push_back(index);
+                ++added;
+            }
+        }
+    }
+    if (g_desktop_title_bound
+        && std::find(order.begin(), order.end(), kDesktopTitleSlot) == order.end()) {
+        order.push_back(kDesktopTitleSlot);
+        order.push_back(kDesktopTitleHeightSlot);
+        ++added;
+    }
+    if (g_drawer_title_bound
+        && std::find(order.begin(), order.end(), kDrawerTitleSlot) == order.end()) {
+        order.push_back(kDrawerTitleSlot);
+        order.push_back(kDrawerTitleHeightSlot);
+        ++added;
+    }
+    if (g_title_color_bound
+        && std::find(order.begin(), order.end(), kTitleColorSlot) == order.end()) {
+        order.push_back(kTitleColorSlot);
+        ++added;
+    }
     for (size_t index = 0; index < g_knobs.size(); ++index) {
         KnobRuntime &knob = g_knobs[index];
         if (!knob.hook_mode || knob.hook_address == 0) continue;
@@ -1635,6 +2111,14 @@ size_t arm_hooks(std::vector<size_t> &order) {
             ++added;
         }
     }
+    for (size_t i = 0; i < 2; ++i) {
+        const size_t index = kDropGeometrySlotBase + i;
+        if (g_slots[index].address != 0
+            && std::find(order.begin(), order.end(), index) == order.end()) {
+            order.push_back(index);
+            ++added;
+        }
+    }
     return added;
 }
 
@@ -1649,6 +2133,10 @@ size_t publish_hooks() {
     for (size_t i = 0; i < 5; ++i) folder_ready &= g_slots[kFolderGeometrySlotBase + i].registered;
     folder_ready &= g_slots[kKnobHookSlotBase + 2].registered
         && g_slots[kKnobHookSlotBase + 3].registered;
+    const bool drop_ready = g_slots[kDropGeometrySlotBase].registered
+        && g_slots[kDropGeometrySlotBase + 1].registered
+        && g_slots[kKnobHookSlotBase + 2].registered
+        && g_slots[kKnobHookSlotBase + 3].registered;
     size_t live = 0;
     for (size_t index = 0; index < g_knobs.size(); ++index) {
         KnobRuntime &knob = g_knobs[index];
@@ -1657,7 +2145,7 @@ size_t publish_hooks() {
         // Once the complete folder bank is available, also observe stock (zero
         // inset) layouts. Otherwise off/on can reuse a stale rendered margin.
         const bool workspace_active = (index == 2 || index == 3)
-            && (folder_ready || g_knobs[2].delta_dp.load(std::memory_order_relaxed) != 0
+            && (folder_ready || drop_ready || g_knobs[2].delta_dp.load(std::memory_order_relaxed) != 0
             || g_knobs[3].delta_dp.load(std::memory_order_relaxed) != 0
             || g_knobs[4].delta_dp.load(std::memory_order_relaxed) != 0);
         if ((!workspace_active && delta == 0) || !knob.hook_armed) {
@@ -1675,6 +2163,7 @@ size_t publish_hooks() {
     }
     publish_indicator_dot_delta();
     __atomic_store_n(&hc_layout_folder_enabled, folder_ready ? 1u : 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_layout_drop_enabled, drop_ready ? 1u : 0u, __ATOMIC_RELEASE);
     return live;
 }
 
@@ -1817,7 +2306,12 @@ void *worker(void *) {
         if (home_layout::query_config(config)) { queried = true; break; }
         delay_ms(100);
     }
-    if (!queried) {
+    if (queried) sync_title_config(config);
+    if (!queried && g_title_desktop_sp.load(std::memory_order_acquire) == 12
+        && g_title_drawer_sp.load(std::memory_order_acquire) == 12
+        && g_title_color.load(std::memory_order_acquire) == -1
+        && !__atomic_load_n(&hc_title_hide_new_install, __ATOMIC_ACQUIRE)
+        && !__atomic_load_n(&hc_title_custom_enabled, __ATOMIC_ACQUIRE)) {
         __android_log_print(ANDROID_LOG_WARN, kTag,
             "layout config unavailable; leaving launcher unmodified");
         return attempt_finished();
@@ -1869,8 +2363,13 @@ void *worker(void *) {
         || config.tweaks.fold_enabled || config.tweaks.icon_scale_enabled
         || config.tweaks.recents_hide_clear || config.tweaks.recents_no_clear
         || config.tweaks.animation_open_enabled || config.tweaks.animation_recents_enabled
-        || config.tweaks.hotseat_unlimited;
-    if (!config.grid_enabled && !any_knob && !top_probe && !any_tweak) {
+        || config.tweaks.hotseat_unlimited || config.widget_allow_move;
+    if (!config.grid_enabled && !any_knob && !top_probe && !any_tweak
+        && g_title_desktop_sp.load(std::memory_order_acquire) == 12
+        && g_title_drawer_sp.load(std::memory_order_acquire) == 12
+        && g_title_color.load(std::memory_order_acquire) == -1
+        && !__atomic_load_n(&hc_title_hide_new_install, __ATOMIC_ACQUIRE)
+        && !__atomic_load_n(&hc_title_custom_enabled, __ATOMIC_ACQUIRE)) {
         __android_log_print(ANDROID_LOG_INFO, kTag, "layout preferences disabled; no hooks installed");
         return attempt_finished();
     }
@@ -2038,9 +2537,15 @@ void *worker(void *) {
             order.push_back(kDockCaptureSlot);
         }
     }
+    (void) bind_title_color();
+    (void) bind_title_custom();
+    (void) bind_drawer_title();
+    (void) bind_desktop_title();
+    (void) bind_title_hide();
     arm_hooks(order);
     publish_hooks();
     (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
+    (void) sync_widget_move(config.widget_allow_move);
     const bool grid_live =
         config.grid_enabled && located && located->x != 0 && located->y != 0;
     g_ready.store(grid_live, std::memory_order_release);
@@ -2152,6 +2657,7 @@ void *worker(void *) {
         if (iterations % 10 == 0) {
             home_layout::Config latest;
             if (home_layout::query_config(latest)) {
+                sync_title_config(latest);
                 if (latest.grid_enabled && located && located->x != 0 && located->y != 0
                     && std::find(order.begin(), order.end(), size_t{0}) == order.end()) {
                     g_slots[0] = {located->x, reinterpret_cast<void *>(cell_x_replacement),
@@ -2199,9 +2705,15 @@ void *worker(void *) {
 
                 }
                 (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
+                (void) sync_widget_move(config.widget_allow_move);
                 (void) knobs_changed;
             }
             any_knob = sync_requested();
+            (void) bind_title_color();
+            (void) bind_title_custom();
+    (void) bind_drawer_title();
+            (void) bind_desktop_title();
+            (void) bind_title_hide();
             if (arm_hooks(order) != 0 || publish_hooks() != 0) {
                 g_dart_ready.store(true, std::memory_order_release);
             }
@@ -2354,6 +2866,50 @@ void *worker(void *) {
 }
 } // namespace
 
+extern "C" uint64_t hc_title_custom_label(uint64_t original, uint64_t model, uint64_t heap,
+    uint64_t thread, uint64_t dispatch, uint64_t null_object, uint32_t site) {
+    if (!g_title_custom_bound) return original;
+    const auto names = std::atomic_load_explicit(&g_title_names, std::memory_order_acquire);
+    if (!names || names->empty()) return original;
+    const auto result = home_title::custom_label(original, model, heap, thread, dispatch, null_object,
+        g_title_component_method, g_title_pin_method, *names);
+    static std::atomic_uint reported{0};
+    const unsigned bit = 1U << (site & 1U);
+    if (result != original && !(reported.load(std::memory_order_relaxed) & bit)
+        && !(reported.fetch_or(bit, std::memory_order_relaxed) & bit)) {
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "title custom first-match site=%u model_cid=%#x cloned=1 entries=%zu",
+            site, home_title::dart_cid(model), names->size());
+    }
+    return result;
+}
+
+extern "C" uint32_t hc_title_is_new_asset(uint64_t text) {
+    return home_title::new_install_asset(text) ? 1U : 0U;
+}
+
+extern "C" uint64_t hc_title_color_clone(uint64_t color, uint64_t thread) {
+    const auto result = home_title::clone_color(color, thread,
+        g_title_color.load(std::memory_order_acquire));
+    static std::atomic_bool reported{false};
+    if (!reported.load(std::memory_order_relaxed)
+        && !reported.exchange(true, std::memory_order_relaxed)) {
+        uint64_t header = 0, top = 0, end = 0;
+        if (color & 1U) std::memcpy(&header, reinterpret_cast<const void *>(color - 1), 8);
+        if (thread) {
+            std::memcpy(&top, reinterpret_cast<const void *>(thread + 0x60), 8);
+            std::memcpy(&end, reinterpret_cast<const void *>(thread + 0x68), 8);
+        }
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "title color first-render cid=%#llx cloned=%d top_align=%llu nursery_room=%llu argb=%#x",
+            static_cast<unsigned long long>((header >> 12) & 0xfffffU), result != color ? 1 : 0,
+            static_cast<unsigned long long>(top & 15),
+            static_cast<unsigned long long>(end > top ? end - top : 0),
+            g_title_color.load(std::memory_order_relaxed));
+    }
+    return result;
+}
+
 // Both callbacks run on the corresponding Dart thread. Settings publication
 // never accesses this cache; different isolates cannot mix rendered geometry.
 static thread_local home_layout::WorkspaceRenderSnapshot rendered_workspace;
@@ -2374,6 +2930,32 @@ extern "C" void hc_layout_folder_body(uintptr_t frame, uint64_t heap, uintptr_t 
         __android_log_print(ANDROID_LOG_INFO, "HyperCeiler.HomeLayout",
             "folder geometry body kind=%u ready=%d delta=%d/%d/%d valid=%d render-hit=%d",
             kind, ready ? 1 : 0, top, bottom, side, valid ? 1 : 0, render_hit ? 1 : 0);
+        if (kind == 0 || kind == 2) {
+            // Diagnostic scalars only; never dereference cached Dart identity.
+            for (const auto &l : rendered_workspace.layouts) if (l.grid != 0) {
+                __android_log_print(ANDROID_LOG_INFO, "HyperCeiler.HomeLayout",
+                    "folder rendered grid cols=%lld rows=%lld raw=%.3f/%.3f inset=%.3f/%.3f stride=%.3f/%.3f",
+                    static_cast<long long>(l.columns), static_cast<long long>(l.rows),
+                    l.raw_width, l.raw_height, l.side, l.top, l.width, l.height);
+            }
+        }
+    }
+}
+
+extern "C" void hc_layout_drop_body(uintptr_t frame, uint64_t heap, uintptr_t saved,
+    unsigned kind) {
+    const int top = g_knobs[2].delta_dp.load(std::memory_order_relaxed);
+    const int bottom = g_knobs[3].delta_dp.load(std::memory_order_relaxed);
+    const int side = g_knobs[4].delta_dp.load(std::memory_order_relaxed);
+    const uint64_t hits_before = rendered_workspace.hits;
+    const bool valid = home_layout::drop_geometry_body(frame, heap, saved, kind,
+        top, bottom, side, &rendered_workspace);
+    const uint64_t count = __atomic_fetch_add(&hc_layout_drop_hits[kind], uint64_t{1}, __ATOMIC_RELAXED);
+    if (count < 4) {
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "drop geometry body kind=%u delta=%d/%d/%d valid=%d render-hit=%d",
+            kind, top, bottom, side, valid ? 1 : 0,
+            rendered_workspace.hits != hits_before ? 1 : 0);
     }
 }
 
@@ -2518,7 +3100,34 @@ bool adopt_layout_state() {
     g_capacity_bound = g_capacity_enabled = false;
     g_capacity_known = true;
     for (auto &word : g_capacity_words) word = {};
+    g_widget_move_busy.clear(std::memory_order_release);
+    g_widget_move_address = 0;
+    g_widget_move_checked = g_widget_move_enabled = false;
+    g_widget_move_known = true;
     g_captures_armed = false;
+    g_desktop_title_bound = false;
+    hc_desktop_title_original = nullptr;
+    hc_desktop_title_continue = 0;
+    hc_desktop_title_height_original = nullptr;
+    hc_desktop_title_height_continue = 0;
+    g_title_hide_bound = false;
+    hc_title_prefix_original = nullptr;
+    hc_title_folder_new_original = nullptr;
+    hc_title_folder_new_caller = 0;
+    hc_title_light_original = nullptr;
+    g_title_custom_bound = false;
+    hc_title_custom_original = nullptr;
+    hc_title_custom_continue = 0;
+    g_title_component_method = g_title_pin_method = 0;
+    g_title_color_bound = false;
+    hc_title_color_original = nullptr;
+    hc_title_color_continue = 0;
+    g_drawer_title_bound = false;
+    hc_drawer_title_original = nullptr;
+    hc_drawer_title_height_original = nullptr;
+    hc_drawer_title_height_continue = 0;
+    hc_drawer_title_caller = 0;
+    hc_drawer_title_continue = 0;
     __atomic_store_n(&hc_layout_indicator_mode, uint32_t{0}, __ATOMIC_RELEASE);
     hc_layout_dart_IndicatorDot_address = 0;
     hc_layout_dart_IndicatorDot_getter = 0;
@@ -2535,6 +3144,10 @@ bool adopt_layout_state() {
     __atomic_store_n(&hc_layout_folder_enabled, 0u, __ATOMIC_RELEASE);
     for (size_t i = 0; i < 5; ++i) {
         hc_layout_folder_resume[i] = 0; hc_layout_folder_hits[i] = 0; hc_layout_folder_original[i] = nullptr;
+    }
+    __atomic_store_n(&hc_layout_drop_enabled, 0u, __ATOMIC_RELEASE);
+    for (size_t i = 0; i < 2; ++i) {
+        hc_layout_drop_resume[i] = 0; hc_layout_drop_hits[i] = 0; hc_layout_drop_original[i] = nullptr;
     }
     g_probe_primed = false;
     g_hook_globals_inited = false;
@@ -2569,6 +3182,29 @@ bool adopt_layout_state() {
 
 void home_layout_prepare_for_launcher_child() {
     (void) adopt_layout_state();
+}
+
+void home_layout_set_desktop_title_size(int sp) {
+    if (sp < 0 || sp > 20) return;
+    g_title_desktop_sp.store(sp, std::memory_order_release);
+    __atomic_store_n(&hc_desktop_title_sp, static_cast<uint32_t>(sp), __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_drawer_title_override,
+        g_title_drawer_sp.load(std::memory_order_acquire) != 12 ? 1U : 0U,
+        __ATOMIC_RELEASE);
+}
+
+void home_layout_set_drawer_title_size(int sp) {
+    if (sp < 0 || sp > 20) return;
+    g_title_drawer_sp.store(sp, std::memory_order_release);
+    __atomic_store_n(&hc_drawer_title_sp, static_cast<uint32_t>(sp), __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_drawer_title_override,
+        sp != 12 ? 1U : 0U,
+        __ATOMIC_RELEASE);
+}
+
+void home_layout_set_title_color(int argb) {
+    g_title_color.store(argb, std::memory_order_release);
+    __atomic_store_n(&hc_title_color_enabled, argb != -1 ? 1U : 0U, __ATOMIC_RELEASE);
 }
 
 /*
@@ -2616,12 +3252,18 @@ void prime_home_layout_knobs(HookFunction hook, UnhookFunction unhook) {
      */
     home_layout::Config config;
     if (home_layout::query_config(config)) {
+        sync_title_config(config);
         for (size_t index = 0; index < HC_LAYOUT_KNOB_COUNT; ++index) {
             g_knobs[index].delta_dp.store(config.knobs[index].delta_dp,
                 std::memory_order_relaxed);
         }
     }
     std::vector<size_t> order; // worker adopts these same registered slots after publication
+    (void) bind_title_color();
+    (void) bind_title_custom();
+    (void) bind_drawer_title();
+    (void) bind_desktop_title();
+    (void) bind_title_hide();
     const size_t added = arm_hooks(order);
     if (added == 0 && order.empty()) return;
     /*
@@ -2652,6 +3294,7 @@ void prime_home_layout_knobs(HookFunction hook, UnhookFunction unhook) {
     }
     publish_hooks();
     (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
+    (void) sync_widget_move(config.widget_allow_move);
     g_loader_prime_finished.store(true, std::memory_order_release);
 }
 
