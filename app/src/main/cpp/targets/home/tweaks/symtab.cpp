@@ -442,6 +442,27 @@ bool SymbolIndex::Find(const char* needle, uint32_t* va, uint32_t* size) const {
     return false;
 }
 
+/*
+ * Distance from `va` to the next resolved target above it.
+ *
+ * The reported per-symbol size cannot be trusted as a body length: on launcher 7722
+ * `LauncherIndicatorState.build` claims 0x58 while the code actually runs to 0x2b4, so anything
+ * that inspects a whole body has to walk to where the next name starts. Comparing against the
+ * reported size instead would stop half way through the instructions being looked for, and the
+ * scan would report "not found" for a function that is present and unchanged.
+ */
+bool SymbolIndex::SpanFrom(uint32_t va, uint32_t* span) const {
+    if (!loaded_ || va == 0 || span == nullptr) return false;
+    uint32_t next = 0;
+    for (size_t i = 0; i < kTargetCount; ++i) {
+        if (!has_[i] || va_[i] <= va) continue;
+        if (next == 0 || va_[i] < next) next = va_[i];
+    }
+    if (next == 0 || next <= va) return false;
+    *span = next - va;
+    return true;
+}
+
 bool SymbolIndex::EnsureLoaded(const Image& image) {
     if (attempted_) return loaded_;
     attempted_ = true;

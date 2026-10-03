@@ -1058,6 +1058,25 @@ bool HomeTweaksFindSymbol(const char *name, uint32_t *outVa, uint32_t *outSize) 
 }
 
 /**
+ * Distance from `va` to the next symbol in the same table.
+ *
+ * Some Dart bodies are reported far shorter than the code that follows them -- on launcher 7722
+ * `LauncherIndicatorState.build` claims 0x58 while its real extent is 0x2b4, which is larger than
+ * the number of named functions in it. Anything that has to look at a whole body therefore has
+ * to walk to where the next name begins, not to the size the table reports, or it stops half way
+ * through the very instructions it is looking for. Returns false when `va` is the last symbol.
+ */
+bool HomeTweaksSymbolSpan(uint32_t va, uint32_t *outSpan) {
+    if (va == 0 || outSpan == nullptr) return false;
+    TryDiscoverImage();
+    std::lock_guard<std::mutex> work(g_workMutex);
+    if (!g_state.imageFound) return false;
+    SymbolIndex &index = SymbolIndex::Instance();
+    if (!index.EnsureLoaded(g_state.image)) return false;
+    return index.SpanFrom(va, outSpan);
+}
+
+/**
  * Report the launcher image this module resolved.
  *
  * The layout module's own APK discovery matches a fixed /data directory pattern; the 7654 desktop

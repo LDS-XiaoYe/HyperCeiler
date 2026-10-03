@@ -31,6 +31,9 @@ public:
 
     bool Find(const char* needle, uint32_t* va, uint32_t* size) const;
 
+    /* Distance to the next resolved symbol; the reported `size` is not a body length. */
+    bool SpanFrom(uint32_t va, uint32_t* span) const;
+
     bool Has(const char* needle) const;
 
     void ResetForTest();
