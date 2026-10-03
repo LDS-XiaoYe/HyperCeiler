@@ -170,6 +170,9 @@ const TargetFunction kTargets[] = {
          */
         {"HotSeatsConstants2.hotSeatsMarginBottom", "HotSeatsConstants2.hotSeatsMarginBottom",
          "候选 dock 边距视图"},
+        {"GridSizeCalRules._calVariableHeight", "GridSizeCalRules._calVariableHeight", "解锁布局工作区自动间距"},
+        {"GridSizeCalRules.calVarCellHeight", "GridSizeCalRules.calVarCellHeight", "工作区最终高度上限校验"},
+        {"PhoneCellSizeHandler.calVariableValues", "PhoneCellSizeHandler.calVariableValues", "解锁布局工作区自动间距"},
         {"GridConfig.calGridSize", "GridConfig.calGridSize", "候选 布局总算"},
         {"GridController.statusBarHeight", "GridController.statusBarHeight", "候选 状态栏高度"},
         {"GridController.navigateBarHeight", "GridController.navigateBarHeight", "候选 导航栏高度"},
@@ -248,6 +251,20 @@ const TargetFunction kTargets[] = {
          * the 6309 image), so the hook path can bind them; `newPadding*` are shared-entry thunks and
          * are deliberately absent - bind_dart_target refuses their prologue.
          */
+        {"FolderGridViewGetxController.calGridWidth", "FolderGridViewGetxController.calGridWidth", "文件夹原逻辑布局"},
+        {"FolderClingWidget.getFolderClingWidth", "FolderClingWidget.getFolderClingWidth", "文件夹原逻辑布局"},
+        {"FolderClingGetxController._calcFolderPaddingTop", "FolderClingGetxController._calcFolderPaddingTop", "文件夹原逻辑布局"},
+        {"FolderHeaderWidget.build", "FolderHeaderWidget.build", "文件夹标题容器原逻辑"},
+        {"AndroidAttributeUtils.convertGravity", "AndroidAttributeUtils.convertGravity", "文件夹 Stack Alignment 语义"},
+        {"Stack.updateRenderObject", "Stack.updateRenderObject", "文件夹标题对齐字段校验"},
+        {"AndroidAttributeUtils.convertTextAlignment", "AndroidAttributeUtils.convertTextAlignment", "文件夹标题居中独立语义校验"},
+        {"_encodeParagraphStyle", "_encodeParagraphStyle", "文件夹标题枚举 index 非 Smi 校验"},
+        {"CrossAxisAlignment._getChildCrossAxisOffset", "CrossAxisAlignment._getChildCrossAxisOffset", "文件夹标题列居中校验"},
+        {"Flex.updateRenderObject", "Flex.updateRenderObject", "文件夹标题列字段校验"},
+        {"RxObjectMixin.value", "RxObjectMixin.value", "文件夹配置接收对象校验"},
+        {"FolderHeaderWidget._buildText", "FolderHeaderWidget._buildText", "文件夹原逻辑布局"},
+        {"FolderHeaderWidget._buildEditor", "FolderHeaderWidget._buildEditor", "文件夹原逻辑布局"},
+        {"_FlutterTextViewState._resolveEffectiveTextAlign", "_FlutterTextViewState._resolveEffectiveTextAlign", "文件夹原逻辑布局"},
         {"FolderGridViewGetxController.folderGridPaddingTop",
          "FolderGridViewGetxController.folderGridPaddingTop", "候选 文件夹网格上边距"},
         {"FolderGridViewGetxController.folderGridPaddingBottom",
@@ -342,6 +359,19 @@ bool LooksLikeDartFunction(const Image& image, uint32_t va, const char *name, ui
     const uint32_t* p = reinterpret_cast<const uint32_t*>(
             image.base + static_cast<uintptr_t>(va));
     if (p[0] == 0xA9BF79FDu && p[1] == 0xAA0F03FDu) return true;
+    // Read-only semantic root for folder alignment. This leaf has no Dart frame.
+    // Exact name and dispatch ABI only; bind_dart_target still rejects leaf patch sites.
+    if (NameEquals(name, "AndroidAttributeUtils.convertTextAlignment")) {
+        bool whole_function_exec = false;
+        for (size_t i = 0; i < image.segmentCount; ++i) {
+            const Segment &s = image.segments[i];
+            if ((s.flags & 1u) && image.base + va >= s.begin
+                && uint64_t(image.base) + va + size <= s.end) whole_function_exec = true;
+        }
+        return whole_function_exec && size >= 12 && size <= kMaxFunctionBytes && !(size & 3)
+            && p[0] == 0xaa0103e3u && p[1] == 0xf1000c7fu
+            && (p[2] & 0xff00001fu) == 0x5400000cu;
+    }
     // These verified leaf/stub functions intentionally have no Dart frame prologue.
     // Keep the exception exact-name/size/opcode scoped; never accept arbitrary code.
     if (NameEquals(name, "ShortcutInfoModel.getComponentName") && size == 0x48)

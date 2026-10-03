@@ -291,7 +291,13 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     public record Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
         int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
-        boolean widgetAllowMove) {
+        boolean widgetAllowMove, int[] folder) {
+        public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
+            int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
+            boolean widgetAllowMove) {
+            this(acknowledgment, gridEnabled, cellX, cellY, knobEnabled, knobDeltaDp, tweaks, title,
+                customTitles, widgetAllowMove, new int[FOLDER_COUNT]);
+        }
         public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
             int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles) {
             this(acknowledgment, gridEnabled, cellX, cellY, knobEnabled, knobDeltaDp, tweaks, title,
@@ -352,7 +358,8 @@ public final class HomeLayoutNativeEndpointOS4 {
                     || read.knobDeltaDp().length != KNOB_ROWS.length
                     || read.tweaks().length != TWEAK_COUNT
                     || read.title() == null || read.title().length != TITLE_COUNT
-                    || read.customTitles() == null || read.customTitles().length > 1024) {
+                    || read.customTitles() == null || read.customTitles().length > 1024
+                    || !validFolder(read.folder())) {
                 return denied("snapshot shape is wrong: " + describe(read));
             }
             for (int index = 0; index < KNOB_ROWS.length; ++index) {
@@ -375,7 +382,7 @@ public final class HomeLayoutNativeEndpointOS4 {
             }
             final Snapshot accepted = new Snapshot(ACK, read.gridEnabled(), read.cellX(), read.cellY(),
             read.knobEnabled(), read.knobDeltaDp(), read.tweaks(), read.title(), read.customTitles(),
-            read.widgetAllowMove());
+            read.widgetAllowMove(), read.folder().clone());
             final String summary = describe(accepted);
             if (!summary.equals(lastAccepted)) {
                 lastAccepted = summary;
@@ -423,6 +430,7 @@ public final class HomeLayoutNativeEndpointOS4 {
         if (snapshot.title() != null) text.append(" title=")
             .append(java.util.Arrays.toString(snapshot.title()));
         if (snapshot.customTitles() != null) text.append(" custom_titles=").append(snapshot.customTitles().length);
+        text.append(" folder=").append(java.util.Arrays.toString(snapshot.folder()));
         return text.toString();
     }
 
@@ -510,7 +518,32 @@ public final class HomeLayoutNativeEndpointOS4 {
                 ? HomeLayoutPrefsSnapshot.customTitles(values != null
                     && values.get("home_title_title_icontitlecustomization") instanceof String packet ? packet : null)
                 : new String[0][],
-            readBoolean(values, "home_widget_allow_moved_to_minus_one_screen", false));
+            readBoolean(values, "home_widget_allow_moved_to_minus_one_screen", false), readFolder(values));
+    }
+
+    public static final int FOLDER_MAGIC = 0x48434631;
+    public static final int FOLDER_COUNT = 7;
+    private static final int[] FOLDER_MAX = {1, 1, 1, 50, 450, 200, 1};
+    private static boolean validFolder(int[] values) {
+        if (values == null || values.length != FOLDER_COUNT) return false;
+        for (int i = 0; i < FOLDER_COUNT; i++)
+            if (values[i] < 0 || values[i] > FOLDER_MAX[i]) return false;
+        return true;
+    }
+    private static int[] readFolder(java.util.Map<String, Object> values) {
+        Integer position = cached(values, "home_folder_title_pos");
+        int alignment = position != null ? position : values != null ? 0
+            : PrefsBridge.getStringAsInt("home_folder_title_pos", 0);
+        int[] folder = {alignment,
+            readBoolean(values, "home_folder_width", false) ? 1 : 0,
+            readBoolean(values, "home_folder_horizontal_padding_enable", false) ? 1 : 0,
+            readInt(values, "home_folder_horizontal_padding", 0),
+            readInt(values, "home_folder_horizontal_padding_pad_h", 0),
+            readInt(values, "home_folder_horizontal_padding_pad_v", 0),
+            com.sevtinge.hyperceiler.libhook.utils.api.DeviceHelper.Miui.isPad() ? 1 : 0};
+        for (int i = 0; i < FOLDER_COUNT; i++)
+            if (folder[i] < 0 || folder[i] > FOLDER_MAX[i]) folder[i] = 0;
+        return folder;
     }
 
     public static final int TITLE_COUNT = 4;

@@ -641,6 +641,9 @@ class HomeDockWindow : BaseHook() {
                         // Optional trailing extension; older native clients ignore it.
                         reply.writeInt(0x48435731)
                         reply.writeInt(if (result?.widgetAllowMove() == true) 1 else 0)
+                        reply.writeInt(HomeLayoutNativeEndpointOS4.FOLDER_MAGIC)
+                        val folder = result?.folder() ?: IntArray(HomeLayoutNativeEndpointOS4.FOLDER_COUNT)
+                        for (value in folder) reply.writeInt(value)
                     } else {
                         val acknowledgment = nativeMotionReply.get() ?: DockNativeMotionEndpoint.ACK
                         nativeMotionReply.remove()
