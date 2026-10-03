@@ -1,14 +1,62 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #pragma once
 #include <cstdint>
+#include <cstddef>
+#include <vector>
 
 namespace home_layout {
 inline constexpr const char *kWidgetMoveSymbol = "AssistantDragToPAHandler.canDragToPA";
-inline constexpr uint32_t kWidgetMoveSize = 0xa04;
-inline constexpr uint32_t kWidgetMoveOffset = 0x7f8;
+
+// The patched branch: `tbnz w0,#4, reject` that fires for an MIUI widget. Found by scan, not
+// stored -- see widget_move_gate_offset(). The two words below are the only ones this file
+// names, and they are matched against, never written into an address.
 inline constexpr uint32_t kWidgetMoveOriginal = 0x37200500; // tbnz w0,#4, reject
 inline constexpr uint32_t kWidgetMoveReplacement = 0xd503201f; // nop; continue to span check
 inline constexpr int32_t kWidgetMoveMagic = 0x48435731; // HCW1; appended after custom titles
+
+/*
+ * Locate the isMIUIWidget rejection inside the gate function.
+ *
+ * Four `tbnz w0,#4` sites in this body load a flag byte from the dragged object and test one
+ * bit of it, so the instruction shape alone is not a determination -- an earlier version of
+ * this hook picked the first match and patched the wrong branch. What separates the widget
+ * test is that its flag is the last byte of the object's own storage: every other site reads
+ * a small field near the start of the same struct. Requiring exactly one site keeps the scan
+ * from silently choosing, and SIZE_MAX means "leave the original code alone".
+ *
+ * `flag_field` is the offset that test reads, learned here rather than assumed; a launcher that
+ * reorders the struct simply stops matching and the hook goes inert instead of misfiring.
+ */
+template <typename ReadWords>
+size_t widget_move_gate_offset(size_t size, ReadWords read, int32_t *flag_field = nullptr) {
+    std::vector<uint32_t> code;
+    if (size == 0 || size > (1u << 20) || !read(size, code)) return SIZE_MAX;
+    size_t found = SIZE_MAX;
+    int32_t learned = 0;
+    for (size_t i = 2; i < code.size(); ++i) {
+        const uint32_t branch = code[i];
+        if ((branch >> 24) != 0x37u || (branch & 0x1Fu) != 0u
+            || ((branch >> 19) & 0x1Fu) != 4u) continue;
+        const uint32_t load = code[i - 2];
+        // ldur w0,[x2,#imm9]: the flag byte, with its base pinned to the object register the
+        // drag handlers pass around.
+        if ((load & 0xFFE00C00u) != 0xB8400000u || (load & 0x1Fu) != 0u) continue;
+        if (((load >> 5) & 0x1Fu) != 2u) continue;
+        uint32_t raw = (load >> 12) & 0x1FFu;
+        const int32_t field = (raw & 0x100u) ? static_cast<int32_t>(raw) - 0x200
+                                             : static_cast<int32_t>(raw);
+        if (field < 0x80) continue;  // the trailing flag, not a leading struct field
+        // The sign-extension pair that completes the narrow load; matched locally so this
+        // header stays independent of the Gadget bridge's instruction helpers.
+        if ((code[i - 1] & 0xFFFFFC00u) != 0x8B1C8000u) continue;
+        if (found != SIZE_MAX) return SIZE_MAX;  // ambiguous
+        found = i * 4;
+        learned = field;
+    }
+    if (flag_field != nullptr) *flag_field = learned;
+    return found;
+}
+
 template <typename Read>
 bool read_widget_move_extension(Read read, bool &enabled) {
     int32_t magic = 0, flag = 0;
@@ -18,26 +66,7 @@ bool read_widget_move_extension(Read read, bool &enabled) {
     enabled = flag == 1;
     return true;
 }
-struct WidgetMoveGuard { uint32_t offset; uint32_t words[4]; };
-inline constexpr WidgetMoveGuard kWidgetMoveGuards[] = {
-    {0, {0xa9bf79fd, 0xaa0f03fd, 0xd100a1ef, 0xf81f83a1}},
-    // The stack-model path and widget-class range stay unchanged.
-    {0x4ac, {0xf85ff040, 0xd34c7c00, 0xf11f9c1f, 0x540015a1}},
-    {0x770, {0xd11fb010, 0xf1001a1f, 0x54000fe8, 0xf85e83a3}},
-    // Only the isMIUIWidget rejection is replaced. The original size check still runs.
-    {0x7f0, {0xb84fb040, 0x8b1c8000, kWidgetMoveOriginal, 0xaa0403e1}},
-    {0x800, {0xaa0603e2, 0x940000f0, 0x37200480, 0xf85f83a0}},
-    {0x818, {0x9400007b, 0xf85e83a2, 0xb842b040, 0x8b1c8000}},
-};
-template <typename ReadWords>
-bool widget_move_guards_match(ReadWords read) {
-    for (const auto &guard : kWidgetMoveGuards) {
-        uint32_t words[4]{};
-        if (!read(guard.offset, words)) return false;
-        for (int i = 0; i < 4; ++i) if (words[i] != guard.words[i]) return false;
-    }
-    return true;
-}
+
 
 // One aligned instruction: no trampoline, Dart stack/heap edit, allocation or timer.
 // Reject foreign bytes; undo even a writer that changed memory before returning failure.

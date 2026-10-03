@@ -25,6 +25,7 @@
 namespace hometweaks {
 void PushTweaksConfig(const Config &config);
 bool HomeTweaksFindSymbol(const char *name, uint32_t *outVa, uint32_t *outSize);
+bool HomeTweaksSymbolSpan(uint32_t va, uint32_t *outSpan);
 bool HomeTweaksTargetImage(char *path, size_t cap);
 }
 
@@ -935,6 +936,33 @@ bool dart_words(uint32_t va, size_t count, std::vector<uint32_t> &out) {
 }
 
 /*
+ * Slurp one whole Dart function into memory for scanning. `dart_words` reopens the APK per
+ * call, which is fine for a handful of words but not for the instruction sweeps the Gadget
+ * anchor search runs -- a single miss would cost hundreds of reads.
+ *
+ * `bytes` is a length in bytes, the same unit the function spans are expressed in, and the
+ * result holds one entry per instruction. Mixing the two up here is invisible for a short body
+ * and catastrophic for a long one: passing a byte count where a word count was expected made the
+ * read ask for four times the range, which runs off the end of the mapped APK and fails the
+ * whole read -- so the scan reported "not found" for functions that are present and unchanged.
+ * The size comes from the symbol table rather than a literal, so a launcher OTA that grows or
+ * shrinks the body is followed instead of silently truncating the scan.
+ */
+bool dart_function_words(uint32_t va, uint32_t bytes, std::vector<uint32_t> &out) {
+    if (!g_dart || va == 0 || bytes < 4 || bytes > (1u << 20) || (bytes & 3) != 0) return false;
+    const size_t words = bytes / 4;
+    const auto file = dart_file_offset(va, bytes);
+    if (!file || g_dart->view_begin > UINT64_MAX - *file) return false;
+    std::ifstream apk(g_dart->path, std::ios::binary);
+    if (!apk) return false;
+    out.assign(words, 0);
+    apk.seekg(static_cast<std::streamoff>(g_dart->view_begin + *file));
+    apk.read(reinterpret_cast<char *>(out.data()),
+        static_cast<std::streamsize>(out.size() * 4));
+    return apk.gcount() == static_cast<std::streamsize>(out.size() * 4);
+}
+
+/*
  * Bind a Dart image VA to its runtime address, code source and instruction words. This is only used
  * for the two capture trampolines: the geometry fields no longer need a hook.
  */
@@ -958,6 +986,74 @@ bool bind_dart_target(uint32_t va, uintptr_t &address, nhk::CodeSource &source, 
 
 bool bl_target(uint32_t word, uint32_t pc, uint32_t *target);
 
+/*
+ * Run-time anchor search over a Dart function body.
+ *
+ * Every position the layout hooks need is derived here instead of being written down: sizes
+ * come from the symbol table's own ordering, callee addresses from the names it carries. A
+ * site is reported only when exactly one instruction run matches. Zero matches means the
+ * launcher reshaped that code, several means the shape does not identify it, and both decline
+ * the hook rather than fall back to a remembered number -- a mis-bound splice replaces working
+ * launcher code with ours, which is strictly worse than leaving the feature off.
+ */
+namespace dartscan {
+
+/* The symbol table understates some bodies (`LauncherIndicatorState.build` reports 0x58 but
+ * spans 0x2b4), so a scan covers the distance to the next symbol rather than the reported
+ * size. Truncating at the reported size would cut the very sites these hooks look for.
+ *
+ * The cap matters in the other direction: the targets this module cares about are Dart
+ * functions, but the next *listed* symbol can sit far past the end of one -- `Container.build`
+ * has nothing else of ours between it and the next entry, which would hand the scan tens of
+ * kilobytes of unrelated code. The bound is what keeps that in check, and it has to clear the
+ * longest body these scans actually walk: the drop-back target's bounds check sits past 0x1300
+ * bytes into it, so a smaller bound truncates the scan and reports "not found" for a function
+ * that is present and unchanged.
+ */
+constexpr uint32_t kMaxScanBytes = 0x4000;
+
+bool function_span(uint32_t va, uint32_t *out_size) {
+    if (va == 0 || out_size == nullptr) return false;
+    uint32_t span = 0;
+    if (!hometweaks::HomeTweaksSymbolSpan(va, &span)) return false;
+    if (span < 4 || span > kMaxScanBytes) span = kMaxScanBytes;
+    *out_size = span;
+    return true;
+}
+
+/* The single offset at which `seq` occurs verbatim. Several occurrences are a failure. */
+bool unique_sequence(const std::vector<uint32_t> &body, const uint32_t *seq, size_t count,
+    uint32_t *offset) {
+    if (seq == nullptr || count == 0 || body.size() < count) return false;
+    size_t found = SIZE_MAX;
+    for (size_t i = 0; i + count <= body.size(); ++i) {
+        if (!std::equal(seq, seq + count, body.begin() + static_cast<long>(i))) continue;
+        if (found != SIZE_MAX) return false;
+        found = i;
+    }
+    if (found == SIZE_MAX) return false;
+    if (offset != nullptr) *offset = static_cast<uint32_t>(found) * 4;
+    return true;
+}
+
+
+} // namespace dartscan
+
+/*
+ * Locate the capsule splice point in `LauncherIndicatorState.build`.
+ *
+ * The launcher builds the capsule indicator by calling `_wrapWithAnimation` and then packing
+ * the result into the two-element array it hands on. The splice goes inside that packing, on the
+ * instruction that starts passing the second element along. Nothing about that position is
+ * written down here: the packing run is found by scanning, the call in front of it is decoded
+ * to confirm it is the wrapper's, and the instruction is counted from there. A launcher that
+ * reorders the sequence therefore either resolves to its new position or declines -- it cannot
+ * be left pointing at whatever slid into the old slot, which is what a stored offset would do.
+ *
+ * Every step must be unique. The body calls the wrapper three times, so the call target alone
+ * does not identify anything; it is the packing run that pins the site down, and the call is
+ * only checked to agree.
+ */
 bool capsule_wrapper_layout_compatible(uint32_t wrapper_va, uint32_t wrapper_size,
     uint32_t *caller_va) {
     // Verify both finished branches at the original builder splice, the wrapper allocator,
@@ -1003,51 +1099,57 @@ bool capsule_wrapper_layout_compatible(uint32_t wrapper_va, uint32_t wrapper_siz
     return true;
 }
 
-bool workspace_geometry_code_compatible(uint32_t va, uint32_t size, bool occupied) {
-    // OS4 7722: actual RenderBox layout/ParentData.offset consumers. Verify the
-    // original loads, frame slots, displaced code and final constraint stores.
-    // The earlier _buildChildren splice was overwritten by these delegates.
-    std::vector<uint32_t> code;
-    const auto matches = [&](uint32_t offset, const auto &expected) {
-        return dart_words(va + offset, std::size(expected), code)
-            && code.size() >= std::size(expected)
-            && std::equal(std::begin(expected), std::end(expected), code.begin());
-    };
-    if (occupied == false) {
-        if (size != 0x5cc) return false;
-        constexpr uint32_t words0[] = {0xb841b003u, 0x8b1c8063u, 0xf81f83a3u, 0xfc42b060u, 0xfc1b03a0u, 0xfc433061u, 0xfc1b83a1u, 0xb846b061u};
-        constexpr uint32_t words1[] = {0xf85f83a0u, 0xf81d83a2u, 0xb843b003u, 0x8b1c8063u, 0xf81e03a3u, 0xfc407060u, 0xfc1a83a0u, 0xf85f03a4u, 0xfc5b03a1u, 0xfc5b83a2u, 0xfc5c03a3u, 0xf85ff040u, 0xd34c7c00u};
-        constexpr uint32_t words2[] = {0xfc5a83a0u, 0xf8407002u, 0x9e620044u, 0x1e610885u, 0x1e652804u, 0xfc1983a4u, 0xf840f002u, 0x9e620045u, 0x1e6208a6u, 0x1e6328c5u, 0xfc1a03a5u};
-        constexpr uint32_t words3[] = {0xfc5b03a0u, 0xf81d03a0u, 0xfc007000u, 0xfc00f000u, 0xfc5b83a1u, 0xfc017001u, 0xfc01f001u, 0xf85f03a3u};
-        return matches(0x18, words0) && matches(0xbc, words1) && matches(0x1d4, words2) && matches(0x2c8, words3);
+/*
+ * Locate a set of instruction runs inside a Dart body and require every one of them.
+ *
+ * The runs are what these hooks have always compared against; what changed is where they are
+ * looked for. Each used to carry a fixed offset, and the same run appears at a different offset
+ * in every one of these bodies -- 0x18 in the empty-grid delegate, 0x7b4 in the occupied one --
+ * so a fixed offset identifies a function, not a site, and silently matches the wrong code
+ * once the launcher reorganises the bodies. Scanning also removes the need to assert the
+ * reported symbol size, which is shorter than the real body for two of these functions and so
+ * would truncate the scan before it reached the last run.
+ */
+static bool require_runs(uint32_t va, const std::vector<std::pair<const uint32_t *, size_t>> &runs) {
+    uint32_t span = 0;
+    if (!dartscan::function_span(va, &span)) return false;
+    std::vector<uint32_t> body;
+    if (!dart_function_words(va, span, body)) return false;
+    for (const auto &run : runs) {
+        if (!dartscan::unique_sequence(body, run.first, run.second, nullptr)) return false;
     }
-    if (occupied == true) {
-        if (size != 0x6ac) return false;
-        constexpr uint32_t words0[] = {0xf85f83a2u, 0xb8417040u, 0x8b1c8000u, 0xfc42b000u, 0xfc1a03a0u, 0xfc433001u, 0xfc1a83a1u, 0xb840f043u};
-        constexpr uint32_t words1[] = {0xb843b001u, 0x8b1c8021u, 0xfc407022u, 0xfc1b03a2u, 0xa9460345u, 0x910040a5u, 0xeb05001fu, 0x54002a09u};
-        constexpr uint32_t words2[] = {0xfc5a03a0u, 0xfc5a83a1u, 0xfc5b03a2u, 0xf85f03a0u, 0xf85e83a1u, 0xf8437002u, 0x9e620043u, 0x1e600864u, 0x1e642843u, 0xfc1903a3u, 0xf843f002u, 0x9e620044u, 0x1e610885u, 0xfc1983a5u, 0xf9403f40u, 0xf9524800u, 0xf9402370u, 0x6b10001fu};
-        constexpr uint32_t words3[] = {0xfc5803a0u, 0xf81c83a0u, 0xfc007000u, 0xfc00f000u, 0xfc5883a0u, 0xfc017000u, 0xfc01f000u, 0xf85f83a3u, 0xb840b064u, 0x8b1c8084u};
-        return matches(0x90, words0) && matches(0xc4, words1) && matches(0x1fc, words2) && matches(0x440, words3);
-    }
-    return false;
+    return true;
 }
 
-bool hotseat_geometry_code_compatible(uint32_t va, uint32_t size) {
-    // OS4 7722: final Dock ParentData.offset.x, after original per-icon calculation.
-    // Verify delegate count, compressed ItemInfo chain, column and Offset stores.
-    if (size != 0x72c) return false;
-    std::vector<uint32_t> code;
-    const auto matches = [&](uint32_t offset, const auto &expected) {
-        return dart_words(va + offset, std::size(expected), code)
-            && code.size() >= std::size(expected)
-            && std::equal(std::begin(expected), std::end(expected), code.begin());
-    };
-    constexpr uint32_t words0[] = {0xa9bf79fdu, 0xaa0f03fdu, 0xd10281efu, 0xf81f83a1u, 0xf81f03a2u, 0xd28000c1u, 0x9411837cu, 0xaa0003e1u};
-    constexpr uint32_t words1[] = {0xf85f83a5u, 0xf81c03a4u, 0xf84130a6u, 0x937f78c0u, 0xeb8004dfu, 0x54000060u, 0x941187bcu, 0xf8007006u, 0xf81c83a0u, 0xfc42b0a0u, 0xfc1883a0u, 0xd2800001u, 0xfc5903a1u, 0xf81d03a2u};
-    constexpr uint32_t words2[] = {0xf85b03a2u, 0x97c6e9ecu, 0xaa0003e3u, 0xf85b03a2u, 0xb840f040u, 0x8b1c8000u, 0xb8407001u, 0x8b1c8021u, 0xf8437024u, 0x937f7880u, 0xeb80049fu, 0x54000060u, 0x94118778u, 0xf8007004u, 0xf85c83b0u};
-    constexpr uint32_t words3[] = {0xfc1783a2u, 0xa9461340u, 0x91004000u, 0xeb00009fu, 0x54001529u};
-    constexpr uint32_t words4[] = {0x97c6c09eu, 0xf85b03a2u, 0xb8413040u, 0x8b1c8000u, 0xfc407000u, 0xfc1803a0u, 0x9406fdaeu, 0xfc5803a0u, 0xf81983a0u, 0xfc007000u, 0xfc5783a0u, 0xfc00f000u, 0xf85f83a3u};
-    return matches(0x0, words0) && matches(0x218, words1) && matches(0x310, words2) && matches(0x43c, words3) && matches(0x54c, words4);
+#define HC_RUN(name) std::make_pair(static_cast<const uint32_t *>(name), std::size(name))
+
+bool workspace_geometry_code_compatible(uint32_t va, bool occupied) {
+    // The real RenderBox layout / ParentData.offset consumers. Each run below is the original
+    // load, frame slot, displaced code or final constraint store at one of those sites.
+    // The earlier _buildChildren splice was overwritten by these delegates.
+    if (occupied == false) {
+        static constexpr uint32_t words0[] = {0xb841b003u, 0x8b1c8063u, 0xf81f83a3u, 0xfc42b060u, 0xfc1b03a0u, 0xfc433061u, 0xfc1b83a1u, 0xb846b061u};
+        static constexpr uint32_t words1[] = {0xf85f83a0u, 0xf81d83a2u, 0xb843b003u, 0x8b1c8063u, 0xf81e03a3u, 0xfc407060u, 0xfc1a83a0u, 0xf85f03a4u, 0xfc5b03a1u, 0xfc5b83a2u, 0xfc5c03a3u, 0xf85ff040u, 0xd34c7c00u};
+        static constexpr uint32_t words2[] = {0xfc5a83a0u, 0xf8407002u, 0x9e620044u, 0x1e610885u, 0x1e652804u, 0xfc1983a4u, 0xf840f002u, 0x9e620045u, 0x1e6208a6u, 0x1e6328c5u, 0xfc1a03a5u};
+        static constexpr uint32_t words3[] = {0xfc5b03a0u, 0xf81d03a0u, 0xfc007000u, 0xfc00f000u, 0xfc5b83a1u, 0xfc017001u, 0xfc01f001u, 0xf85f03a3u};
+        return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3)});
+    }
+    static constexpr uint32_t cwords0[] = {0xf85f83a2u, 0xb8417040u, 0x8b1c8000u, 0xfc42b000u, 0xfc1a03a0u, 0xfc433001u, 0xfc1a83a1u, 0xb840f043u};
+    static constexpr uint32_t cwords1[] = {0xb843b001u, 0x8b1c8021u, 0xfc407022u, 0xfc1b03a2u, 0xa9460345u, 0x910040a5u, 0xeb05001fu, 0x54002a09u};
+    static constexpr uint32_t cwords2[] = {0xfc5a03a0u, 0xfc5a83a1u, 0xfc5b03a2u, 0xf85f03a0u, 0xf85e83a1u, 0xf8437002u, 0x9e620043u, 0x1e600864u, 0x1e642843u, 0xfc1903a3u, 0xf843f002u, 0x9e620044u, 0x1e610885u, 0xfc1983a5u, 0xf9403f40u, 0xf9524800u, 0xf9402370u, 0x6b10001fu};
+    static constexpr uint32_t cwords3[] = {0xfc5803a0u, 0xf81c83a0u, 0xfc007000u, 0xfc00f000u, 0xfc5883a0u, 0xfc017000u, 0xfc01f000u, 0xf85f83a3u, 0xb840b064u, 0x8b1c8084u};
+    return require_runs(va, {HC_RUN(cwords0), HC_RUN(cwords1), HC_RUN(cwords2), HC_RUN(cwords3)});
+}
+
+bool hotseat_geometry_code_compatible(uint32_t va) {
+    // The final Dock ParentData.offset.x write, after the original per-icon calculation:
+    // delegate count, the compressed ItemInfo chain, the column and the Offset stores.
+    static constexpr uint32_t words0[] = {0xa9bf79fdu, 0xaa0f03fdu, 0xd10281efu, 0xf81f83a1u, 0xf81f03a2u, 0xd28000c1u, 0x9411837cu, 0xaa0003e1u};
+    static constexpr uint32_t words1[] = {0xf85f83a5u, 0xf81c03a4u, 0xf84130a6u, 0x937f78c0u, 0xeb8004dfu, 0x54000060u, 0x941187bcu, 0xf8007006u, 0xf81c83a0u, 0xfc42b0a0u, 0xfc1883a0u, 0xd2800001u, 0xfc5903a1u, 0xf81d03a2u};
+    static constexpr uint32_t words2[] = {0xf85b03a2u, 0x97c6e9ecu, 0xaa0003e3u, 0xf85b03a2u, 0xb840f040u, 0x8b1c8000u, 0xb8407001u, 0x8b1c8021u, 0xf8437024u, 0x937f7880u, 0xeb80049fu, 0x54000060u, 0x94118778u, 0xf8007004u, 0xf85c83b0u};
+    static constexpr uint32_t words3[] = {0xfc1783a2u, 0xa9461340u, 0x91004000u, 0xeb00009fu, 0x54001529u};
+    static constexpr uint32_t words4[] = {0x97c6c09eu, 0xf85b03a2u, 0xb8413040u, 0x8b1c8000u, 0xfc407000u, 0xfc1803a0u, 0x9406fdaeu, 0xfc5803a0u, 0xf81983a0u, 0xfc007000u, 0xfc5783a0u, 0xfc00f000u, 0xf85f83a3u};
+    return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3), HC_RUN(words4)});
 }
 
 bool bind_target(const Library &library, uint64_t va, uintptr_t &address,
@@ -1401,23 +1503,28 @@ void bind_folder_geometry() {
         const auto &spec = home_layout::kFolderGeometrySites[i];
         uint32_t va = 0, size = 0;
         std::vector<uint32_t> words;
-        if (!hometweaks::HomeTweaksFindSymbol(spec.symbol, &va, &size)
-            || size != spec.size || !dart_words(va + spec.offset, 4, words)
-            || !std::equal(std::begin(spec.words), std::end(spec.words), words.begin())) return;
+        if (!hometweaks::HomeTweaksFindSymbol(spec.symbol, &va, &size)) return;
+        // The site is wherever its four-word run is, and only there: see the note on
+        // FolderGeometrySite. Reading the whole body is what admits the complete known
+        // function, so the reported symbol size is not consulted at all.
+        uint32_t span = 0;
+        if (!dartscan::function_span(va, &span)) return;
+        std::vector<uint32_t> body;
+        if (!dart_function_words(va, span, body)) return;
+        uint32_t offset = 0;
+        if (!dartscan::unique_sequence(body, spec.words, std::size(spec.words), &offset)
+            || offset + 16 > span) return;
         // The scalar carry crosses original Dart calls. Admit only the complete
         // known bodies, including the outgoing-argument writes and last screen read.
         const auto full = i < 2 || i == 4
             ? std::span<const uint32_t>(home_layout::kFolderPositionOriginal)
             : std::span<const uint32_t>(home_layout::kFolderSizeOriginal);
-        std::vector<uint32_t> body;
-        if (!dart_words(va, full.size(), body)
+        if (body.size() < full.size()
             || !std::equal(full.begin(), full.end(), body.begin())) return;
         // Validate the owning frame. The continuation is exactly patch+16.
-        std::vector<uint32_t> frame;
-        if (!dart_words(va, 3, frame) || frame[0] != kDartPrologue
-            || frame[1] != 0xaa0f03fd || frame[2] != full[2]) return;
+        if (body[0] != kDartPrologue || body[1] != 0xaa0f03fd || body[2] != full[2]) return;
         auto &slot = candidates[i];
-        if (!bind_dart_target(va + spec.offset, slot.address, slot.source, slot.original_words)) return;
+        if (!bind_dart_target(va + offset, slot.address, slot.source, slot.original_words)) return;
         slot.replacement = const_cast<void *>(entries[i]);
         slot.original = &hc_layout_folder_original[i];
     }
@@ -1425,33 +1532,68 @@ void bind_folder_geometry() {
         g_slots[kFolderGeometrySlotBase + i] = candidates[i];
         hc_layout_folder_resume[i] = candidates[i].address + 16;
     }
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "folder geometry bank bound at scanned sites=%zu first=%#llx", candidates.size(),
+        static_cast<unsigned long long>(candidates[0].address));
+}
+
+/*
+ * GridInfo field offsets, resolved once at bind time from the drop-back target's own code --
+ * it is the one function that reads every field the geometry hooks need. See
+ * home_dart_fields.h for how each is identified, and for which ones the code does not pin down.
+ */
+home_layout::GridFieldOffsets g_grid_field{};
+
+home_layout::DropGeometryFields drop_geometry_fields() {
+    return home_layout::drop_geometry_fields(g_grid_field);
+}
+
+/*
+ * Resolve the GridInfo field offsets from a function that reads them. The drop-back target is
+ * used because it reads all of them in one place. Declining is silent and total: the fields keep
+ * their -1s and every geometry hook that needs one leaves the layout alone, which is a no-op
+ * rather than a misplaced icon.
+ */
+void resolve_grid_fields(const char *symbol) {
+    if (g_grid_field.columns > 0) return;
+    uint32_t va = 0, size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol(symbol, &va, &size)) return;
+    uint32_t span = 0;
+    if (!dartscan::function_span(va, &span)) return;
+    std::vector<uint32_t> body;
+    if (!dart_function_words(va, span, body)) return;
+    g_grid_field = home_layout::read_grid_field_offsets(body);
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "grid fields resolved from %s: cols=%d rows=%d origin=%d item=%d,%d", symbol,
+        g_grid_field.columns, g_grid_field.rows, g_grid_field.origin,
+        g_grid_field.item_col, g_grid_field.item_row);
 }
 
 void bind_drop_geometry() {
     if (g_slots[kDropGeometrySlotBase].address != 0 || !g_dart) return;
     uint32_t va = 0, size = 0;
-    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kDropGeometrySymbol, &va, &size)
-        || size != home_layout::kDropGeometrySize) return;
+    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kDropGeometrySymbol, &va, &size)) return;
+    // The whole body is the identity here -- it is what the field offsets below are read out
+    // of -- so it is scanned to the next symbol rather than to the reported size, which
+    // understates this body and would cut the search short of most of it.
+    uint32_t span = 0;
+    if (!dartscan::function_span(va, &span)) return;
     std::vector<uint32_t> body;
-    if (!dart_words(va, size / 4, body)) return;
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    for (const uint32_t word : body) {
-        for (unsigned shift = 0; shift < 32; shift += 8) {
-            hash ^= (word >> shift) & 0xffu;
-            hash *= 0x100000001b3ULL;
-        }
-    }
-    if (hash != home_layout::kDropGeometryHash || body[0] != kDartPrologue
-        || body[1] != 0xaa0f03fd || body[2] != 0xd10141ef) return;
+    if (!dart_function_words(va, span, body)) return;
+    if (body[0] != kDartPrologue || body[1] != 0xaa0f03fd) return;
+    // The GridInfo fields this hook reads, resolved from the body rather than stored. Any that
+    // the code does not pin down stays at -1 and the body declines to adjust, which leaves the
+    // drop where the stock code would have put it.
+    resolve_grid_fields(home_layout::kDropGeometrySymbol);
     const void *entries[] = {reinterpret_cast<void *>(hc_layout_drop_0_entry),
         reinterpret_cast<void *>(hc_layout_drop_1_entry)};
     std::array<Slot, 2> candidates{};
     for (size_t i = 0; i < candidates.size(); ++i) {
-        const auto &spec = home_layout::kDropGeometrySites[i];
-        if (!std::equal(std::begin(spec.words), std::end(spec.words),
-                body.begin() + spec.offset / 4)) return;
+        uint32_t offset = 0;
+        if (!dartscan::unique_sequence(body, home_layout::kDropGeometrySites[i].words,
+                std::size(home_layout::kDropGeometrySites[i].words), &offset)) return;
         auto &slot = candidates[i];
-        if (!bind_dart_target(va + spec.offset, slot.address, slot.source,
+        if (!bind_dart_target(va + offset, slot.address, slot.source,
                 slot.original_words)) return;
         slot.replacement = const_cast<void *>(entries[i]);
         slot.original = &hc_layout_drop_original[i];
@@ -1460,6 +1602,11 @@ void bind_drop_geometry() {
         g_slots[kDropGeometrySlotBase + i] = candidates[i];
         hc_layout_drop_resume[i] = candidates[i].address + 16;
     }
+    const home_layout::DropGeometryFields field = drop_geometry_fields();
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "drop geometry bank bound at scanned sites=%zu cols=%d rows=%d origin=%d "
+        "item=%d,%d usable=%d", candidates.size(), field.columns, field.rows, field.origin,
+        field.item_col, field.item_row, field.usable() ? 1 : 0);
 }
 
 size_t bind_knobs() {
@@ -1484,7 +1631,9 @@ size_t bind_knobs() {
         if (&knob == &g_knobs[5]) {
             if (knob.symbol == "LauncherIndicatorState._wrapWithAnimation") {
                 uint32_t caller_va = 0;
-                if (!capsule_wrapper_layout_compatible(va, size, &caller_va)) continue;
+                if (!capsule_wrapper_layout_compatible(va, size, &caller_va)) {
+                    continue;
+                }
                 capsule_patch_va = caller_va;
                 knob.hook_entry = reinterpret_cast<void *>(hc_layout_capsule_entry);
             } else {
@@ -1528,7 +1677,7 @@ size_t bind_knobs() {
         const bool hotseat_horizontal = &knob == &g_knobs[4]
             && knob.symbol == "HotSeatLayoutDelegate.cellLayout";
         if (workspace_cell || workspace_occupied) {
-            if (!workspace_geometry_code_compatible(va, size, workspace_occupied)) continue;
+            if (!workspace_geometry_code_compatible(va, workspace_occupied)) continue;
             knob.hook_entry = workspace_cell
                 ? reinterpret_cast<void *>(hc_layout_workspace_entry)
                 : reinterpret_cast<void *>(hc_layout_workspace_occupied_entry);
@@ -1537,7 +1686,7 @@ size_t bind_knobs() {
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_container_probe_entry);
         }
         if (hotseat_horizontal) {
-            if (!hotseat_geometry_code_compatible(va, size)) continue;
+            if (!hotseat_geometry_code_compatible(va)) continue;
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_hotseat_horizontal_entry);
         }
         const bool workspace_splice = workspace_cell || workspace_occupied || hotseat_horizontal
@@ -1842,19 +1991,32 @@ bool sync_hotseat_capacity(bool enabled) {
         for (int i = 0; i < home_layout::kCapacitySiteCount; ++i) {
             const auto &site = home_layout::kCapacitySites[i];
             uint32_t va = 0, size = 0;
-            std::vector<uint32_t> guard, prologue;
-            if (!hometweaks::HomeTweaksFindSymbol(site.symbol, &va, &size) || size != site.size
-                || site.offset < 12 || site.offset + 4 > size
-                || !dart_words(va, 4, prologue) || prologue[0] != kDartPrologue
-                || !dart_words(va + site.offset - 12, 4, guard)
-                || std::memcmp(guard.data(), site.guard, sizeof(site.guard)) != 0) return false;
+            std::vector<uint32_t> body;
+            if (!hometweaks::HomeTweaksFindSymbol(site.symbol, &va, &size)) return false;
+            if (!dart_words(va, 4, body) || body[0] != kDartPrologue) return false;
+            // The guard run is the site; the patched instruction is the word it ends on. The
+            // reported symbol size is not consulted: it is shorter than the real body for
+            // `calculatePositionX` (0x18c against a 0x138 offset), so requiring it to match
+            // would refuse a site that is present and unchanged.
+            uint32_t span = 0;
+            if (!dartscan::function_span(va, &span)) return false;
+            std::vector<uint32_t> full;
+            if (!dart_function_words(va, span, full)) return false;
+            uint32_t guard_at = 0;
+            if (!dartscan::unique_sequence(full, site.guard, home_layout::kCapacityGuardWords,
+                    &guard_at)) {
+                return false;
+            }
+            const uint32_t offset = guard_at + home_layout::kCapacityGuardLead;
+            if (offset + 4 > span) return false;
             // source() pins the runtime address to this loaded image, not another libapp mapping.
-            if (g_dart->load_base > UINTPTR_MAX - va - site.offset) return false;
-            const uintptr_t address = g_dart->load_base + va + site.offset;
-            const auto file = dart_file_offset(va + site.offset, 4);
+            if (g_dart->load_base > UINTPTR_MAX - va - offset) return false;
+            const uintptr_t address = g_dart->load_base + va + offset;
+            const auto file = dart_file_offset(va + offset, 4);
             const auto origin = nhk::source_at(g_dart->owned, address, 4);
             if (!file || !origin || origin->file_offset != *file || (address & 3)) return false;
-            candidate[i] = {address, site.guard[3], site.replacement};
+            candidate[i] = {address, site.guard[home_layout::kCapacityGuardWords - 1],
+                site.replacement};
         }
         std::copy(std::begin(candidate), std::end(candidate), std::begin(g_capacity_words));
         g_capacity_bound = true;
@@ -1893,31 +2055,37 @@ bool sync_widget_move(bool enabled) {
     if (!g_dart || (!enabled && !g_widget_move_address)) return !enabled;
     if (!g_widget_move_checked) {
         g_widget_move_checked = true;
-        uint32_t va = 0, size = 0, span = 0, span_size = 0, session = 0, session_size = 0;
-        bool compatible = hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &va, &size)
-            && size == home_layout::kWidgetMoveSize
-            && hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._isSpanSupportedByPa", &span, &span_size)
-            && span == va + 0xbc4 && span_size == 0x108
-            && hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._ensureDragSessionId", &session, &session_size)
-            && session == va + 0xa04 && session_size == 0x144;
-        compatible = compatible && home_layout::widget_move_guards_match(
-            [&](uint32_t offset, uint32_t (&expected)[4]) {
-            std::vector<uint32_t> words;
-            if (!dart_words(va + offset, 4, words)) return false;
-            std::copy(words.begin(), words.end(), std::begin(expected));
-            return true;
-        });
-        if (compatible && g_dart->load_base <= UINTPTR_MAX - va - home_layout::kWidgetMoveOffset) {
-            const uintptr_t address = g_dart->load_base + va + home_layout::kWidgetMoveOffset;
-            const auto file = dart_file_offset(va + home_layout::kWidgetMoveOffset, 4);
+        uint32_t va = 0, size = 0;
+        /*
+         * No neighbour-placement assertion here. `_isSpanSupportedByPa` and
+         * `_ensureDragSessionId` are closures *inside* this body, not siblings of it, so their
+         * addresses move with the parent and any fixed distance or ordering between them says
+         * nothing about whether the hook is still aimed at the right code. The scan below is
+         * what decides: it either finds exactly one branch whose shape identifies the widget
+         * rejection, or the hook stays off.
+         */
+        bool compatible = hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &va, &size);
+        size_t gate = SIZE_MAX;
+        int32_t flag_field = 0;
+        if (compatible) {
+            gate = home_layout::widget_move_gate_offset(size,
+                [&](size_t count, std::vector<uint32_t> &out) {
+                    return dart_function_words(va, static_cast<uint32_t>(count), out);
+                }, &flag_field);
+            compatible = gate != SIZE_MAX && gate + 4 <= size * 4;
+        }
+        if (compatible && g_dart->load_base <= UINTPTR_MAX - va - gate) {
+            const uintptr_t address = g_dart->load_base + va + gate;
+            const auto file = dart_file_offset(va + static_cast<uint32_t>(gate), 4);
             const auto source = nhk::source_at(g_dart->owned, address, 4);
             if (file && source && source->file_offset == *file && !(address & 3)) {
                 g_widget_move_address = address;
             }
         }
         __android_log_print(g_widget_move_address ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
-            "widget minus-one original-code compatible=%d symbol=%s offset=%#x",
-            g_widget_move_address != 0, home_layout::kWidgetMoveSymbol, home_layout::kWidgetMoveOffset);
+            "widget minus-one original-code compatible=%d symbol=%s gate=%#zx flag=%#x",
+            g_widget_move_address != 0, home_layout::kWidgetMoveSymbol, gate,
+            static_cast<uint32_t>(flag_field));
     }
     if (!g_widget_move_address) return false;
     if (g_widget_move_known && enabled == g_widget_move_enabled) return true;
@@ -2032,41 +2200,139 @@ bool bind_title_hide() {
     return true;
 }
 
+/*
+ * Locate every position the Gadget bridge needs by scanning the loaded image for instruction
+ * semantics. See home_gadget_bridge.h for why a zero- or two-match scan is a hard failure.
+ * Nothing below carries a displacement: the sizes come from the symbol table and the offsets
+ * come from the scans.
+ */
+bool gadget_scan_anchors(uint32_t serializer, uint32_t serializer_size,
+    uint32_t put_int_va, uint32_t gate, uint32_t gate_size, home_layout::GadgetAnchors &out) {
+    using namespace home_layout;
+    std::vector<uint32_t> body, gate_body;
+    if (!dart_function_words(serializer, serializer_size, body)
+        || !dart_function_words(gate, gate_size, gate_body)) return false;
+    const auto at = [](const std::vector<uint32_t> &v, size_t i) {
+        return i < v.size() ? v[i] : 0u;
+    };
+
+    // putInt: the serializer stores the marker through BundleImpl.putInt fifteen times, so the
+    // callee alone is ambiguous. The reported one is the call whose block also carries the
+    // marker-key load -- that is the write the bridge has to reproduce, not any of the other 14.
+    for (size_t i = 0; i + 2 < body.size(); ++i) {
+        if (!is_bl(body[i])) continue;
+        // BL's immediate counts instructions and is signed, so the target is computed in 64-bit:
+        // adding it as an unsigned 32-bit would wrap a backward branch into a huge address and
+        // the comparison below would never match.
+        const int64_t target = static_cast<int64_t>(serializer) + i * 4
+            + static_cast<int64_t>(bl_imm_words(body[i])) * 4;
+        if (target != static_cast<int64_t>(put_int_va)) continue;
+        for (size_t back = i; back-- > 0;) {
+            if (at(body, back) == movz_32(kMarkerKey, 17)) {
+                out.put_int = static_cast<uint32_t>(i) * 4;
+                // The store the bridge must not disturb sits one instruction after the load
+                // of the key it was indexed by.
+                out.ret = static_cast<uint32_t>(back) * 4;
+                break;
+            }
+            if (i - back > 24) break;
+        }
+        if (out.put_int) break;
+    }
+    // select: the branch that discriminates the marker path, keyed on its own immediate.
+    for (size_t i = 0; i + 1 < body.size(); ++i) {
+        if (!is_imm_compare(body[i], kSelectDiscriminator)) continue;
+        if (!is_cond_branch(body[i + 1])) continue;
+        out.select = static_cast<uint32_t>(i) * 4;
+        break;
+    }
+    // common / id: the Bundle field the clear path rewrites. That immediate appears twice in
+    // this body, so it alone does not identify the site; what does is the spilled slot it is
+    // read through -- the shared path reloads the same one the marker store used. Requiring
+    // exactly one such pair keeps a renumbered launcher from binding the wrong read.
+    {
+        size_t found = SIZE_MAX;
+        for (size_t i = 1; i < body.size(); ++i) {
+            int32_t field = 0;
+            if (!is_ldur_w(body[i], 3, field)) continue;
+            if (field != static_cast<int32_t>(kClearField)) continue;
+            if (!is_ldur_sp(body[i - 1], kClearSlot, kFramePointer)) continue;
+            if (found != SIZE_MAX) { found = SIZE_MAX; break; }
+            found = i;
+        }
+        if (found != SIZE_MAX) {
+            out.id_offset = static_cast<uint32_t>(kClearField);
+            out.common = static_cast<uint32_t>(found - 1) * 4;
+        }
+    }
+    // The gate body has several `tbnz w0,#4` sites; only one is preceded by a call, and that is
+    // the span check. The widget test is the sign-extension pair, but three sites share that
+    // shape -- it is told apart by branching to the same reject arm the span check does, which
+    // is what makes the two a matched pair instead of two independent guesses.
+    for (size_t i = 1; i < gate_body.size(); ++i) {
+        if (!is_tbnz_w(gate_body[i], 0, 4)) continue;
+        const int32_t dest = static_cast<int32_t>(i) * 4 + branch_disp_words(gate_body[i]) * 4;
+        if (dest <= 0 || static_cast<uint32_t>(dest) >= gate_size * 4) continue;
+        if (!is_bl(gate_body[i - 1])) continue;
+        if (out.span_entry != 0) { out.span_entry = 0; break; }
+        out.span_entry = static_cast<uint32_t>(i) * 4;
+        out.span_reject = static_cast<uint32_t>(dest);
+    }
+    for (size_t i = 1; out.span_reject != 0 && i < gate_body.size(); ++i) {
+        if (!is_tbnz_w(gate_body[i], 0, 4)) continue;
+        const int32_t dest = static_cast<int32_t>(i) * 4 + branch_disp_words(gate_body[i]) * 4;
+        if (static_cast<uint32_t>(dest) != out.span_reject) continue;
+        if (!is_add_shift32(gate_body[i - 1])) continue;
+        if (out.widget_gate != 0) { out.widget_gate = 0; break; }
+        out.widget_gate = static_cast<uint32_t>(i) * 4;
+    }
+    out.ok = out.put_int && out.ret && out.select && out.common
+        && out.id_offset && out.span_entry && out.span_reject && out.widget_gate;
+    return out.ok;
+}
+
 // Two original-body splices; original putInt BL/return PC retain the Dart stack map.
 bool bind_gadget_bridge() {
     if (g_gadget_bound) return true;
     if (!g_dart || !g_gadget_requested.load(std::memory_order_acquire)) return false;
-    uint32_t va = 0, size = 0, clone = 0, clone_size = 0, factory = 0;
-    std::vector<uint32_t> code;
-    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetSerializer, &va, &size)
-        || size != home_layout::kGadgetSerializerSize
-        || !home_layout::gadget_bridge_guards_match([&](uint32_t offset, uint32_t (&words)[4]) {
-            if (!dart_words(va + offset, 4, code)) return false;
-            std::copy(code.begin(), code.end(), words); return true;
-        })
-        || !hometweaks::HomeTweaksFindSymbol("GadgetInfoModel.cloneModel", &clone, &clone_size)
-        || clone_size != 0x23c || !dart_words(clone + 0x1c, 1, code)
-        || !bl_target(code[0], clone + 0x1c, &factory)
-        || !dart_words(factory, 2, code) || code[0] != 0xd2840382 || code[1] != 0xf2a00fe2
-        || !dart_words(clone + 0x40, 4, code)
-        || code[0] != 0xd2802371 || code[1] != 0xb8716840
-        || code[2] != 0x8b1c8000 || code[3] != 0xd2802371) return false;
-    uint32_t put = 0, put_size = 0, called = 0;
-    if (!hometweaks::HomeTweaksFindSymbol("BundleImpl.putInt", &put, &put_size)
-        || !dart_words(va + home_layout::kGadgetPutIntOffset, 1, code)
-        || !bl_target(code[0], va + home_layout::kGadgetPutIntOffset, &called)
-        || called != put) return false;
+    uint32_t va = 0, size = 0, put = 0, put_size = 0, clone = 0, clone_size = 0;
     uint32_t can = 0, can_size = 0;
-    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &can, &can_size)
-        || can_size != home_layout::kWidgetMoveSize
-        || !dart_words(can + 0x808, 4, code)
-        || code[0] != 0x37200480 || code[1] != 0xf85f83a0
-        || code[2] != 0xf85e83a2 || code[3] != 0xaa0003e1
-        || !dart_words(can + 0x480, 4, code)
-        || code[0] != 0xb8407002 || code[1] != 0x8b1c8042
-        || code[2] != 0xaa0203e0 || code[3] != 0xf85e83a3) return false;
+    home_layout::GadgetAnchors anchors;
+    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetSerializer, &va, &size)
+        || !hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetBundlePut, &put, &put_size)
+        || !hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &can, &can_size)
+        || !hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetModel, &clone, &clone_size)
+        || !gadget_scan_anchors(va, size, put, can, can_size, anchors)) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "Gadget12 bridge declined at scan; putInt=%x ret=%x select=%x common=%x id=%x "
+            "span=%x reject=%x gate=%x",
+            anchors.put_int, anchors.ret, anchors.select, anchors.common, anchors.id_offset,
+            anchors.span_entry, anchors.span_reject, anchors.widget_gate);
+        return false;
+    }
+    // The model clone the clear path mirrors. The clone body opens with a call into the model
+    // factory; the factory is recognised by the field key it indexes, not by where it sits.
+    uint32_t factory = 0;
+    std::vector<uint32_t> clone_body, code;
+    if (!dart_function_words(clone, clone_size, clone_body)) return false;
+    for (size_t i = 0; i < clone_body.size() && i < 32; ++i) {
+        if (!home_layout::is_bl(clone_body[i])) continue;
+        // Same signedness care as the putInt scan: the call is a backward branch.
+        const uint32_t candidate = static_cast<uint32_t>(
+            static_cast<int64_t>(clone) + i * 4
+            + static_cast<int64_t>(home_layout::bl_imm_words(clone_body[i])) * 4);
+        if (!dart_words(candidate, 12, code) || code.size() < 12) continue;
+        for (size_t k = 0; k + 1 < code.size(); ++k) {
+            if (code[k] != home_layout::movz_32(home_layout::kModelFieldKey, 17)) continue;
+            if (!home_layout::is_ldr32_reg(code[k + 1], 3, 17)) continue;
+            factory = candidate;
+            break;
+        }
+        if (factory) break;
+    }
+    if (!factory) return false;
     Slot prepared[3]{};
-    const uint32_t offsets[] = {home_layout::kGadgetSelectOffset, home_layout::kGadgetReturnOffset};
+    const uint32_t offsets[] = {anchors.select, anchors.ret};
     void *entries[] = {reinterpret_cast<void *>(hc_gadget_select_entry),
         reinterpret_cast<void *>(hc_gadget_return_entry)};
     for (unsigned i = 0; i < 2; ++i) {
@@ -2076,20 +2342,23 @@ bool bind_gadget_bridge() {
     }
     {
         uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
-        if (!bind_dart_target(can + 0x808, address, source, words)) return false;
+        if (!bind_dart_target(can + anchors.span_entry, address, source, words)) return false;
         prepared[2] = {address, reinterpret_cast<void *>(hc_gadget_span_entry),
             &hc_gadget_original[2], source, words};
         hc_gadget_span_continue = address + 16;
-        hc_gadget_span_reject = g_dart->load_base + can + 0x898;
+        hc_gadget_span_reject = g_dart->load_base + can + anchors.span_reject;
     }
     hc_gadget_select_continue = prepared[0].address + 16;
     hc_gadget_return_continue = prepared[1].address + 16;
-    hc_gadget_put_int = g_dart->load_base + va + home_layout::kGadgetPutIntOffset;
-    hc_gadget_common = g_dart->load_base + va + home_layout::kGadgetCommonOffset;
+    hc_gadget_put_int = g_dart->load_base + va + anchors.put_int;
+    hc_gadget_common = g_dart->load_base + va + anchors.common;
     for (unsigned i = 0; i < 3; ++i) g_slots[kGadgetBridgeSlot + i] = prepared[i];
     g_gadget_bound = true;
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "Gadget12 serializer bridge bound; original putInt PC; Dart8; no heap writes");
+        "Gadget12 bridge bound at scanned anchors putInt=%x ret=%x select=%x common=%x id=%x "
+        "span=%x reject=%x gate=%x; no heap writes",
+        anchors.put_int, anchors.ret, anchors.select, anchors.common, anchors.id_offset,
+        anchors.span_entry, anchors.span_reject, anchors.widget_gate);
     return true;
 }
 
@@ -3034,8 +3303,9 @@ extern "C" void hc_layout_drop_body(uintptr_t frame, uint64_t heap, uintptr_t sa
     const int bottom = g_knobs[3].delta_dp.load(std::memory_order_relaxed);
     const int side = g_knobs[4].delta_dp.load(std::memory_order_relaxed);
     const uint64_t hits_before = rendered_workspace.hits;
+    const home_layout::DropGeometryFields field = drop_geometry_fields();
     const bool valid = home_layout::drop_geometry_body(frame, heap, saved, kind,
-        top, bottom, side, &rendered_workspace);
+        &field, top, bottom, side, &rendered_workspace);
     const uint64_t count = __atomic_fetch_add(&hc_layout_drop_hits[kind], uint64_t{1}, __ATOMIC_RELAXED);
     if (count < 4) {
         __android_log_print(ANDROID_LOG_INFO, kTag,
@@ -3053,7 +3323,7 @@ extern "C" void hc_layout_workspace_layout(uintptr_t frame, uint64_t heap, int o
     const bool hotseat = occupied == 2;
     const bool valid = hotseat ? home_layout::inset_hotseat_frame(frame, heap, side, geometry)
         : home_layout::inset_workspace_frame(frame, heap, occupied != 0,
-            top, bottom, side, geometry, &rendered_workspace);
+            &g_grid_field, top, bottom, side, geometry, &rendered_workspace);
     static std::atomic<uint32_t> reports[3]{};
     if (reports[hotseat ? 2 : occupied != 0].fetch_add(1, std::memory_order_relaxed) < 8) {
         __android_log_print(ANDROID_LOG_INFO, "HyperCeiler.HomeLayout",

@@ -3,23 +3,31 @@
 #include "home_workspace_geometry.h"
 
 namespace home_layout {
-// Five original-body windows, after currentConfig returns and before any
-// edit-mode transform or Dart allocator. Never replace a getter's return.
+/*
+ * Five original-body splice points, after currentConfig returns and before any edit-mode
+ * transform or Dart allocator. Never replace a getter's return.
+ *
+ * `offset` is not stored. It used to be, and that made a fixed position the identity of the
+ * site: the same four-word run sits at a different offset in each body it appears in, so the
+ * number named a function rather than a place, and a launcher that inserted a check above one
+ * of them would have had the hook applied to whatever moved into that slot. The run alone
+ * identifies the site -- it is unique in every body it occurs in -- so the offset is looked up
+ * at bind time and the body is admitted only when exactly one place matches.
+ */
 struct FolderGeometrySite {
     const char *symbol;
-    uint32_t size, offset;
     uint32_t words[4];
 };
 inline constexpr FolderGeometrySite kFolderGeometrySites[] = {
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x128,
+    {"WidgetPositionUtil.getCellPosition",
         {0xb843b001, 0x8b1c8021, 0xfc407020, 0xf85f83a0}},
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x1cc,
+    {"WidgetPositionUtil.getCellPosition",
         {0x9e620000, 0xfc5d83a1, 0x1e610802, 0xfc407020}},
-    {"FolderIconGetxController.calOriginPreviewIconLoc", 0x2a4, 0x11c,
+    {"FolderIconGetxController.calOriginPreviewIconLoc",
         {0xb843b001, 0x8b1c8021, 0xfc407020, 0xf85f83a1}},
-    {"FolderIconGetxController.calOriginPreviewIconLoc", 0x2a4, 0x1d4,
+    {"FolderIconGetxController.calOriginPreviewIconLoc",
         {0x9e620060, 0xfc5e03a1, 0x1e610802, 0xfc407020}},
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x140,
+    {"WidgetPositionUtil.getCellPosition",
         {0x1e620823, 0x1e632801, 0x4ea11c20, 0xf85e83a1}},
 };
 
