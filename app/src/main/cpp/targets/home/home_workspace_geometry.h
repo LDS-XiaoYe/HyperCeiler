@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include "home_dart_fields.h"
 #include "home_workspace_snapshot.h"
 
 namespace home_layout {
@@ -38,26 +39,45 @@ template <typename T> inline void workspace_write(uintptr_t p, intptr_t off, T v
 // Offsets are admitted only after the original instruction windows match.
 // Occupied cells are recalculated from pristine GridInfo on EVERY iteration:
 // the preceding iteration's changed constraint locals must never compound.
+//
+// `field` carries the GridInfo offsets resolved from the launcher's own code; see
+// home_dart_fields.h. The two cell-size fields are not in it because they cannot be located
+// from the code that reads them, so the size still comes from the frame-pointer slots the stock
+// code itself wrote -- which is where the values being adjusted came from in the first place.
+// A null or unusable `field` declines the whole adjustment.
 inline bool inset_workspace_frame(uintptr_t fp, uint64_t heap, bool occupied,
-    double top, double bottom, double side, double *out,
+    const GridFieldOffsets *field, double top, double bottom, double side, double *out,
     WorkspaceRenderSnapshot *rendered = nullptr) {
+    if (field == nullptr || field->columns <= 0 || field->rows <= 0) return false;
     uintptr_t grid = workspace_read<uintptr_t>(fp, -8);
     if (occupied) grid = workspace_read<uint32_t>(grid, 0x17) + (heap << 32);
-    const int64_t columns = workspace_read<int64_t>(grid, 0x1b);
-    const int64_t rows = workspace_read<int64_t>(grid, 0x23);
+    const int64_t columns = workspace_read<int64_t>(grid, field->columns);
+    const int64_t rows = workspace_read<int64_t>(grid, field->rows);
     // A one-row hotseat is a separate tree and retains its original geometry.
     if (rows < 2) return false;
+    /*
+     * The cell size, from wherever this path's stock layout kept it. An occupied cell reads it
+     * off the GridInfo the delegate was handed; an empty one reads the local the layout already
+     * computed. Neither source is the field-offset problem this hook had to solve -- the first
+     * is a value the stock code itself put there, and the second is a stack slot -- so they stay
+     * as they were.
+     */
+    const double cell_width = occupied ? workspace_read<double>(grid, kCellSizeWidth)
+                                       : workspace_read<double>(fp, -0x50);
+    const double cell_height = occupied ? workspace_read<double>(grid, kCellSizeHeight)
+                                        : workspace_read<double>(fp, -0x48);
     double g[] = {
         workspace_read<double>(fp, occupied ? -0x50 : -0x58),
         occupied ? 0 : workspace_read<double>(fp, -0x40),
-        occupied ? workspace_read<double>(grid, 0x2b) : workspace_read<double>(fp, -0x50),
-        occupied ? workspace_read<double>(grid, 0x33) : workspace_read<double>(fp, -0x48),
+        cell_width,
+        cell_height,
     };
     if (!inset_workspace(g, columns, rows, top, bottom, side)) return false;
     if (occupied) {
+        if (field->item_col <= 0 || field->item_row <= 0) return false;
         const uintptr_t info = workspace_read<uintptr_t>(fp, -0x10);
-        const int64_t col = workspace_read<int64_t>(info, 0x37);
-        const int64_t row = workspace_read<int64_t>(info, 0x3f);
+        const int64_t col = workspace_read<int64_t>(info, field->item_col);
+        const int64_t row = workspace_read<int64_t>(info, field->item_row);
         if (col < 0 || col >= columns || row < 0 || row >= rows) return false;
         workspace_write(fp, -0x70, g[0] + col * g[2]);
         workspace_write(fp, -0x68, g[1] + row * g[3]);
@@ -72,8 +92,7 @@ inline bool inset_workspace_frame(uintptr_t fp, uint64_t heap, bool occupied,
     // Publish only the geometry this original layout actually used, including
     // zero insets when disabled. Latest settings alone are not a rendered frame.
     if (rendered) rendered->rendered(grid, columns, rows,
-        workspace_read<double>(grid, 0x2b), workspace_read<double>(grid, 0x33),
-        side, top, g[2], g[3]);
+        cell_width, cell_height, side, top, g[2], g[3]);
     if (out) std::memcpy(out, g, sizeof(g));
     return true;
 }
