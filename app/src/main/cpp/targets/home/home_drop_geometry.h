@@ -20,40 +20,8 @@ inline constexpr DropGeometrySite kDropGeometrySites[] = {
     {{0x1e610802, 0xfc407020, 0x1e622801, 0xf85f83a1}},
 };
 
-/*
- * The GridInfo field offsets this hook reads, resolved once from the drop-back target's own
- * code. See home_dart_fields.h for how each one is identified; the short version is that they
- * are found by what the surrounding instructions do with the value, and any that the code does
- * not pin down stays at -1.
- *
- * A field left unresolved is not fatal. The bounds checks below compare the item's cell
- * indices against the counts, so an unresolved count makes them fail and the adjustment is
- * skipped -- the drag lands where the stock code would have put it. That is the correct
- * degradation: the alternative, reading a neighbouring field, would move the icon somewhere
- * the user did not ask for.
- */
-struct DropGeometryFields {
-    int32_t columns = -1;
-    int32_t rows = -1;
-    int32_t origin = -1;
-    int32_t item_col = -1;
-    int32_t item_row = -1;
-
-    bool usable() const {
-        return columns > 0 && rows > 0 && origin >= 0
-            && item_col > 0 && item_row > 0;
-    }
-};
-
-inline DropGeometryFields drop_geometry_fields(const GridFieldOffsets &found) {
-    DropGeometryFields out;
-    out.columns = found.columns;
-    out.rows = found.rows;
-    out.origin = found.origin;
-    out.item_col = found.item_col;
-    out.item_row = found.item_row;
-    return out;
-}
+using DropGeometryFields = GridFieldOffsets;
+inline DropGeometryFields drop_geometry_fields(const GridFieldOffsets &found) { return found; }
 
 // x0 is GridInfo after currentConfig returns. The stock code uses its raw
 // cell width/height to compute the drop-back center, while RenderBox may
@@ -76,18 +44,12 @@ inline bool drop_geometry_body(uintptr_t fp, uint64_t heap, uintptr_t saved,
         const int64_t column = workspace_read<int64_t>(fp, -0x10);
         const int64_t row = workspace_read<int64_t>(fp, -0x18);
         double g[4]{};
-        /*
-         * The cell size is not compared against the GridInfo field here. The frame-pointer
-         * copies are what the stock code computed with, and the field they would be checked
-         * against cannot be located from this function (see kDropGeometryHasNoResolvedCellSize),
-         * so the check would be against a guess. What is still checked is the part that can
-         * be: that the item really is inside the grid, using the two counts and the two cell
-         * indices that were resolved.
-         */
         const int64_t columns = workspace_read<int64_t>(grid, field->columns);
         const int64_t rows = workspace_read<int64_t>(grid, field->rows);
-        const bool valid = folder_grid_geometry(grid, top, bottom, side, g, rendered)
+        const bool valid = folder_grid_geometry(grid, top, bottom, side, g, rendered, field)
             && std::isfinite(raw_x) && std::isfinite(raw_width) && std::isfinite(raw_height)
+            && raw_width == workspace_read<double>(grid, field->cell_width)
+            && raw_height == workspace_read<double>(grid, field->cell_height)
             && columns >= 1 && rows >= 1
             && column >= 0 && column < columns
             && row >= 0 && row < rows;

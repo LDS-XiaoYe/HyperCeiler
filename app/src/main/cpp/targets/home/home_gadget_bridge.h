@@ -64,17 +64,10 @@ constexpr bool is_ldur_w(uint32_t w, uint32_t rt, int32_t &imm9) {
 constexpr bool is_tbnz_w(uint32_t w, uint32_t rt, uint32_t bit) {
     return (w >> 24) == 0x37u && (w & 0x1Fu) == rt && ((w >> 19) & 0x1Fu) == bit;
 }
-/*
- * Displacement of a conditional branch, in instructions. The immediate is bits [20:5] and is
- * signed: bit 20 of the instruction is the `op` bit that separates TBZ from TBNZ, not part of
- * the offset, and the two extra bits below it (bit 21, 22) are fixed for the 32-bit forms.
- * Reading the full [23:5] window instead folds `op` and the test bit into the offset and sends
- * the computed target far outside the function, which is how this scan silently found nothing
- * on the first attempt.
- */
+// TBZ/TBNZ uses signed imm14 in [18:5], not the B.cond imm19 or an imm16.
 constexpr int32_t branch_disp_words(uint32_t w) {
-    const uint32_t imm = (w >> 5) & 0xFFFFu;
-    return (imm & 0x8000u) ? static_cast<int32_t>(imm) - 0x10000 : static_cast<int32_t>(imm);
+    const uint32_t imm = (w >> 5) & 0x3FFFu;
+    return (imm & 0x2000u) ? static_cast<int32_t>(imm) - 0x4000 : static_cast<int32_t>(imm);
 }
 constexpr bool is_bl(uint32_t w) { return (w & 0xFC000000u) == 0x94000000u; }
 constexpr int32_t bl_imm_words(uint32_t w) {
@@ -95,7 +88,7 @@ constexpr bool is_add_shift32(uint32_t w) { return (w & 0xFFFFFC00u) == 0x8B1C80
  * determination.
  */
 constexpr bool is_ldr32_reg(uint32_t w, uint32_t rt, uint32_t rm) {
-    return (w & 0xFFC00000u) == 0xB8400000u && (w & 0x1Fu) == rt
+    return (w & 0xFFE0FC00u) == 0xB8606800u && (w & 0x1Fu) == rt
         && ((w >> 16) & 0x1Fu) == rm;
 }
 
@@ -106,7 +99,7 @@ constexpr int32_t load_imm9(uint32_t w) {
 }
 /* The unscaled 64-bit load that reloads a spilled slot from the frame pointer. */
 constexpr bool is_ldur_sp(uint32_t w, int32_t want_imm, uint32_t base) {
-    return (w & 0xFFC00000u) == 0xF8400000u && ((w >> 5) & 0x1Fu) == base
+    return (w & 0xFFE00C00u) == 0xF8400000u && ((w >> 5) & 0x1Fu) == base
         && load_imm9(w) == want_imm;
 }
 

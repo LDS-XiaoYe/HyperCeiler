@@ -40,31 +40,24 @@ template <typename T> inline void workspace_write(uintptr_t p, intptr_t off, T v
 // Occupied cells are recalculated from pristine GridInfo on EVERY iteration:
 // the preceding iteration's changed constraint locals must never compound.
 //
-// `field` carries the GridInfo offsets resolved from the launcher's own code; see
-// home_dart_fields.h. The two cell-size fields are not in it because they cannot be located
-// from the code that reads them, so the size still comes from the frame-pointer slots the stock
-// code itself wrote -- which is where the values being adjusted came from in the first place.
-// A null or unusable `field` declines the whole adjustment.
+// All heap offsets come from verified owning consumers; stack slots remain the stub ABI.
 inline bool inset_workspace_frame(uintptr_t fp, uint64_t heap, bool occupied,
     const GridFieldOffsets *field, double top, double bottom, double side, double *out,
     WorkspaceRenderSnapshot *rendered = nullptr) {
     if (field == nullptr || field->columns <= 0 || field->rows <= 0) return false;
     uintptr_t grid = workspace_read<uintptr_t>(fp, -8);
-    if (occupied) grid = workspace_read<uint32_t>(grid, 0x17) + (heap << 32);
+    if (occupied) {
+        if (field->occupied_grid <= 0) return false;
+        grid = workspace_read<uint32_t>(grid, field->occupied_grid) + (heap << 32);
+    }
     const int64_t columns = workspace_read<int64_t>(grid, field->columns);
     const int64_t rows = workspace_read<int64_t>(grid, field->rows);
     // A one-row hotseat is a separate tree and retains its original geometry.
     if (rows < 2) return false;
-    /*
-     * The cell size, from wherever this path's stock layout kept it. An occupied cell reads it
-     * off the GridInfo the delegate was handed; an empty one reads the local the layout already
-     * computed. Neither source is the field-offset problem this hook had to solve -- the first
-     * is a value the stock code itself put there, and the second is a stack slot -- so they stay
-     * as they were.
-     */
-    const double cell_width = occupied ? workspace_read<double>(grid, kCellSizeWidth)
+    if (occupied && (field->cell_width <= 0 || field->cell_height <= 0)) return false;
+    const double cell_width = occupied ? workspace_read<double>(grid, field->cell_width)
                                        : workspace_read<double>(fp, -0x50);
-    const double cell_height = occupied ? workspace_read<double>(grid, kCellSizeHeight)
+    const double cell_height = occupied ? workspace_read<double>(grid, field->cell_height)
                                         : workspace_read<double>(fp, -0x48);
     double g[] = {
         workspace_read<double>(fp, occupied ? -0x50 : -0x58),
@@ -102,14 +95,16 @@ inline bool inset_workspace_frame(uintptr_t fp, uint64_t heap, bool occupied,
 // config or icon constraints. Match the workspace's symmetric cell-center
 // displacement: side * (1 - (2 * column + 1) / columns).
 inline bool inset_hotseat_frame(uintptr_t fp, uint64_t heap, double side,
-    double *out) {
+    double *out, const GridFieldOffsets *field = nullptr) {
+    if (!field || field->dock_columns <= 0 || field->dock_item <= 0
+        || field->dock_info <= 0 || field->item_col <= 0) return false;
     if (!std::isfinite(side) || side < -20 || side > 80 || side == 0) return false;
     const uintptr_t delegate = workspace_read<uintptr_t>(fp, -8);
-    const int64_t columns = workspace_read<int64_t>(delegate, 0x13);
+    const int64_t columns = workspace_read<int64_t>(delegate, field->dock_columns);
     const uintptr_t closure = workspace_read<uintptr_t>(fp, -0x50);
-    const uintptr_t item = workspace_read<uint32_t>(closure, 0xf) + (heap << 32);
-    const uintptr_t info = workspace_read<uint32_t>(item, 7) + (heap << 32);
-    const int64_t column = workspace_read<int64_t>(info, 0x37);
+    const uintptr_t item = workspace_read<uint32_t>(closure, field->dock_item) + (heap << 32);
+    const uintptr_t info = workspace_read<uint32_t>(item, field->dock_info) + (heap << 32);
+    const int64_t column = workspace_read<int64_t>(info, field->item_col);
     const double original_x = workspace_read<double>(fp, -0x80);
     if (columns < 1 || columns > 32 || column < 0 || column >= columns
         || !std::isfinite(original_x)) return false;

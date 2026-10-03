@@ -998,25 +998,17 @@ bool bl_target(uint32_t word, uint32_t pc, uint32_t *target);
  */
 namespace dartscan {
 
-/* The symbol table understates some bodies (`LauncherIndicatorState.build` reports 0x58 but
- * spans 0x2b4), so a scan covers the distance to the next symbol rather than the reported
- * size. Truncating at the reported size would cut the very sites these hooks look for.
- *
- * The cap matters in the other direction: the targets this module cares about are Dart
- * functions, but the next *listed* symbol can sit far past the end of one -- `Container.build`
- * has nothing else of ours between it and the next entry, which would hand the scan tens of
- * kilobytes of unrelated code. The bound is what keeps that in check, and it has to clear the
- * longest body these scans actually walk: the drop-back target's bounds check sits past 0x1300
- * bytes into it, so a smaller bound truncates the scan and reports "not found" for a function
- * that is present and unchanged.
- */
+/* Some reported sizes are partial (LauncherIndicatorState.build), but the next function in
+ * the complete symbol table is a stronger bound than the next whitelisted target. Oversized,
+ * unaligned or missing spans are declined: clamping them would allow a partial view to claim
+ * uniqueness, or growing a short span would inspect another function's receiver. */
 constexpr uint32_t kMaxScanBytes = 0x4000;
 
 bool function_span(uint32_t va, uint32_t *out_size) {
     if (va == 0 || out_size == nullptr) return false;
     uint32_t span = 0;
     if (!hometweaks::HomeTweaksSymbolSpan(va, &span)) return false;
-    if (span < 4 || span > kMaxScanBytes) span = kMaxScanBytes;
+    if (span < 4 || span > kMaxScanBytes || (span & 3)) return false;
     *out_size = span;
     return true;
 }
@@ -1037,6 +1029,34 @@ bool unique_sequence(const std::vector<uint32_t> &body, const uint32_t *seq, siz
 }
 
 
+bool body(uint32_t va, std::vector<uint32_t> &words) {
+    uint32_t span = 0;
+    return function_span(va, &span) && dart_function_words(va, span, words);
+}
+bool site(uint32_t va, std::span<const uint32_t> words, uint32_t *offset) {
+    std::vector<uint32_t> code;
+    return body(va, code) && unique_sequence(code, words.data(), words.size(), offset);
+}
+bool site(uint32_t va, std::initializer_list<uint32_t> words, uint32_t *offset) {
+    return site(va, std::span<const uint32_t>(words.begin(), words.size()), offset);
+}
+// Allocator identity is its class/size tag, not an old relative BL encoding.
+bool tagged_call(uint32_t va, uint32_t first, uint32_t second, uint32_t *factory) {
+    std::vector<uint32_t> code;
+    if (!body(va, code)) return false;
+    size_t hits = 0; uint32_t result = 0;
+    for (size_t i = 0; i < code.size(); ++i) {
+        uint32_t target = 0; std::vector<uint32_t> tag;
+        if (bl_target(code[i], va + static_cast<uint32_t>(i * 4), &target)
+            && dart_words(target, 2, tag) && tag[0] == first && tag[1] == second) {
+            ++hits; result = target;
+        }
+    }
+    if (hits != 1) return false;
+    if (factory) *factory = result;
+    return true;
+}
+
 } // namespace dartscan
 
 /*
@@ -1054,49 +1074,46 @@ bool unique_sequence(const std::vector<uint32_t> &body, const uint32_t *seq, siz
  * does not identify anything; it is the packing run that pins the site down, and the call is
  * only checked to agree.
  */
-bool capsule_wrapper_layout_compatible(uint32_t wrapper_va, uint32_t wrapper_size,
+bool capsule_wrapper_layout_compatible(uint32_t wrapper_va, uint32_t,
     uint32_t *caller_va) {
-    // Verify both finished branches at the original builder splice, the wrapper allocator,
-    // and Flutter Padding layout. A changed launcher image declines this precise path.
-    if (wrapper_size != 0xf4 || caller_va == nullptr) return false;
-    uint32_t launcher_va = 0, launcher_size = 0;
-    uint32_t container_va = 0, container_size = 0;
-    uint32_t padding_create_va = 0, padding_create_size = 0;
-    if (!hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState.build", &launcher_va,
-            &launcher_size) || launcher_size != 0x58
-        || !hometweaks::HomeTweaksFindSymbol("Container.build", &container_va,
-            &container_size) || container_size < 0x314
-        || !hometweaks::HomeTweaksFindSymbol("Padding.createRenderObject", &padding_create_va,
-            &padding_create_size) || padding_create_size < 0x18) return false;
-    std::vector<uint32_t> wrapper_call, parent_call, padding_call, padding_read;
-    uint32_t wrapper_alloc_va = 0, padding_alloc_va = 0, called_va = 0;
-    if (!dart_words(wrapper_va + 0x94, 1, wrapper_call)
-        || !dart_words(launcher_va + 0x21c, 1, parent_call)
-        || !dart_words(container_va + 0x310, 1, padding_call)
-        || !dart_words(padding_create_va + 0x14, 1, padding_read)
-        || !bl_target(wrapper_call[0], wrapper_va + 0x94, &wrapper_alloc_va)
-        || !bl_target(parent_call[0], launcher_va + 0x21c, &called_va)
-        || !bl_target(padding_call[0], container_va + 0x310, &padding_alloc_va)
-        || called_va != wrapper_va || padding_read[0] != 0xb840f002u) return false;
-    std::vector<uint32_t> wrapper_alloc, padding_alloc;
-    if (!dart_words(wrapper_alloc_va, 2, wrapper_alloc)
-        || !dart_words(padding_alloc_va, 2, padding_alloc)
-        || wrapper_alloc[0] != 0xd2868382u || wrapper_alloc[1] != 0xf2a04302u
-        || padding_alloc[0] != 0xd28a4382u || padding_alloc[1] != 0xf2a03c42u) return false;
-    constexpr uint32_t pair_words[] = {
-        0xaa1603e1u, 0xd28000c2u, 0xf81f83a0u, 0x94278e38u,
-        0xaa0003e2u, 0xf85f03a0u, 0xf81e03a2u, 0xb800f040u,
-        0xf85e83a0u, 0xb8013040u, 0xf85f83a0u, 0xb8017040u};
-    std::vector<uint32_t> pair;
-    if (!dart_words(launcher_va + 0x220, std::size(pair_words), pair)
-        || !std::equal(std::begin(pair_words), std::end(pair_words), pair.begin())) return false;
-    if (!dart_words(launcher_va + 0x1e0, 1, parent_call)
-        || !bl_target(parent_call[0], launcher_va + 0x1e0, &called_va)
-        || called_va != wrapper_va) return false;
-    // Do not relocate the Array allocator BL: a GC inside a relocated Dart call
-    // would return to an alien code PC. Splice after that original call instead.
-    *caller_va = launcher_va + 0x230;
-    return true;
+    if (!caller_va) return false;
+    uint32_t launcher = 0, container = 0, padding = 0, unused = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState.build", &launcher, &unused)
+        || !hometweaks::HomeTweaksFindSymbol("Container.build", &container, &unused)
+        || !hometweaks::HomeTweaksFindSymbol("Padding.createRenderObject", &padding, &unused)
+        || !dartscan::tagged_call(wrapper_va, 0xd2868382, 0xf2a04302, nullptr)
+        || !dartscan::site(padding, {0xb840f002}, nullptr)) return false;
+    constexpr uint32_t padding_replay[] = {0xaa0003e1, 0xf85f03a0, 0xb800f020, 0xf85e83a0, 0xb800b020};
+    std::vector<uint32_t> container_code;
+    if (!dartscan::body(container, container_code)) return false;
+    size_t padding_hits = 0;
+    for (size_t i = 1; i + std::size(padding_replay) <= container_code.size(); ++i) {
+        uint32_t factory = 0; std::vector<uint32_t> tag;
+        if (std::equal(std::begin(padding_replay), std::end(padding_replay), container_code.begin() + i)
+            && bl_target(container_code[i - 1], container + static_cast<uint32_t>((i - 1) * 4), &factory)
+            && dart_words(factory, 2, tag) && tag[0] == 0xd28a4382 && tag[1] == 0xf2a03c42) ++padding_hits;
+    }
+    if (padding_hits != 1) return false;
+    constexpr uint32_t head[] = {0xaa1603e1, 0xd28000c2, 0xf81f83a0};
+    constexpr uint32_t tail[] = {0xaa0003e2, 0xf85f03a0, 0xf81e03a2, 0xb800f040,
+        0xf85e83a0, 0xb8013040, 0xf85f83a0, 0xb8017040};
+    std::vector<uint32_t> code;
+    if (!dartscan::body(launcher, code)) return false;
+    size_t hits = 0; uint32_t patch = 0;
+    for (size_t i = 1; i + 12 <= code.size(); ++i) {
+        uint32_t wrapper = 0, factory = 0; std::vector<uint32_t> tag;
+        if (std::equal(std::begin(head), std::end(head), code.begin() + i)
+            && std::equal(std::begin(tail), std::end(tail), code.begin() + i + 4)
+            && bl_target(code[i - 1], launcher + static_cast<uint32_t>((i - 1) * 4), &wrapper)
+            && wrapper == wrapper_va
+            && bl_target(code[i + 3], launcher + static_cast<uint32_t>((i + 3) * 4), &factory)
+            && dart_words(factory, 4, tag) && tag[0] == 0x37000402 && tag[1] == 0xb27d37f1
+            && tag[2] == 0x6b11005f && tag[3] == 0x540003a8) {
+            ++hits; patch = launcher + static_cast<uint32_t>((i + 4) * 4);
+        }
+    }
+    if (hits != 1) return false;
+    *caller_va = patch; return true;
 }
 
 /*
@@ -1110,20 +1127,31 @@ bool capsule_wrapper_layout_compatible(uint32_t wrapper_va, uint32_t wrapper_siz
  * reported symbol size, which is shorter than the real body for two of these functions and so
  * would truncate the scan before it reached the last run.
  */
-static bool require_runs(uint32_t va, const std::vector<std::pair<const uint32_t *, size_t>> &runs) {
+static bool require_runs(uint32_t va, const std::vector<std::pair<const uint32_t *, size_t>> &runs,
+    size_t patch_run, size_t patch_word, uint32_t *patch_offset) {
     uint32_t span = 0;
     if (!dartscan::function_span(va, &span)) return false;
     std::vector<uint32_t> body;
     if (!dart_function_words(va, span, body)) return false;
-    for (const auto &run : runs) {
-        if (!dartscan::unique_sequence(body, run.first, run.second, nullptr)) return false;
+    if (!patch_offset || patch_run >= runs.size()) return false;
+    uint32_t candidate = 0;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        const auto &run = runs[i];
+        uint32_t at = 0;
+        if (!dartscan::unique_sequence(body, run.first, run.second, &at)) return false;
+        if (i == patch_run) {
+            if (patch_word >= run.second) return false;
+            candidate = at + static_cast<uint32_t>(patch_word * 4);
+        }
     }
+    if (candidate + 16 > span) return false;
+    *patch_offset = candidate;
     return true;
 }
 
 #define HC_RUN(name) std::make_pair(static_cast<const uint32_t *>(name), std::size(name))
 
-bool workspace_geometry_code_compatible(uint32_t va, bool occupied) {
+bool workspace_geometry_code_compatible(uint32_t va, bool occupied, uint32_t *patch_offset) {
     // The real RenderBox layout / ParentData.offset consumers. Each run below is the original
     // load, frame slot, displaced code or final constraint store at one of those sites.
     // The earlier _buildChildren splice was overwritten by these delegates.
@@ -1132,16 +1160,18 @@ bool workspace_geometry_code_compatible(uint32_t va, bool occupied) {
         static constexpr uint32_t words1[] = {0xf85f83a0u, 0xf81d83a2u, 0xb843b003u, 0x8b1c8063u, 0xf81e03a3u, 0xfc407060u, 0xfc1a83a0u, 0xf85f03a4u, 0xfc5b03a1u, 0xfc5b83a2u, 0xfc5c03a3u, 0xf85ff040u, 0xd34c7c00u};
         static constexpr uint32_t words2[] = {0xfc5a83a0u, 0xf8407002u, 0x9e620044u, 0x1e610885u, 0x1e652804u, 0xfc1983a4u, 0xf840f002u, 0x9e620045u, 0x1e6208a6u, 0x1e6328c5u, 0xfc1a03a5u};
         static constexpr uint32_t words3[] = {0xfc5b03a0u, 0xf81d03a0u, 0xfc007000u, 0xfc00f000u, 0xfc5b83a1u, 0xfc017001u, 0xfc01f001u, 0xf85f03a3u};
-        return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3)});
+        return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3)},
+            1, 7, patch_offset);
     }
     static constexpr uint32_t cwords0[] = {0xf85f83a2u, 0xb8417040u, 0x8b1c8000u, 0xfc42b000u, 0xfc1a03a0u, 0xfc433001u, 0xfc1a83a1u, 0xb840f043u};
     static constexpr uint32_t cwords1[] = {0xb843b001u, 0x8b1c8021u, 0xfc407022u, 0xfc1b03a2u, 0xa9460345u, 0x910040a5u, 0xeb05001fu, 0x54002a09u};
     static constexpr uint32_t cwords2[] = {0xfc5a03a0u, 0xfc5a83a1u, 0xfc5b03a2u, 0xf85f03a0u, 0xf85e83a1u, 0xf8437002u, 0x9e620043u, 0x1e600864u, 0x1e642843u, 0xfc1903a3u, 0xf843f002u, 0x9e620044u, 0x1e610885u, 0xfc1983a5u, 0xf9403f40u, 0xf9524800u, 0xf9402370u, 0x6b10001fu};
     static constexpr uint32_t cwords3[] = {0xfc5803a0u, 0xf81c83a0u, 0xfc007000u, 0xfc00f000u, 0xfc5883a0u, 0xfc017000u, 0xfc01f000u, 0xf85f83a3u, 0xb840b064u, 0x8b1c8084u};
-    return require_runs(va, {HC_RUN(cwords0), HC_RUN(cwords1), HC_RUN(cwords2), HC_RUN(cwords3)});
+    return require_runs(va, {HC_RUN(cwords0), HC_RUN(cwords1), HC_RUN(cwords2), HC_RUN(cwords3)},
+        2, 14, patch_offset);
 }
 
-bool hotseat_geometry_code_compatible(uint32_t va) {
+bool hotseat_geometry_code_compatible(uint32_t va, uint32_t *patch_offset) {
     // The final Dock ParentData.offset.x write, after the original per-icon calculation:
     // delegate count, the compressed ItemInfo chain, the column and the Offset stores.
     static constexpr uint32_t words0[] = {0xa9bf79fdu, 0xaa0f03fdu, 0xd10281efu, 0xf81f83a1u, 0xf81f03a2u, 0xd28000c1u, 0x9411837cu, 0xaa0003e1u};
@@ -1149,7 +1179,8 @@ bool hotseat_geometry_code_compatible(uint32_t va) {
     static constexpr uint32_t words2[] = {0xf85b03a2u, 0x97c6e9ecu, 0xaa0003e3u, 0xf85b03a2u, 0xb840f040u, 0x8b1c8000u, 0xb8407001u, 0x8b1c8021u, 0xf8437024u, 0x937f7880u, 0xeb80049fu, 0x54000060u, 0x94118778u, 0xf8007004u, 0xf85c83b0u};
     static constexpr uint32_t words3[] = {0xfc1783a2u, 0xa9461340u, 0x91004000u, 0xeb00009fu, 0x54001529u};
     static constexpr uint32_t words4[] = {0x97c6c09eu, 0xf85b03a2u, 0xb8413040u, 0x8b1c8000u, 0xfc407000u, 0xfc1803a0u, 0x9406fdaeu, 0xfc5803a0u, 0xf81983a0u, 0xfc007000u, 0xfc5783a0u, 0xfc00f000u, 0xf85f83a3u};
-    return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3), HC_RUN(words4)});
+    return require_runs(va, {HC_RUN(words0), HC_RUN(words1), HC_RUN(words2), HC_RUN(words3), HC_RUN(words4)},
+        4, 7, patch_offset);
 }
 
 bool bind_target(const Library &library, uint64_t va, uintptr_t &address,
@@ -1376,7 +1407,9 @@ bool bl_target(uint32_t word, uint32_t pc, uint32_t *target) {
     if ((word & 0xFC000000u) != 0x94000000u) return false;
     int64_t imm = static_cast<int32_t>(word & 0x03FFFFFFu);
     if ((imm & 0x02000000) != 0) imm -= 0x04000000;
-    *target = static_cast<uint32_t>(static_cast<int64_t>(pc) + (imm << 2));
+    const int64_t destination = static_cast<int64_t>(pc) + imm * 4;
+    if (target == nullptr || destination <= 0 || destination > UINT32_MAX) return false;
+    *target = static_cast<uint32_t>(destination);
     return true;
 }
 
@@ -1453,46 +1486,69 @@ bool g_probe_primed = false;
 int g_device_object_offset = -1;
 
 /* Bind only verified interior control-flow sites, never a margin getter. */
-bool indicator_policy_compatible(uint32_t va, uint32_t size) {
-    uint32_t editing_va = 0, editing_size = 0;
-    if (size != 0x90 || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState.isInEditing",
-        &editing_va, &editing_size) || editing_va != va + 0x4b4 || editing_size != 0xb8) return false;
-    constexpr uint32_t gate[] = {0xf100041fu, 0x540001ecu, 0xf85e83a3u, 0x362001a3u,
-        0xf85f83a1u, 0xb840f024u, 0x8b1c8084u, 0xaa0403e1u};
-    constexpr uint32_t result[] = {0x362000e0u, 0xf85e03a0u, 0x362000a0u,
-        0xf9712b60u, 0xaa1d03efu, 0xa8c179fdu, 0xd65f03c0u,
-        0xf85c83a2u, 0xf85c03a0u, 0xf85e83a1u};
+struct IndicatorPolicyAnchors { uint32_t gate = 0, result = 0; };
+bool indicator_policy_compatible(uint32_t va, uint32_t, IndicatorPolicyAnchors *out) {
+    if (!out) return false;
+    uint32_t editing = 0, unused = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState.isInEditing", &editing, &unused)) return false;
+    constexpr uint32_t gate[] = {0xf100041f, 0x540001ec, 0xf85e83a3, 0x362001a3,
+        0xf85f83a1, 0xb840f024, 0x8b1c8084, 0xaa0403e1};
+    constexpr uint32_t result[] = {0x362000e0, 0xf85e03a0, 0x362000a0,
+        0xf9712b60, 0xaa1d03ef, 0xa8c179fd, 0xd65f03c0,
+        0xf85c83a2, 0xf85c03a0, 0xf85e83a1};
     std::vector<uint32_t> code;
-    uint32_t target = 0;
-    return dart_words(va + 0x3d8, std::size(gate), code)
-        && std::equal(std::begin(gate), std::end(gate), code.begin())
-        && dart_words(va + 0x3f8, 1, code)
-        && bl_target(code[0], va + 0x3f8, &target) && target == editing_va
-        && dart_words(va + 0x3fc, std::size(result), code)
-        && std::equal(std::begin(result), std::end(result), code.begin());
+    uint32_t g = 0, r = 0, target = 0;
+    if (!dartscan::body(va, code) || !dartscan::unique_sequence(code, gate, std::size(gate), &g)
+        || !dartscan::unique_sequence(code, result, std::size(result), &r) || r != g + 36
+        || !bl_target(code[g / 4 + 8], va + g + 32, &target) || target != editing) return false;
+    *out = {g, r}; return true;
+}
+bool indicator_slide_compatible(uint32_t va, uint32_t *patch, uint32_t *idle_caller) {
+    if (!patch || !idle_caller) return false;
+    uint32_t animate = 0, refresh = 0, current_type = 0, unused = 0, fallback = 0;
+    if (!dartscan::site(va, {0xf85f83a0, 0xf81f03a3, 0xf841b002, 0xeb03005f}, patch)
+        || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._animateIndicator", &animate, &unused)
+        || !dartscan::site(animate, {0x7100103f, 0x54000081, 0xb846b061, 0x8b1c8021,
+            0x14000003, 0xb8463061, 0x8b1c8021}, &fallback)
+        || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._refreshIndicator", &refresh, &unused)
+        || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._getCurrentIndicatorType", &current_type, &unused)) return false;
+    std::vector<uint32_t> code;
+    if (!dartscan::body(refresh, code)) return false;
+    size_t hits = 0; uint32_t caller = 0;
+    for (size_t i = 3; i < code.size(); ++i) {
+        uint32_t target = 0, producer = 0;
+        if (code[i - 2] == 0xf85f03a1 && code[i - 1] == 0xaa0003e2
+            && bl_target(code[i - 3], refresh + static_cast<uint32_t>((i - 3) * 4), &producer)
+            && producer == current_type && bl_target(code[i], refresh + static_cast<uint32_t>(i * 4), &target) && target == va) {
+            ++hits; caller = refresh + static_cast<uint32_t>((i + 1) * 4);
+        }
+    }
+    if (hits != 1) return false;
+    *idle_caller = caller; return true;
 }
 
 void bind_indicator_dot_target() {
     if (hc_layout_dart_IndicatorDot_address != 0) return;
-    uint32_t va = 0, size = 0;
-    if (!hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._buildScreenIndicator", &va,
-        &size) || !indicator_policy_compatible(va, size)) return;
+    uint32_t va = 0, size = 0; IndicatorPolicyAnchors anchors;
+    if (!hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._buildScreenIndicator", &va, &size)
+        || !indicator_policy_compatible(va, size, &anchors)) return;
     uintptr_t address = 0;
-    if (!bind_dart_target(va + 0x3fc, address, hc_layout_dart_IndicatorDot_source,
+    if (!bind_dart_target(va + anchors.result, address, hc_layout_dart_IndicatorDot_source,
         hc_layout_dart_IndicatorDot_words)) return;
     hc_layout_dart_IndicatorDot_address = address;
-    hc_layout_dart_IndicatorDot_getter = va + 0x3fc;
+    hc_layout_dart_IndicatorDot_getter = va + anchors.result;
     hc_layout_dart_IndicatorDot_size = size;
-    hc_layout_indicator_edit_call = g_dart->load_base + va + 0x3e8;
-    // Empty-widget pool load at +0x408 is overwritten by the 16-byte bank.
-    // The assembly replays it and jumps to the untouched epilogue, not patch bytes.
-    hc_layout_indicator_build_empty = g_dart->load_base + va + 0x40c;
-    hc_layout_indicator_build_dots = g_dart->load_base + va + 0x418;
-    __android_log_print(ANDROID_LOG_INFO, kTag,
-        "layout indicator visibility interior va=%#x", va + 0x3fc);
+    hc_layout_indicator_edit_call = g_dart->load_base + va + anchors.gate + 16;
+    hc_layout_indicator_build_empty = g_dart->load_base + va + anchors.result + 16;
+    hc_layout_indicator_build_dots = g_dart->load_base + va + anchors.result + 28;
 }
 
+home_layout::GridFieldOffsets g_grid_field{};
+void resolve_grid_fields(const char *symbol);
+
 void bind_folder_geometry() {
+    resolve_grid_fields(home_layout::kDropGeometrySymbol);
+    if (!g_grid_field.usable()) return;
     if (g_slots[kFolderGeometrySlotBase].address != 0 || !g_dart) return;
     const void *entries[] = {reinterpret_cast<void *>(hc_layout_folder_0_entry),
         reinterpret_cast<void *>(hc_layout_folder_1_entry),
@@ -1537,36 +1593,43 @@ void bind_folder_geometry() {
         static_cast<unsigned long long>(candidates[0].address));
 }
 
-/*
- * GridInfo field offsets, resolved once at bind time from the drop-back target's own code --
- * it is the one function that reads every field the geometry hooks need. See
- * home_dart_fields.h for how each is identified, and for which ones the code does not pin down.
- */
-home_layout::GridFieldOffsets g_grid_field{};
-
+// All consumers use one atomically admitted geometry contract from owning bodies.
 home_layout::DropGeometryFields drop_geometry_fields() {
     return home_layout::drop_geometry_fields(g_grid_field);
 }
-
-/*
- * Resolve the GridInfo field offsets from a function that reads them. The drop-back target is
- * used because it reads all of them in one place. Declining is silent and total: the fields keep
- * their -1s and every geometry hook that needs one leaves the layout alone, which is a no-op
- * rather than a misplaced icon.
- */
 void resolve_grid_fields(const char *symbol) {
     if (g_grid_field.columns > 0) return;
-    uint32_t va = 0, size = 0;
-    if (!hometweaks::HomeTweaksFindSymbol(symbol, &va, &size)) return;
-    uint32_t span = 0;
-    if (!dartscan::function_span(va, &span)) return;
-    std::vector<uint32_t> body;
-    if (!dart_function_words(va, span, body)) return;
-    g_grid_field = home_layout::read_grid_field_offsets(body);
+    const auto read = [](const char *name, uint32_t &va, std::vector<uint32_t> &body) {
+        uint32_t size = 0, span = 0;
+        return hometweaks::HomeTweaksFindSymbol(name, &va, &size)
+            && dartscan::function_span(va, &span) && dart_function_words(va, span, body);
+    };
+    uint32_t drop = 0, cell = 0, occupied = 0, counts = 0, config = 0, unused = 0;
+    std::vector<uint32_t> db, cb, ob, nb;
+    if (!read(symbol, drop, db) || !read("GridCellDelegate.performLayout", cell, cb)
+        || !read("GridOccupiedCellDelegate.performLayout", occupied, ob)
+        || !read("CellLayoutGetxController.isItemPosEmpty", counts, nb)
+        || !hometweaks::HomeTweaksFindSymbol("GridController.currentConfig", &config, &unused)) return;
+    auto found = home_layout::read_grid_field_offsets(db);
+    home_layout::read_grid_cell_size(cb, found);
+    // Prove the origin's receiver is the same named config used by the bounds consumer.
+    size_t origin_calls = 0;
+    for (size_t i = 0; i + 3 < db.size(); ++i) {
+        int32_t off = 0;
+        if (home_layout::dart_call_to(db[i], drop + static_cast<uint32_t>(i * 4), config)
+            && home_layout::dart_ldur_w(db[i + 1], 0, 1, &off) && off == found.origin
+            && db[i + 2] == 0x8b1c8021 && db[i + 3] == 0xfc407020) ++origin_calls;
+    }
+    if (origin_calls != 1 || found.cell_width <= 0 || found.cell_height <= 0
+        || !home_layout::read_grid_counts(nb, counts, config, found)
+        || !home_layout::read_occupied_fields(ob, found)) return;
+    uint32_t dock = 0; std::vector<uint32_t> hb;
+    if (read("HotSeatLayoutDelegate.cellLayout", dock, hb)) home_layout::read_hotseat_fields(hb, found);
+    g_grid_field = found;
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "grid fields resolved from %s: cols=%d rows=%d origin=%d item=%d,%d", symbol,
-        g_grid_field.columns, g_grid_field.rows, g_grid_field.origin,
-        g_grid_field.item_col, g_grid_field.item_row);
+        "grid contract admitted cols=%d rows=%d origin=%d item=%d,%d cell=%d,%d occupied=%d",
+        found.columns, found.rows, found.origin, found.item_col, found.item_row,
+        found.cell_width, found.cell_height, found.occupied_grid);
 }
 
 void bind_drop_geometry() {
@@ -1585,6 +1648,7 @@ void bind_drop_geometry() {
     // the code does not pin down stays at -1 and the body declines to adjust, which leaves the
     // drop where the stock code would have put it.
     resolve_grid_fields(home_layout::kDropGeometrySymbol);
+    if (!g_grid_field.usable()) return;
     const void *entries[] = {reinterpret_cast<void *>(hc_layout_drop_0_entry),
         reinterpret_cast<void *>(hc_layout_drop_1_entry)};
     std::array<Slot, 2> candidates{};
@@ -1611,6 +1675,7 @@ void bind_drop_geometry() {
 
 size_t bind_knobs() {
     if (!ensure_dart_library()) return 0;
+    resolve_grid_fields(home_layout::kDropGeometrySymbol);
 
     // The shipped hook targets, unless the calibration channel retargeted the knob already.
     for (size_t index = 0; index < g_knobs.size(); ++index) {
@@ -1627,7 +1692,7 @@ size_t bind_knobs() {
         if (!hometweaks::HomeTweaksFindSymbol(knob.symbol.c_str(), &va, &size) || size < 16) {
             continue;
         }
-        uint32_t capsule_patch_va = 0;
+        uint32_t capsule_patch_va = 0, policy_patch_offset = 0, slide_patch_offset = 0;
         if (&knob == &g_knobs[5]) {
             if (knob.symbol == "LauncherIndicatorState._wrapWithAnimation") {
                 uint32_t caller_va = 0;
@@ -1643,33 +1708,20 @@ size_t bind_knobs() {
         const bool indicator_policy = &knob == &g_knobs[6]
             && knob.symbol == "LauncherIndicatorState._buildScreenIndicator";
         if (indicator_policy) {
-            if (!indicator_policy_compatible(va, size)) continue;
+            IndicatorPolicyAnchors anchors;
+            if (!indicator_policy_compatible(va, size, &anchors)) continue;
+            policy_patch_offset = anchors.gate;
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_indicator_policy_entry);
         }
         const bool indicator_slide = &knob == &g_knobs[7]
             && knob.symbol == "LauncherIndicatorState._showIndicator";
         if (indicator_slide) {
-            uint32_t refresh_va = 0, refresh_size = 0, animate_va = 0, animate_size = 0;
-            std::vector<uint32_t> code;
-            constexpr uint32_t decision[] = {0xf85f83a0u, 0xf81f03a3u, 0xf841b002u, 0xeb03005fu};
-            // Internal hidden state 3 follows the original controller default but the original
-            // timeout closure has no 3 branch: all three visible flags remain false.
-            constexpr uint32_t fallback[] = {0x7100103fu, 0x54000081u, 0xb846b061u,
-                0x8b1c8021u, 0x14000003u, 0xb8463061u, 0x8b1c8021u};
-            if (size != 0x144 || !dart_words(va + 0xe0, std::size(decision), code)
-                || !std::equal(std::begin(decision), std::end(decision), code.begin())
-                || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._animateIndicator",
-                    &animate_va, &animate_size) || animate_size != 0x170
-                || !dart_words(animate_va + 0xdc, std::size(fallback), code)
-                || !std::equal(std::begin(fallback), std::end(fallback), code.begin())
-                || !hometweaks::HomeTweaksFindSymbol("LauncherIndicatorState._refreshIndicator",
-                    &refresh_va, &refresh_size) || refresh_size != 0x198) continue;
-            uint32_t target = 0;
-            if (!dart_words(refresh_va + 0x13c, 1, code)
-                || !bl_target(code[0], refresh_va + 0x13c, &target) || target != va) continue;
-            hc_layout_indicator_idle_caller = g_dart->load_base + refresh_va + 0x140;
+            uint32_t idle_caller = 0;
+            if (!indicator_slide_compatible(va, &slide_patch_offset, &idle_caller)) continue;
+            hc_layout_indicator_idle_caller = g_dart->load_base + idle_caller;
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_indicator_slide_only_entry);
         }
+        uint32_t geometry_patch_offset = 0;
         const bool workspace_cell = &knob == &g_knobs[2]
             && knob.symbol == "GridCellDelegate.performLayout";
         const bool workspace_occupied = &knob == &g_knobs[3]
@@ -1677,7 +1729,8 @@ size_t bind_knobs() {
         const bool hotseat_horizontal = &knob == &g_knobs[4]
             && knob.symbol == "HotSeatLayoutDelegate.cellLayout";
         if (workspace_cell || workspace_occupied) {
-            if (!workspace_geometry_code_compatible(va, workspace_occupied)) continue;
+            if (!g_grid_field.usable()) continue;
+            if (!workspace_geometry_code_compatible(va, workspace_occupied, &geometry_patch_offset)) continue;
             knob.hook_entry = workspace_cell
                 ? reinterpret_cast<void *>(hc_layout_workspace_entry)
                 : reinterpret_cast<void *>(hc_layout_workspace_occupied_entry);
@@ -1686,13 +1739,14 @@ size_t bind_knobs() {
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_container_probe_entry);
         }
         if (hotseat_horizontal) {
-            if (!hotseat_geometry_code_compatible(va)) continue;
+            if (g_grid_field.dock_columns <= 0 || g_grid_field.dock_item <= 0
+                || g_grid_field.dock_info <= 0) continue;
+            if (!hotseat_geometry_code_compatible(va, &geometry_patch_offset)) continue;
             knob.hook_entry = reinterpret_cast<void *>(hc_layout_hotseat_horizontal_entry);
         }
         const bool workspace_splice = workspace_cell || workspace_occupied || hotseat_horizontal
             || capsule_patch_va != 0 || indicator_policy || indicator_slide;
-        const uint32_t patch_va = capsule_patch_va != 0 ? capsule_patch_va : va + (indicator_slide ? 0xe0 : indicator_policy ? 0x3d8 : workspace_cell ? 0xd8 : workspace_occupied ? 0x234
-            : hotseat_horizontal ? 0x568 : 0);
+        const uint32_t patch_va = capsule_patch_va != 0 ? capsule_patch_va : va + (indicator_slide ? slide_patch_offset : indicator_policy ? policy_patch_offset : (workspace_cell || workspace_occupied || hotseat_horizontal) ? geometry_patch_offset : 0);
         if (!bind_dart_target(patch_va, knob.hook_address, knob.hook_source, knob.hook_words)) continue;
         if (!workspace_splice && knob.hook_words[0] != kDartPrologue) {
             knob.hook_address = 0;
@@ -1822,40 +1876,30 @@ bool bind_title_color() {
         || !hometweaks::HomeTweaksFindSymbol("Color.withAlpha", &clone, &clone_size)
         || clone_size != 0xd4) return false;
     std::vector<uint32_t> getter_code, clone_code;
-    if (!dart_words(getter, 4, getter_code) || getter_code.size() != 4
-        || getter_code[0] != kDartPrologue
-        || !dart_words(clone, 50, clone_code) || clone_code.size() != 50
-        || clone_code[0] != kDartPrologue
-        || clone_code[25] != 0xb8027001u || clone_code[27] != 0xfc007000u
-        || clone_code[35] != 0xfc00f002u || clone_code[42] != 0xfc017002u
-        || clone_code[49] != 0xfc01f002u) return false;
-    // Verify the Color allocator tag/size and nursery bounds before using its fast path only.
-    const uint32_t allocation = clone + 0x58;
-    uint32_t call = clone_code[22];
-    if ((call & 0xfc000000u) != 0x94000000u) return false;
-    int32_t displacement = static_cast<int32_t>((call & 0x03ffffffu) << 6) >> 4;
-    const uint32_t factory = allocation + displacement;
-    std::vector<uint32_t> factory_code;
-    if (!dart_words(factory, 3, factory_code) || factory_code.size() != 3
-        || factory_code[0] != 0xd28e6382u || factory_code[1] != 0xf2a047a2u
-        || (factory_code[2] & 0xfc000000u) != 0x14000000u) return false;
-    displacement = static_cast<int32_t>((factory_code[2] & 0x03ffffffu) << 6) >> 4;
-    std::vector<uint32_t> nursery_code;
-    if (!dart_words(factory + 8 + displacement, 7, nursery_code) || nursery_code.size() != 7
-        || nursery_code[0] != 0xd3482c44u || nursery_code[1] != 0xd37cec84u
-        || nursery_code[2] != 0xa9461740u || nursery_code[3] != 0x8b040003u
-        || nursery_code[4] != 0xeb0300bfu || nursery_code[6] != 0xf9003343u) return false;
+    uint32_t ignored = 0, factory = 0;
+    if (!dartscan::body(getter, getter_code) || getter_code.size() < 4 || getter_code[0] != kDartPrologue
+        || !dartscan::body(clone, clone_code) || clone_code.size() < 50 || clone_code[0] != kDartPrologue
+        || !dartscan::site(clone, {0xb8027001, 0xfc5d03a0, 0xfc007000}, &ignored)
+        || !dartscan::site(clone, {0xfc00f002}, &ignored)
+        || !dartscan::site(clone, {0xfc017002}, &ignored)
+        || !dartscan::site(clone, {0xfc01f002}, &ignored)
+        || !dartscan::tagged_call(clone, 0xd28e6382, 0xf2a047a2, &factory)) return false;
+    std::vector<uint32_t> factory_code, nursery_code;
+    uint32_t nursery = 0;
+    if (!dart_words(factory, 3, factory_code) || (factory_code[2] & 0xfc000000) != 0x14000000
+        || !bl_target(factory_code[2] | 0x80000000, factory + 8, &nursery)
+        || !dart_words(nursery, 7, nursery_code)
+        || nursery_code[0] != 0xd3482c44 || nursery_code[1] != 0xd37cec84
+        || nursery_code[2] != 0xa9461740 || nursery_code[3] != 0x8b040003
+        || nursery_code[4] != 0xeb0300bf || nursery_code[6] != 0xf9003343) return false;
     uint32_t builder = 0, builder_size = 0;
-    std::vector<uint32_t> selected;
-    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidget._buildTextWidget", &builder,
-            &builder_size) || builder_size != 0x714
-        || !dart_words(builder + 0xf0, 4, selected)
-        || selected[0] != 0xf81d83a1u || selected[1] != 0xf9403f40u
-        || selected[2] != 0xf9538800u || selected[3] != 0x6b16001fu) return false;
+    uint32_t selected_offset = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidget._buildTextWidget", &builder, &builder_size)
+        || !dartscan::site(builder, {0xf81d83a1, 0xf9403f40, 0xf9538800, 0x6b16001f}, &selected_offset)) return false;
     uintptr_t address = 0;
     nhk::CodeSource source{};
     Words words{};
-    if (!bind_dart_target(builder + 0xf0, address, source, words)
+    if (!bind_dart_target(builder + selected_offset, address, source, words)
         || address > UINTPTR_MAX - 16) return false;
     hc_title_color_continue = address + 16;
     g_slots[kTitleColorSlot] = {address, reinterpret_cast<void *>(hc_title_color_entry),
@@ -1874,9 +1918,12 @@ bool bind_title_custom() {
     const auto guard = [](const char *name, uint32_t size, uint32_t offset,
                           std::initializer_list<uint32_t> expected, uint32_t &va) {
         uint32_t actual_size = 0; std::vector<uint32_t> code;
-        return hometweaks::HomeTweaksFindSymbol(name, &va, &actual_size) && actual_size == size
-            && dart_words(va + offset, expected.size(), code)
-            && std::equal(expected.begin(), expected.end(), code.begin(), code.end());
+        if (!hometweaks::HomeTweaksFindSymbol(name, &va, &actual_size) || !dartscan::body(va, code)) return false;
+        if (offset == 0) return actual_size == size && code.size() >= expected.size()
+            && std::equal(expected.begin(), expected.end(), code.begin());
+        uint32_t located = 0;
+        if (!dartscan::unique_sequence(code, expected.begin(), expected.size(), &located)) return false;
+        va += located; return true;
     };
     uint32_t component = 0, pin = 0, ignored = 0, builder = 0;
     if (!guard("ShortcutInfoModel.getPackageName", 0x70, 0, {
@@ -1888,27 +1935,24 @@ bool bind_title_custom() {
     if (!guard("allocateTwoByteString", 0xec, 0, {
         0xf94001e2u, 0x93407c42u, 0x37000362u, 0xb27c37f1u, 0x6b11005fu, 0x54000308u, 0xaa0203e6u, 0x91007c42u, 0x927cec42u, 0xf9403340u, 0xab020001u, 0x54000242u, 0xf9403747u, 0xeb07003fu, 0x540001e2u, 0xf9003341u, 0x91000400u, 0xa93f7c3fu, 0xf103c05fu, 0xd37cec42u, 0x9a9f9042u, 0xd29e0b90u, 0xf2a000b0u, 0xaa100042u, 0xf81ff002u, 0xf800701fu, 0xb8007006u, 0x14000001u, 0xd65f03c0u}, ignored)) return false;
     // Verify model, Intent and ComponentName class ids through their original factory calls.
-    struct Factory { const char *name; uint32_t size, offset, first, second; };
+    struct Factory { const char *name; uint32_t first, second; };
     constexpr Factory factories[] = {
-        {"ShortcutInfoModel.copyShortcutModel", 0x314, 0x27c, 0xd28a0382u, 0xf2a00fe2u},
-        {"PinShortcutInfoModel.copyShortcutModel", 0x3d8, 0x340, 0xd2980382u, 0xf2a00fe2u},
-        {"PinShortcutInfoModel.copyShortcutModel", 0x3d8, 0x108, 0xd2906382u, 0xf2a01ae2u},
-        {"PinShortcutInfoModel.makePinAppComponentName", 0x84, 0x64, 0xd2962382u, 0xf2a01ae2u},
+        {"ShortcutInfoModel.copyShortcutModel", 0xd28a0382, 0xf2a00fe2},
+        {"PinShortcutInfoModel.copyShortcutModel", 0xd2980382, 0xf2a00fe2},
+        {"PinShortcutInfoModel.copyShortcutModel", 0xd2906382, 0xf2a01ae2},
+        {"PinShortcutInfoModel.makePinAppComponentName", 0xd2962382, 0xf2a01ae2},
     };
     for (const auto &factory : factories) {
-        uint32_t va = 0, size = 0, target = 0; std::vector<uint32_t> code;
-        if (!hometweaks::HomeTweaksFindSymbol(factory.name, &va, &size) || size != factory.size
-            || !dart_words(va + factory.offset, 1, code)
-            || !bl_target(code[0], va + factory.offset, &target)
-            || !dart_words(target, 2, code) || code[0] != factory.first
-            || code[1] != factory.second) return false;
+        uint32_t va = 0, size = 0;
+        if (!hometweaks::HomeTweaksFindSymbol(factory.name, &va, &size)
+            || !dartscan::tagged_call(va, factory.first, factory.second, nullptr)) return false;
     }
     if (!guard("ShortcutIconWidget.getPrefixAssetName", 0x74, 0x30,
         {0xd2802a71u, 0xb8716801u, 0x8b1c8021u}, ignored)
         || !guard("ShortcutIconWidget._buildTextWidget", 0x714, 0x214,
         {0xf85e83a2u, 0xb8447043u, 0x8b1c8063u, 0xf81c83a3u}, builder)) return false;
     uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
-    if (!bind_dart_target(builder + 0x214, address, source, words)
+    if (!bind_dart_target(builder, address, source, words)
         || address > UINTPTR_MAX - 16
         || g_dart->load_base > UINTPTR_MAX - component
         || g_dart->load_base > UINTPTR_MAX - pin) return false;
@@ -1932,28 +1976,24 @@ bool bind_drawer_title() {
             &getter_size) || getter_size != 0x68
         || !hometweaks::HomeTweaksFindSymbol("AppIcon.build", &caller, &caller_size)
         || caller_size != 0x8b8) return false;
-    std::vector<uint32_t> code;
-    if (!dart_words(caller + 0x210, 2, code) || code.size() != 2
-        || code[0] != 0x97e08699u || code[1] != 0xf85f83a0u) return false;
-    std::vector<uint32_t> font;
-    if (!dart_words(caller + 0x214, 4, font)
-        || font[0] != 0xf85f83a0u || font[1] != 0xfc1c03a0u
-        || font[2] != 0xb8413001u || font[3] != 0x8b1c8021u) return false;
-    std::vector<uint32_t> height;
-    if (!dart_words(caller + 0x2b0, 4, height)
-        || height[0] != 0xf85f03a0u || height[1] != 0xfc1b83a0u
-        || height[2] != 0xb845f001u || height[3] != 0x8b1c8021u) return false;
+    uint32_t font_offset = 0, height_offset = 0, target = 0;
+    std::vector<uint32_t> body;
+    if (!dartscan::site(caller, {0xf85f83a0, 0xfc1c03a0, 0xb8413001, 0x8b1c8021}, &font_offset)
+        || !dartscan::site(caller, {0xf85f03a0, 0xfc1b83a0, 0xb845f001, 0x8b1c8021}, &height_offset)
+        || font_offset < 4 || !dartscan::body(caller, body)
+        || !bl_target(body[font_offset / 4 - 1], caller + font_offset - 4, &target)
+        || target != getter) return false;
     uintptr_t height_address = 0;
     nhk::CodeSource height_source{};
     Words height_words{};
-    if (!bind_dart_target(caller + 0x2b0, height_address, height_source, height_words)
+    if (!bind_dart_target(caller + height_offset, height_address, height_source, height_words)
         || height_address > UINTPTR_MAX - 16) return false;
     uintptr_t address = 0;
     nhk::CodeSource source{};
     Words words{};
-    if (!bind_dart_target(caller + 0x214, address, source, words)
-        || g_dart->load_base > UINTPTR_MAX - caller - 0x214) return false;
-    hc_drawer_title_caller = static_cast<uintptr_t>(g_dart->load_base + caller + 0x214);
+    if (!bind_dart_target(caller + font_offset, address, source, words)
+        || g_dart->load_base > UINTPTR_MAX - caller - font_offset) return false;
+    hc_drawer_title_caller = static_cast<uintptr_t>(g_dart->load_base + caller + font_offset);
     hc_drawer_title_continue = address + 16;
     g_slots[kDrawerTitleSlot] = {address, reinterpret_cast<void *>(hc_drawer_title_entry),
         &hc_drawer_title_original, source, words};
@@ -2042,6 +2082,7 @@ bool sync_hotseat_capacity(bool enabled) {
 // One original-body word; all drag state, widget type, span and handoff checks stay native.
 std::atomic_flag g_widget_move_busy = ATOMIC_FLAG_INIT;
 uintptr_t g_widget_move_address = 0;
+uint32_t g_widget_move_original = 0;
 bool g_widget_move_checked = false;
 bool g_widget_move_enabled = false;
 bool g_widget_move_known = true;
@@ -2058,8 +2099,7 @@ bool sync_widget_move(bool enabled) {
         uint32_t va = 0, size = 0;
         /*
          * No neighbour-placement assertion here. `_isSpanSupportedByPa` and
-         * `_ensureDragSessionId` are closures *inside* this body, not siblings of it, so their
-         * addresses move with the parent and any fixed distance or ordering between them says
+         * `_ensureDragSessionId` have independent symbols, so a fixed distance or ordering says
          * nothing about whether the hook is still aimed at the right code. The scan below is
          * what decides: it either finds exactly one branch whose shape identifies the widget
          * rejection, or the hook stays off.
@@ -2067,19 +2107,27 @@ bool sync_widget_move(bool enabled) {
         bool compatible = hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &va, &size);
         size_t gate = SIZE_MAX;
         int32_t flag_field = 0;
+        uint32_t body_span = 0, span_callee = 0, span_size = 0;
+        if (compatible) compatible = dartscan::function_span(va, &body_span)
+            && hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._isSpanSupportedByPa",
+                &span_callee, &span_size);
         if (compatible) {
-            gate = home_layout::widget_move_gate_offset(size,
+            gate = home_layout::widget_move_gate_offset(body_span,
                 [&](size_t count, std::vector<uint32_t> &out) {
                     return dart_function_words(va, static_cast<uint32_t>(count), out);
-                }, &flag_field);
-            compatible = gate != SIZE_MAX && gate + 4 <= size * 4;
+                }, &flag_field, va, span_callee);
+            compatible = gate != SIZE_MAX && gate + 4 <= body_span;
         }
         if (compatible && g_dart->load_base <= UINTPTR_MAX - va - gate) {
             const uintptr_t address = g_dart->load_base + va + gate;
             const auto file = dart_file_offset(va + static_cast<uint32_t>(gate), 4);
             const auto source = nhk::source_at(g_dart->owned, address, 4);
             if (file && source && source->file_offset == *file && !(address & 3)) {
-                g_widget_move_address = address;
+                std::vector<uint32_t> original;
+                if (dart_words(va + static_cast<uint32_t>(gate), 1, original)) {
+                    g_widget_move_original = original[0];
+                    g_widget_move_address = address;
+                }
             }
         }
         __android_log_print(g_widget_move_address ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
@@ -2095,7 +2143,7 @@ bool sync_widget_move(bool enabled) {
     const auto write = [](uintptr_t address, uint32_t word) {
         return nhk::write_code_bytes(address, std::as_bytes(std::span(&word, 1)));
     };
-    const bool applied = home_layout::apply_widget_move_word(g_widget_move_address, enabled, read, write);
+    const bool applied = home_layout::apply_widget_move_word(g_widget_move_address, enabled, read, write, g_widget_move_original);
     g_widget_move_known = applied;
     if (applied) g_widget_move_enabled = enabled;
     __android_log_print(applied ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, kTag,
@@ -2116,36 +2164,25 @@ bool bind_desktop_title() {
         || size != 0x714) return false;
     // Both desktop and modern drawer use this builder. Only the drawer/search creates
     // customShortcutIconConfig (true at +0xb); preserve independent settings at that branch.
-    uint32_t custom = 0, custom_size = 0, factory = 0;
-    std::vector<uint32_t> custom_code, config_read, factory_code;
-    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidgetConfig.customShortcutIconConfig",
-            &custom, &custom_size) || custom_size != 0x30
-        || !dart_words(custom, 12, custom_code)
-        || custom_code[0] != kDartPrologue || custom_code[6] != 0xb8007001u
-        || custom_code[7] != 0x910082c1u || custom_code[8] != 0xb800b001u
-        || !bl_target(custom_code[4], custom + 0x10, &factory)
-        || !dart_words(factory, 2, factory_code)
-        || factory_code[0] != 0xd29a2382u || factory_code[1] != 0xf2a012c2u
-        || !dart_words(va + 0xc4, 3, config_read)
-        || config_read[0] != 0x8b1c8021u || config_read[1] != 0xb840b022u
-        || config_read[2] != 0x8b1c8042u) return false;
-    std::vector<uint32_t> code;
-    if (!dart_words(va + 0xb4, 4, code) || code.size() != 4
-        || code[0] != 0xfc443000u || code[1] != 0xf85f83a0u
-        || code[2] != 0xfc1a83a0u || code[3] != 0xb8417001u) return false;
-    std::vector<uint32_t> height;
-    if (!dart_words(va + 0x1a0, 4, height) || height.size() != 4
-        || height[0] != 0xb846f001u || height[1] != 0x8b1c8021u
-        || height[2] != 0xfc427020u || height[3] != 0xfc1a03a0u) return false;
+    uint32_t custom = 0, custom_size = 0;
+    std::vector<uint32_t> custom_code;
+    uint32_t font_offset = 0, height_offset = 0, config_offset = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("ShortcutIconWidgetConfig.customShortcutIconConfig", &custom, &custom_size)
+        || !dartscan::body(custom, custom_code) || custom_code.empty() || custom_code[0] != kDartPrologue
+        || !dartscan::site(custom, {0xb8007001, 0x910082c1, 0xb800b001}, &config_offset)
+        || !dartscan::tagged_call(custom, 0xd29a2382, 0xf2a012c2, nullptr)
+        || !dartscan::site(va, {0xfc443000, 0xf85f83a0, 0xfc1a83a0, 0xb8417001,
+            0x8b1c8021, 0xb840b022, 0x8b1c8042}, &font_offset)
+        || !dartscan::site(va, {0xb846f001, 0x8b1c8021, 0xfc427020, 0xfc1a03a0}, &height_offset)) return false;
     uintptr_t height_address = 0;
     nhk::CodeSource height_source{};
     Words height_words{};
-    if (!bind_dart_target(va + 0x1a0, height_address, height_source, height_words)
+    if (!bind_dart_target(va + height_offset, height_address, height_source, height_words)
         || height_address > UINTPTR_MAX - 16) return false;
     uintptr_t address = 0;
     nhk::CodeSource source{};
     Words words{};
-    if (!bind_dart_target(va + 0xb4, address, source, words)
+    if (!bind_dart_target(va + font_offset, address, source, words)
         || address > UINTPTR_MAX - 16) return false;
     hc_desktop_title_continue = address + 16;
     g_slots[kDesktopTitleSlot] = {address, reinterpret_cast<void *>(hc_desktop_title_entry),
@@ -2176,25 +2213,28 @@ bool bind_title_hide() {
             || size != sizes[index] || !dart_words(vas[index], 4, words)
             || words[0] != kDartPrologue) return false;
     }
-    if (!hometweaks::HomeTweaksFindSymbol("FolderIconGetxController.updateNewInstallNotification",
-            &caller, &caller_size) || caller_size != 0xec
-        || !dart_words(caller + 0x74, 1, words)) return false;
-    uint32_t target = 0;
-    if (!bl_target(words[0], caller + 0x74, &target) || target != vas[1]) return false;
-    if (g_dart->load_base > UINTPTR_MAX - caller - 0x78) return false;
-    if (!dart_words(vas[0] + 0x60, 1, words) || words[0] != 0xf9407f61u) return false;
-    if (!dart_words(vas[0] + 0x64, 4, words)
-        || words[0] != 0xaa0103e0u || words[1] != 0xaa1d03efu
-        || words[2] != 0xa8c179fdu || words[3] != 0xd65f03c0u) return false;
+    if (!hometweaks::HomeTweaksFindSymbol("FolderIconGetxController.updateNewInstallNotification", &caller, &caller_size)
+        || !dartscan::body(caller, words)) return false;
+    size_t hits = 0; uint32_t return_pc = 0;
+    for (size_t i = 0; i < words.size(); ++i) {
+        uint32_t target = 0;
+        if (bl_target(words[i], caller + static_cast<uint32_t>(i * 4), &target) && target == vas[1]) {
+            ++hits; return_pc = caller + static_cast<uint32_t>((i + 1) * 4);
+        }
+    }
+    uint32_t prefix = 0;
+    if (hits != 1 || g_dart->load_base > UINTPTR_MAX - return_pc
+        || !dartscan::site(vas[0], {0xf9407f61, 0xaa0103e0, 0xaa1d03ef, 0xa8c179fd, 0xd65f03c0}, &prefix)) return false;
+    prefix += 4;
     Slot prepared[3]{};
     for (unsigned index = 0; index < 3; ++index) {
         uintptr_t address = 0; nhk::CodeSource source{}; Words original{};
-        if (!bind_dart_target(vas[index] + (index == 0 ? 0x64 : 0), address, source, original))
+        if (!bind_dart_target(vas[index] + (index == 0 ? prefix : 0), address, source, original))
             return false;
         prepared[index] = {address, entries[index], originals[index], source, original};
     }
     for (unsigned index = 0; index < 3; ++index) g_slots[slots[index]] = prepared[index];
-    hc_title_folder_new_caller = g_dart->load_base + caller + 0x78;
+    hc_title_folder_new_caller = g_dart->load_base + return_pc;
     g_title_hide_bound = true;
     __android_log_print(ANDROID_LOG_INFO, kTag, "title hide appearance bank bound=3; database flags preserved");
     return true;
@@ -2207,88 +2247,90 @@ bool bind_title_hide() {
  * come from the scans.
  */
 bool gadget_scan_anchors(uint32_t serializer, uint32_t serializer_size,
-    uint32_t put_int_va, uint32_t gate, uint32_t gate_size, home_layout::GadgetAnchors &out) {
+    uint32_t put_int_va, uint32_t gate, uint32_t gate_size, uint32_t span_callee,
+    home_layout::GadgetAnchors &out) {
     using namespace home_layout;
+    out = {};
     std::vector<uint32_t> body, gate_body;
     if (!dart_function_words(serializer, serializer_size, body)
         || !dart_function_words(gate, gate_size, gate_body)) return false;
-    const auto at = [](const std::vector<uint32_t> &v, size_t i) {
-        return i < v.size() ? v[i] : 0u;
+    const auto run = [](const auto &v, size_t at, std::initializer_list<uint32_t> words) {
+        return at <= v.size() && words.size() <= v.size() - at
+            && std::equal(words.begin(), words.end(), v.begin() + at);
     };
-
-    // putInt: the serializer stores the marker through BundleImpl.putInt fifteen times, so the
-    // callee alone is ambiguous. The reported one is the call whose block also carries the
-    // marker-key load -- that is the write the bridge has to reproduce, not any of the other 14.
-    for (size_t i = 0; i + 2 < body.size(); ++i) {
-        if (!is_bl(body[i])) continue;
-        // BL's immediate counts instructions and is signed, so the target is computed in 64-bit:
-        // adding it as an unsigned 32-bit would wrap a backward branch into a huge address and
-        // the comparison below would never match.
-        const int64_t target = static_cast<int64_t>(serializer) + i * 4
-            + static_cast<int64_t>(bl_imm_words(body[i])) * 4;
-        if (target != static_cast<int64_t>(put_int_va)) continue;
-        for (size_t back = i; back-- > 0;) {
-            if (at(body, back) == movz_32(kMarkerKey, 17)) {
-                out.put_int = static_cast<uint32_t>(i) * 4;
-                // The store the bridge must not disturb sits one instruction after the load
-                // of the key it was indexed by.
-                out.ret = static_cast<uint32_t>(back) * 4;
-                break;
-            }
-            if (i - back > 24) break;
-        }
-        if (out.put_int) break;
+    const auto calls = [](uint32_t word, uint32_t base, size_t index, uint32_t callee) {
+        return is_bl(word) && static_cast<int64_t>(base) + static_cast<int64_t>(index) * 4
+            + static_cast<int64_t>(bl_imm_words(word)) * 4 == callee;
+    };
+    // These replay windows are an ABI contract, not candidate addresses. The assembly still
+    // uses these registers, stack roots and pool fields; a changed ABI must decline.
+    size_t put_hits = 0, select_hits = 0, common_hits = 0, span_hits = 0, widget_hits = 0;
+    for (size_t i = 5; i + 4 < body.size(); ++i) {
+        if (!calls(body[i], serializer, i, put_int_va)
+            || !run(body, i - 5, {0xf85e83a0, 0xf85f03a1, 0x9140db62,
+                0xf947fc42, 0xd2800083})
+            || !run(body, i + 1, {0xf85e83a0, 0xd2802871, 0xb8716803, 0x8b1c8063})) continue;
+        ++put_hits;
+        out.put_int = static_cast<uint32_t>(i * 4);
+        out.ret = static_cast<uint32_t>((i + 1) * 4); // original return PC, never the key load
     }
-    // select: the branch that discriminates the marker path, keyed on its own immediate.
-    for (size_t i = 0; i + 1 < body.size(); ++i) {
-        if (!is_imm_compare(body[i], kSelectDiscriminator)) continue;
-        if (!is_cond_branch(body[i + 1])) continue;
-        out.select = static_cast<uint32_t>(i) * 4;
-        break;
-    }
-    // common / id: the Bundle field the clear path rewrites. That immediate appears twice in
-    // this body, so it alone does not identify the site; what does is the spilled slot it is
-    // read through -- the shared path reloads the same one the marker store used. Requiring
-    // exactly one such pair keeps a renumbered launcher from binding the wrong read.
-    {
-        size_t found = SIZE_MAX;
-        for (size_t i = 1; i < body.size(); ++i) {
-            int32_t field = 0;
-            if (!is_ldur_w(body[i], 3, field)) continue;
-            if (field != static_cast<int32_t>(kClearField)) continue;
-            if (!is_ldur_sp(body[i - 1], kClearSlot, kFramePointer)) continue;
-            if (found != SIZE_MAX) { found = SIZE_MAX; break; }
-            found = i;
+    for (size_t i = 0; i + 3 < body.size(); ++i) {
+        if (body[i] == 0xf11fb43f && (body[i + 1] & 0xff00001fu) == 0x54000001u
+            && body[i + 2] == 0xf85e83a0 && body[i + 3] == 0xf85f03a1) {
+            ++select_hits; out.select = static_cast<uint32_t>(i * 4);
         }
-        if (found != SIZE_MAX) {
-            out.id_offset = static_cast<uint32_t>(kClearField);
-            out.common = static_cast<uint32_t>(found - 1) * 4;
+        if (run(body, i, {0xf85e83a0, 0xb849f003, 0x8b1c8063, 0xf85f03a1})) {
+            ++common_hits; out.common = static_cast<uint32_t>(i * 4); out.id_offset = 0x9f;
         }
     }
-    // The gate body has several `tbnz w0,#4` sites; only one is preceded by a call, and that is
-    // the span check. The widget test is the sign-extension pair, but three sites share that
-    // shape -- it is told apart by branching to the same reject arm the span check does, which
-    // is what makes the two a matched pair instead of two independent guesses.
-    for (size_t i = 1; i < gate_body.size(); ++i) {
-        if (!is_tbnz_w(gate_body[i], 0, 4)) continue;
-        const int32_t dest = static_cast<int32_t>(i) * 4 + branch_disp_words(gate_body[i]) * 4;
-        if (dest <= 0 || static_cast<uint32_t>(dest) >= gate_size * 4) continue;
-        if (!is_bl(gate_body[i - 1])) continue;
-        if (out.span_entry != 0) { out.span_entry = 0; break; }
-        out.span_entry = static_cast<uint32_t>(i) * 4;
+    for (size_t i = 1; i + 3 < gate_body.size(); ++i) {
+        if (!is_tbnz_w(gate_body[i], 0, 4)
+            || !calls(gate_body[i - 1], gate, i - 1, span_callee)
+            || !run(gate_body, i + 1, {0xf85f83a0, 0xf85e83a2, 0xaa0003e1})) continue;
+        const int64_t dest = static_cast<int64_t>(i) * 4
+            + static_cast<int64_t>(branch_disp_words(gate_body[i])) * 4;
+        if (dest < 0 || dest + 4 > gate_size) return false;
+        ++span_hits; out.span_entry = static_cast<uint32_t>(i * 4);
         out.span_reject = static_cast<uint32_t>(dest);
     }
-    for (size_t i = 1; out.span_reject != 0 && i < gate_body.size(); ++i) {
-        if (!is_tbnz_w(gate_body[i], 0, 4)) continue;
-        const int32_t dest = static_cast<int32_t>(i) * 4 + branch_disp_words(gate_body[i]) * 4;
-        if (static_cast<uint32_t>(dest) != out.span_reject) continue;
-        if (!is_add_shift32(gate_body[i - 1])) continue;
-        if (out.widget_gate != 0) { out.widget_gate = 0; break; }
-        out.widget_gate = static_cast<uint32_t>(i) * 4;
+    if (span_hits != 1) return false;
+    for (size_t i = 2; i < gate_body.size(); ++i) {
+        if (!is_tbnz_w(gate_body[i], 0, 4)
+            || !run(gate_body, i - 2, {0xb84fb040, 0x8b1c8000})) continue;
+        const int64_t dest = static_cast<int64_t>(i) * 4
+            + static_cast<int64_t>(branch_disp_words(gate_body[i])) * 4;
+        if (dest != out.span_reject) continue;
+        ++widget_hits; out.widget_gate = static_cast<uint32_t>(i * 4);
     }
-    out.ok = out.put_int && out.ret && out.select && out.common
-        && out.id_offset && out.span_entry && out.span_reject && out.widget_gate;
-    return out.ok;
+    // The original rooted closure/model path used by the span stub must still exist exactly once.
+    size_t root_hits = 0;
+    for (size_t i = 0; i + 3 < gate_body.size(); ++i)
+        if (run(gate_body, i, {0xb8407002, 0x8b1c8042, 0xaa0203e0, 0xf85e83a3})) ++root_hits;
+    if (put_hits != 1 || select_hits != 1 || common_hits != 1 || widget_hits != 1 || root_hits != 1)
+        return false;
+    const uint32_t branch = body[out.select / 4 + 1];
+    const uint32_t raw = (branch >> 5) & 0x7ffff;
+    const int64_t disp = raw & 0x40000 ? static_cast<int64_t>(raw) - 0x80000 : raw;
+    if (static_cast<int64_t>(out.select) + 4 + disp * 4 != out.common) return false;
+    out.ok = true;
+    return true;
+}
+
+// The clone field-copy ABI and allocator class tags are independent evidence.
+bool gadget_clone_compatible(uint32_t clone, uint32_t clone_span) {
+    std::vector<uint32_t> clone_body, code;
+    if (!dart_function_words(clone, clone_span, clone_body)) return false;
+    size_t factory_hits = 0, field_hits = 0;
+    for (size_t i = 0; i < clone_body.size(); ++i) {
+        if (i + 3 < clone_body.size() && clone_body[i] == 0xd2802371
+            && clone_body[i + 1] == 0xb8716840 && clone_body[i + 2] == 0x8b1c8000
+            && clone_body[i + 3] == 0xd2802371) ++field_hits;
+        uint32_t candidate = 0;
+        if (!bl_target(clone_body[i], clone + static_cast<uint32_t>(i * 4), &candidate)) continue;
+        if (dart_words(candidate, 2, code) && code.size() == 2
+            && code[0] == 0xd2840382 && code[1] == 0xf2a00fe2) ++factory_hits;
+    }
+    return factory_hits == 1 && field_hits == 1;
 }
 
 // Two original-body splices; original putInt BL/return PC retain the Dart stack map.
@@ -2296,13 +2338,16 @@ bool bind_gadget_bridge() {
     if (g_gadget_bound) return true;
     if (!g_dart || !g_gadget_requested.load(std::memory_order_acquire)) return false;
     uint32_t va = 0, size = 0, put = 0, put_size = 0, clone = 0, clone_size = 0;
-    uint32_t can = 0, can_size = 0;
+    uint32_t can = 0, can_size = 0, span_callee = 0, span_size = 0;
     home_layout::GadgetAnchors anchors;
     if (!hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetSerializer, &va, &size)
         || !hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetBundlePut, &put, &put_size)
         || !hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &can, &can_size)
         || !hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetModel, &clone, &clone_size)
-        || !gadget_scan_anchors(va, size, put, can, can_size, anchors)) {
+        || !hometweaks::HomeTweaksFindSymbol("AssistantDragToPAHandler._isSpanSupportedByPa",
+            &span_callee, &span_size)
+        || !dartscan::function_span(va, &size) || !dartscan::function_span(can, &can_size)
+        || !gadget_scan_anchors(va, size, put, can, can_size, span_callee, anchors)) {
         __android_log_print(ANDROID_LOG_WARN, kTag,
             "Gadget12 bridge declined at scan; putInt=%x ret=%x select=%x common=%x id=%x "
             "span=%x reject=%x gate=%x",
@@ -2310,27 +2355,9 @@ bool bind_gadget_bridge() {
             anchors.span_entry, anchors.span_reject, anchors.widget_gate);
         return false;
     }
-    // The model clone the clear path mirrors. The clone body opens with a call into the model
-    // factory; the factory is recognised by the field key it indexes, not by where it sits.
-    uint32_t factory = 0;
-    std::vector<uint32_t> clone_body, code;
-    if (!dart_function_words(clone, clone_size, clone_body)) return false;
-    for (size_t i = 0; i < clone_body.size() && i < 32; ++i) {
-        if (!home_layout::is_bl(clone_body[i])) continue;
-        // Same signedness care as the putInt scan: the call is a backward branch.
-        const uint32_t candidate = static_cast<uint32_t>(
-            static_cast<int64_t>(clone) + i * 4
-            + static_cast<int64_t>(home_layout::bl_imm_words(clone_body[i])) * 4);
-        if (!dart_words(candidate, 12, code) || code.size() < 12) continue;
-        for (size_t k = 0; k + 1 < code.size(); ++k) {
-            if (code[k] != home_layout::movz_32(home_layout::kModelFieldKey, 17)) continue;
-            if (!home_layout::is_ldr32_reg(code[k + 1], 3, 17)) continue;
-            factory = candidate;
-            break;
-        }
-        if (factory) break;
-    }
-    if (!factory) return false;
+    uint32_t clone_span = 0;
+    if (!dartscan::function_span(clone, &clone_span)
+        || !gadget_clone_compatible(clone, clone_span)) return false;
     Slot prepared[3]{};
     const uint32_t offsets[] = {anchors.select, anchors.ret};
     void *entries[] = {reinterpret_cast<void *>(hc_gadget_select_entry),
@@ -3277,7 +3304,7 @@ extern "C" void hc_layout_folder_body(uintptr_t frame, uint64_t heap, uintptr_t 
     const int side = ready ? g_knobs[4].delta_dp.load(std::memory_order_relaxed) : 0;
     const uint64_t hits_before = rendered_workspace.hits;
     const bool valid = home_layout::folder_geometry_body(frame, heap, saved, kind, top, bottom, side,
-        &rendered_workspace);
+        &rendered_workspace, &g_grid_field);
     const bool render_hit = rendered_workspace.hits != hits_before;
     const uint64_t count = __atomic_fetch_add(&hc_layout_folder_hits[kind], uint64_t{1}, __ATOMIC_RELAXED);
     if (count < 4 || (render_hit && !(rendered_workspace.logged_hits & (1u << kind)))) {
@@ -3321,7 +3348,7 @@ extern "C" void hc_layout_workspace_layout(uintptr_t frame, uint64_t heap, int o
     const int side = g_knobs[4].delta_dp.load(std::memory_order_relaxed);
     double geometry[4] = {};
     const bool hotseat = occupied == 2;
-    const bool valid = hotseat ? home_layout::inset_hotseat_frame(frame, heap, side, geometry)
+    const bool valid = hotseat ? home_layout::inset_hotseat_frame(frame, heap, side, geometry, &g_grid_field)
         : home_layout::inset_workspace_frame(frame, heap, occupied != 0,
             &g_grid_field, top, bottom, side, geometry, &rendered_workspace);
     static std::atomic<uint32_t> reports[3]{};
@@ -3465,6 +3492,8 @@ bool adopt_layout_state() {
     hc_gadget_put_int = hc_gadget_common = 0;
     hc_gadget_select_continue = hc_gadget_return_continue = 0;
     g_widget_move_address = 0;
+    g_widget_move_original = 0;
+    g_grid_field = {};
     g_widget_move_checked = g_widget_move_enabled = false;
     g_widget_move_known = true;
     g_captures_armed = false;

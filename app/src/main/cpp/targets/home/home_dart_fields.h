@@ -3,37 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-
 namespace home_layout {
-
-/*
- * Recover the Dart field offsets the geometry hooks read, from the launcher's own code.
- *
- * The hooks need a handful of `GridInfo` field offsets plus the drop-back item's two cell
- * indices. Those live in the Dart heap: no symbol names them, no relocation pins them down,
- * and there is nothing to xref. The only thing that determines them is the code that reads
- * them, and the drop-back target reads every one. The compiler emits each read as
- * `ldur <size> Rt, [xRn, #imm9]`, so the offset sits in the instruction stream next to the
- * arithmetic that gives it meaning.
- *
- * A read is identified by what the code *does* with the value, never by the offset it
- * happens to carry:
- *
- *   - the origin cell is dereferenced for its X coordinate immediately after the load;
- *   - the cell width is the only load whose value a call converts to a double;
- *   - the row count is stored straight back out, which is what a count the caller keeps is for;
- *   - the column count is read, and two instructions later the item's own column and row are
- *     loaded from the same base -- that pairing is the bounds check the two are compared in,
- *     and it is what distinguishes the count from the two other reads of the same field.
- *
- * The immediate is the answer, never the search key. Each shape must match exactly once, or
- * the field stays unknown and the caller leaves the hook off: a launcher that renumbers its
- * fields then stops applying the adjustment, which is the right outcome, whereas a stored
- * offset would have kept pointing at whatever moved into that slot.
- *
- * This is deliberately narrow. It knows the access forms these reads take and nothing more
- * general about Dart layout; it is a resolver for one function's fields, not a general
- * Dart offset facility.
+/* Resolve only bounded original consumers. Counts come from the named currentConfig
+ * receiver followed by X/Y bounds checks with a shared reject arm. Item indices come from
+ * occupied-cell X/Y stride arithmetic. No neighbouring function or adjacent-field guess.
+ * Frame/register contracts are still verified: dynamic offsets do not relax stub ABI.
  */
 struct GridFieldOffsets {
     int32_t columns = -1;
@@ -41,61 +15,20 @@ struct GridFieldOffsets {
     int32_t origin = -1;
     int32_t item_col = -1;
     int32_t item_row = -1;
+    int32_t cell_width = -1;
+    int32_t cell_height = -1;
+    int32_t occupied_grid = -1;
+    int32_t dock_columns = -1, dock_item = -1, dock_info = -1;
+    bool usable() const {
+        return columns > 0 && rows > 0 && origin > 0 && item_col > 0 && item_row > 0
+            && cell_width > 0 && cell_height > 0 && occupied_grid > 0;
+    }
 };
 
-/*
- * The cell width and height are deliberately absent.
- *
- * Neither can be pinned down from this body. The height is never loaded at all, and the width
- * is loaded once but shares its shape -- a narrow load whose value a call converts -- with four
- * other fields, and nothing in the surrounding code separates them: they sit at no fixed
- * distance from the origin cell, from the column count, or from each other. A rule that picked
- * one of them would be a guess wearing a derivation's clothes, and the consequence would be a
- * silent comparison against the wrong field.
- *
- * The hooks only ever use these two to *check* the frame-pointer copy against the GridInfo
- * field, so leaving them unresolved costs the check rather than the adjustment: the caller
- * compares what the frame pointer holds against itself, and the geometry it applies comes from
- * the local values it computed. See kDropGeometryHasNoResolvedCellSize.
- */
-inline constexpr bool kDropGeometryHasNoResolvedCellSize = true;
+// Drop uses original frame copies and validates against the same resolved stride fields.
 
-/*
- * The cell size fields, for the one path that reads them off the GridInfo rather than off a
- * local. They are the two offsets `read_grid_field_offsets` cannot resolve, and they are named
- * here so that their absence is a documented fact rather than an omission that looks like an
- * oversight. See kDropGeometryHasNoResolvedCellSize above for why no scan produces them.
- *
- * The consequence if a launcher renumbers them: an occupied cell's size is read from the wrong
- * place, the value is not finite or not positive, `inset_workspace` rejects it, and the cell
- * keeps the geometry the stock layout gave it. The failure is a no-op on one code path, not a
- * misplaced icon -- `inset_workspace` range-checks every dimension it is handed before use.
- */
-inline constexpr int32_t kCellSizeWidth = 0x2b;
-inline constexpr int32_t kCellSizeHeight = 0x33;
-
-/*
- * Distance between the two cell counts, in bytes.
- *
- * The hooks read the column and row counts as 64-bit values and the launcher stores them as a
- * pair, so one count follows the other exactly one slot on. This is a property of the field
- * pair rather than of any particular build, which is what makes it usable as a relation: a
- * launcher that widened or reordered the pair changes the gap and the field stops resolving.
- */
-inline constexpr int32_t kCountSlotBytes = 8;
-
-/*
- * Encoding predicates, taken from the disassembly of launcher 7722 rather than from the
- * architecture manual: the `size` field selects the access width and its encoding here does
- * not line up with the manual's naming, so these compare the exact words that were observed.
- *
- *   ldur wRt,[xRn,#imm9]  ->  0xB8400000, size bits 10
- *   ldur xRt,[xRn,#imm9]  ->  0xF8400000, size bits 11
- *   ldur dRt,[xRn,#imm9]  ->  0xFC400000, size bits 11
- *   add xRt,xRt,x28,lsl#32
- */
 inline bool dart_ldur_w(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) {
-    if ((w & 0xFFC00000u) != 0xB8400000u) return false;
+    if ((w & 0xFFE00C00u) != 0xB8400000u) return false;
     if (((w >> 30) & 3u) != 2u) return false;
     if (((w >> 5) & 0x1Fu) != rn || (w & 0x1Fu) != rt) return false;
     const uint32_t raw = (w >> 12) & 0x1FFu;
@@ -107,7 +40,7 @@ inline bool dart_ldur_w(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) 
 }
 
 inline bool dart_ldur_x(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) {
-    if ((w & 0xFFC00000u) != 0xF8400000u) return false;
+    if ((w & 0xFFE00C00u) != 0xF8400000u) return false;
     if (((w >> 30) & 3u) != 3u) return false;
     if (((w >> 5) & 0x1Fu) != rn || (w & 0x1Fu) != rt) return false;
     const uint32_t raw = (w >> 12) & 0x1FFu;
@@ -119,7 +52,7 @@ inline bool dart_ldur_x(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) 
 }
 
 inline bool dart_ldur_d(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) {
-    if ((w & 0xFFC00000u) != 0xFC400000u) return false;
+    if ((w & 0xFFE00C00u) != 0xFC400000u) return false;
     if (((w >> 30) & 3u) != 3u) return false;
     if (((w >> 5) & 0x1Fu) != rn || (w & 0x1Fu) != rt) return false;
     const uint32_t raw = (w >> 12) & 0x1FFu;
@@ -131,85 +64,134 @@ inline bool dart_ldur_d(uint32_t w, uint32_t rn, uint32_t rt, int32_t *out_imm) 
 }
 
 inline bool dart_sign_extend_pair(uint32_t w, uint32_t rt) {
-    return (w & 0xFFFFFC00u) == 0x8B1C8000u && (w & 0x1Fu) == rt;
+    return w == (0x8B1C8000u | (rt << 5) | rt);
 }
 
 inline bool dart_is_bl(uint32_t w) { return (w & 0xFC000000u) == 0x94000000u; }
 
 inline bool dart_stur_w(uint32_t w) {
-    return (w & 0xFFC00000u) == 0xB8000000u && ((w >> 30) & 3u) == 2u;
+    return (w & 0xFFE00C00u) == 0xB8000000u && (w & 0x1fu) == 1u;
 }
 
-/* Only positive, plausibly-word-aligned field offsets are considered. */
-inline bool dart_plausible_field(int32_t imm) { return imm > 0 && imm <= 0x400; }
+// GridCellDelegate's locals are the two strides the geometry helper adjusts. Both loads share
+// the same receiver and feed the verified width/height frame slots. The immediates are outputs.
+inline void read_grid_cell_size(const std::vector<uint32_t> &body, GridFieldOffsets &out) {
+    out.cell_width = out.cell_height = -1;
+    size_t hits = 0;
+    int32_t width = -1, height = -1;
+    for (size_t i = 0; i + 3 < body.size(); ++i) {
+        int32_t w = 0, h = 0;
+        if (!dart_ldur_d(body[i], 3, 0, &w) || body[i + 1] != 0xfc1b03a0
+            || !dart_ldur_d(body[i + 2], 3, 1, &h) || body[i + 3] != 0xfc1b83a1
+            || w <= 0 || h <= 0 || w == h || ((w + 1) & 3) || ((h + 1) & 3)) continue;
+        ++hits; width = w; height = h;
+    }
+    if (hits == 1) { out.cell_width = width; out.cell_height = height; }
+}
 
-/*
- * Read every offset out of one function body.
- *
- * `body` must be the whole function, not a slice: the shapes below are "exactly one read in
- * the body", so a truncated view would report a field as unique when it is merely the only one
- * left in the window. `frame_pointer` is the register the Dart AOT frame keeps locals under.
- */
+inline bool dart_plausible_field(int32_t imm) { return imm > 0 && imm < 256 && ((imm + 1) & 3) == 0; }
+
+inline bool dart_call_to(uint32_t word, uint32_t pc, uint32_t target) {
+    if (!dart_is_bl(word) || !target) return false;
+    int64_t imm = word & 0x03ffffffu;
+    if (imm & 0x02000000) imm -= 0x04000000;
+    return static_cast<int64_t>(pc) + imm * 4 == target;
+}
+inline int64_t dart_cond_target(size_t index, uint32_t word) {
+    int32_t imm = (word >> 5) & 0x7ffff;
+    if (imm & 0x40000) imm -= 0x80000;
+    return static_cast<int64_t>(index) + imm;
+}
+
+// calculateCenterGlobalPosition consumes the origin returned by currentConfig.
 inline GridFieldOffsets read_grid_field_offsets(const std::vector<uint32_t> &body,
-    uint32_t frame_pointer = 29) {
+    uint32_t = 29) {
     GridFieldOffsets out;
-    const size_t n = body.size();
-
-    size_t origin_hits = 0, chain_hits = 0;
-    std::vector<int32_t> stored;   // candidates for the row count
-    for (size_t i = 0; i + 2 < n; ++i) {
+    size_t hits = 0;
+    for (size_t i = 0; i + 2 < body.size(); ++i) {
         int32_t imm = 0;
-        if (!dart_ldur_w(body[i], 0, 1, &imm) || !dart_plausible_field(imm)) continue;
-        if (!dart_sign_extend_pair(body[i + 1], 1)) continue;
-        // origin: the cell's X coordinate is read straight out of the loaded value.
-        int32_t slot = 0;
-        if (dart_ldur_d(body[i + 2], 1, 0, &slot) && slot == 7) {
-            ++origin_hits;
-            out.origin = imm;
-        }
-        // rows: stored straight back out, which is what a count the caller keeps is for.
-        if (dart_stur_w(body[i + 2])) stored.push_back(imm);
-    }
-    // columns + the item's own indices: the six-instruction bounds check.
-    for (size_t i = 0; i + 4 < n; ++i) {
-        int32_t cnt = 0, col = 0, row = 0;
-        if (dart_ldur_w(body[i], 0, 1, &cnt) && dart_plausible_field(cnt)
-            && dart_sign_extend_pair(body[i + 1], 1)
-            && dart_ldur_x(body[i + 2], frame_pointer, 0, nullptr)
-            && dart_ldur_x(body[i + 3], 0, 2, &col)
-            && dart_ldur_x(body[i + 4], 0, 3, &row)
-            && dart_plausible_field(col) && dart_plausible_field(row)) {
-            ++chain_hits;
-            out.columns = cnt;
-            out.item_col = col;
-            out.item_row = row;
+        if (dart_ldur_w(body[i], 0, 1, &imm) && dart_plausible_field(imm)
+            && dart_sign_extend_pair(body[i + 1], 1) && body[i + 2] == 0xfc407020) {
+            ++hits; out.origin = imm;
         }
     }
-    /*
-     * The row count is tied to the column count by what the two *are*: a pair of cell counts in
-     * the same object, one 64-bit slot apart. The store shape alone does not single it out --
-     * two fields are stored that way -- but only one of them sits a slot from the column count,
-     * and that relation is what the hooks have always relied on, expressed as a relation rather
-     * than as a stored number. If the launcher reorders the pair the gap changes and the field
-     * stays unknown, which is the right outcome: the caller then declines instead of reading a
-     * neighbouring count.
-     */
-    if (origin_hits != 1) out.origin = -1;
-    if (chain_hits != 1) {
-        out.columns = -1;
-        out.item_col = -1;
-        out.item_row = -1;
-    } else {
-        size_t adjacent = 0;
-        int32_t found = -1;
-        for (const int32_t candidate : stored) {
-            if (candidate - out.columns != kCountSlotBytes) continue;
-            ++adjacent;
-            found = candidate;
-        }
-        out.rows = adjacent == 1 ? found : -1;
-    }
+    if (hits != 1) out.origin = -1;
     return out;
 }
 
+// isItemPosEmpty checks column (unboxed -0x18) and row (boxed -0x10), each
+// against the same named currentConfig return. Both GE branches must reject together.
+inline bool read_grid_counts(const std::vector<uint32_t> &body, uint32_t va,
+    uint32_t current_config, GridFieldOffsets &out) {
+    out.columns = out.rows = -1;
+    size_t xhits = 0, yhits = 0; int32_t x = -1, y = -1;
+    int64_t xr = -1, yr = -1;
+    for (size_t i = 0; i + 8 < body.size(); ++i) {
+        int32_t imm = 0;
+        if (!dart_call_to(body[i], va + static_cast<uint32_t>(i * 4), current_config)
+            || !dart_ldur_x(body[i + 1], 0, 1, &imm) || !dart_plausible_field(imm)) continue;
+        if (body[i + 2] == 0xf85e83a0 && body[i + 3] == 0xeb01001f
+            && (body[i + 4] & 0xff00001f) == 0x5400000a) {
+            ++xhits; x = imm; xr = dart_cond_target(i + 4, body[i + 4]);
+        }
+        if (body[i + 2] == 0xf85f03a2 && body[i + 3] == 0x93417c43
+            && body[i + 4] == 0x36000042 && body[i + 5] == 0xf8407043
+            && body[i + 6] == 0xeb01007f
+            && (body[i + 7] & 0xff00001f) == 0x5400000a) {
+            ++yhits; y = imm; yr = dart_cond_target(i + 7, body[i + 7]);
+        }
+    }
+    if (xhits != 1 || yhits != 1 || x == y || xr != yr || xr < 0
+        || xr >= static_cast<int64_t>(body.size()) || body[xr] != 0x9100c2c0) return false;
+    out.columns = x; out.rows = y; return true;
+}
+
+inline bool read_occupied_fields(const std::vector<uint32_t> &body, GridFieldOffsets &out) {
+    out.item_col = out.item_row = out.occupied_grid = -1;
+    size_t hits = 0, grid_hits = 0; int32_t col = -1, row = -1, grid = -1;
+    for (size_t i = 0; i + 12 < body.size(); ++i) {
+        int32_t x = 0, y = 0;
+        if (body[i] == 0xf85f03a0 && body[i + 1] == 0xf85e83a1
+            && dart_ldur_x(body[i + 2], 0, 2, &x) && dart_plausible_field(x)
+            && body[i + 3] == 0x9e620043 && body[i + 4] == 0x1e600864
+            && body[i + 5] == 0x1e642843 && body[i + 6] == 0xfc1903a3
+            && dart_ldur_x(body[i + 7], 0, 2, &y) && dart_plausible_field(y)
+            && body[i + 8] == 0x9e620044 && body[i + 9] == 0x1e610885
+            && body[i + 10] == 0xfc1983a5 && x != y) { ++hits; col = x; row = y; }
+        int32_t ptr = 0, w = 0, h = 0;
+        if (body[i] == 0xf85f83a2 && dart_ldur_w(body[i + 1], 2, 0, &ptr)
+            && dart_plausible_field(ptr) && dart_sign_extend_pair(body[i + 2], 0)
+            && dart_ldur_d(body[i + 3], 0, 0, &w) && body[i + 4] == 0xfc1a03a0
+            && dart_ldur_d(body[i + 5], 0, 1, &h) && body[i + 6] == 0xfc1a83a1
+            && w == out.cell_width && h == out.cell_height) { ++grid_hits; grid = ptr; }
+    }
+    if (hits != 1 || grid_hits != 1) return false;
+    out.item_col = col; out.item_row = row; out.occupied_grid = grid; return true;
+}
+// The delegate count is boxed into the original -0x38 argument; the per-item
+// column chain originates in the -0x50 closure and agrees with occupied-cell indices.
+inline bool read_hotseat_fields(const std::vector<uint32_t> &body, GridFieldOffsets &out) {
+    out.dock_columns = out.dock_item = out.dock_info = -1;
+    size_t counts = 0, chains = 0; int32_t count = -1, item = -1, info = -1;
+    for (size_t i = 0; i + 8 < body.size(); ++i) {
+        int32_t imm = 0, a = 0, b = 0, col = 0;
+        if (body[i] == 0xf85f83a5 && body[i + 1] == 0xf81c03a4
+            && dart_ldur_x(body[i + 2], 5, 6, &imm) && dart_plausible_field(imm)
+            && body[i + 3] == 0x937f78c0 && body[i + 4] == 0xeb8004df
+            && body[i + 5] == 0x54000060 && dart_is_bl(body[i + 6])
+            && body[i + 7] == 0xf8007006 && body[i + 8] == 0xf81c83a0) {
+            ++counts; count = imm;
+        }
+        if (body[i] == 0xf85b03a2 && dart_ldur_w(body[i + 1], 2, 0, &a)
+            && dart_plausible_field(a) && dart_sign_extend_pair(body[i + 2], 0)
+            && dart_ldur_w(body[i + 3], 0, 1, &b) && dart_plausible_field(b)
+            && dart_sign_extend_pair(body[i + 4], 1)
+            && dart_ldur_x(body[i + 5], 1, 4, &col) && col == out.item_col
+            && body[i + 6] == 0x937f7880 && body[i + 7] == 0xeb80049f) {
+            ++chains; item = a; info = b;
+        }
+    }
+    if (counts != 1 || chains != 1) return false;
+    out.dock_columns = count; out.dock_item = item; out.dock_info = info; return true;
+}
 } // namespace home_layout
