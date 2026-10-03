@@ -8,6 +8,7 @@
 #include "home_indicator_pair.h"
 #include "home_hotseat_capacity.h"
 #include "home_widget_move.h"
+#include "home_gadget_bridge.h"
 #include "home_layout_elf_targets.h"
 #include "nativehook/hook_bank.h"
 #include "nativehook/memory_io.h"
@@ -77,6 +78,14 @@ bool dock_motion_screen_active();
  * and this keeps working.
  */
 extern "C" {
+void hc_gadget_select_entry();
+void hc_gadget_return_entry();
+void hc_gadget_span_entry();
+void *hc_gadget_original[3]{};
+uintptr_t hc_gadget_put_int = 0, hc_gadget_common = 0;
+uintptr_t hc_gadget_select_continue = 0, hc_gadget_return_continue = 0;
+uintptr_t hc_gadget_span_continue = 0, hc_gadget_span_reject = 0;
+uint32_t hc_gadget_bridge_enabled = 0;
 /*
  * One control block per knob, for the hook strategy: the trampoline calls the original layout
  * aggregator and adds this delta to its double result. `hits` is bumped by the trampoline, which is
@@ -251,7 +260,8 @@ constexpr size_t kTitleLightSlot = kTitleFolderNewSlot + 1;
 constexpr size_t kDesktopTitleHeightSlot = kTitleLightSlot + 1;
 constexpr size_t kDrawerTitleHeightSlot = kDesktopTitleHeightSlot + 1;
 constexpr size_t kTitleCustomSlot = kDrawerTitleHeightSlot + 1;
-constexpr size_t kSlotCount = kTitleCustomSlot + 1;
+constexpr size_t kGadgetBridgeSlot = kTitleCustomSlot + 1;
+constexpr size_t kSlotCount = kGadgetBridgeSlot + 3;
 using Slot = nhk::InlineSlot<kPatchWords>;
 using Words = nhk::SlotWords<kPatchWords>;
 /* The companion slot's payload, declared here because `Words` only exists from this line down. */
@@ -1873,8 +1883,11 @@ uintptr_t g_widget_move_address = 0;
 bool g_widget_move_checked = false;
 bool g_widget_move_enabled = false;
 bool g_widget_move_known = true;
+std::atomic<bool> g_gadget_requested{false};
+bool g_gadget_bound = false;
 
 bool sync_widget_move(bool enabled) {
+    g_gadget_requested.store(enabled, std::memory_order_release);
     if (g_widget_move_busy.test_and_set(std::memory_order_acquire)) return false;
     struct Release { ~Release() { g_widget_move_busy.clear(std::memory_order_release); } } release;
     if (!g_dart || (!enabled && !g_widget_move_address)) return !enabled;
@@ -2019,8 +2032,76 @@ bool bind_title_hide() {
     return true;
 }
 
+// Two original-body splices; original putInt BL/return PC retain the Dart stack map.
+bool bind_gadget_bridge() {
+    if (g_gadget_bound) return true;
+    if (!g_dart || !g_gadget_requested.load(std::memory_order_acquire)) return false;
+    uint32_t va = 0, size = 0, clone = 0, clone_size = 0, factory = 0;
+    std::vector<uint32_t> code;
+    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kGadgetSerializer, &va, &size)
+        || size != home_layout::kGadgetSerializerSize
+        || !home_layout::gadget_bridge_guards_match([&](uint32_t offset, uint32_t (&words)[4]) {
+            if (!dart_words(va + offset, 4, code)) return false;
+            std::copy(code.begin(), code.end(), words); return true;
+        })
+        || !hometweaks::HomeTweaksFindSymbol("GadgetInfoModel.cloneModel", &clone, &clone_size)
+        || clone_size != 0x23c || !dart_words(clone + 0x1c, 1, code)
+        || !bl_target(code[0], clone + 0x1c, &factory)
+        || !dart_words(factory, 2, code) || code[0] != 0xd2840382 || code[1] != 0xf2a00fe2
+        || !dart_words(clone + 0x40, 4, code)
+        || code[0] != 0xd2802371 || code[1] != 0xb8716840
+        || code[2] != 0x8b1c8000 || code[3] != 0xd2802371) return false;
+    uint32_t put = 0, put_size = 0, called = 0;
+    if (!hometweaks::HomeTweaksFindSymbol("BundleImpl.putInt", &put, &put_size)
+        || !dart_words(va + home_layout::kGadgetPutIntOffset, 1, code)
+        || !bl_target(code[0], va + home_layout::kGadgetPutIntOffset, &called)
+        || called != put) return false;
+    uint32_t can = 0, can_size = 0;
+    if (!hometweaks::HomeTweaksFindSymbol(home_layout::kWidgetMoveSymbol, &can, &can_size)
+        || can_size != home_layout::kWidgetMoveSize
+        || !dart_words(can + 0x808, 4, code)
+        || code[0] != 0x37200480 || code[1] != 0xf85f83a0
+        || code[2] != 0xf85e83a2 || code[3] != 0xaa0003e1
+        || !dart_words(can + 0x480, 4, code)
+        || code[0] != 0xb8407002 || code[1] != 0x8b1c8042
+        || code[2] != 0xaa0203e0 || code[3] != 0xf85e83a3) return false;
+    Slot prepared[3]{};
+    const uint32_t offsets[] = {home_layout::kGadgetSelectOffset, home_layout::kGadgetReturnOffset};
+    void *entries[] = {reinterpret_cast<void *>(hc_gadget_select_entry),
+        reinterpret_cast<void *>(hc_gadget_return_entry)};
+    for (unsigned i = 0; i < 2; ++i) {
+        uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
+        if (!bind_dart_target(va + offsets[i], address, source, words)) return false;
+        prepared[i] = {address, entries[i], &hc_gadget_original[i], source, words};
+    }
+    {
+        uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
+        if (!bind_dart_target(can + 0x808, address, source, words)) return false;
+        prepared[2] = {address, reinterpret_cast<void *>(hc_gadget_span_entry),
+            &hc_gadget_original[2], source, words};
+        hc_gadget_span_continue = address + 16;
+        hc_gadget_span_reject = g_dart->load_base + can + 0x898;
+    }
+    hc_gadget_select_continue = prepared[0].address + 16;
+    hc_gadget_return_continue = prepared[1].address + 16;
+    hc_gadget_put_int = g_dart->load_base + va + home_layout::kGadgetPutIntOffset;
+    hc_gadget_common = g_dart->load_base + va + home_layout::kGadgetCommonOffset;
+    for (unsigned i = 0; i < 3; ++i) g_slots[kGadgetBridgeSlot + i] = prepared[i];
+    g_gadget_bound = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "Gadget12 serializer bridge bound; original putInt PC; Dart8; no heap writes");
+    return true;
+}
+
 size_t arm_hooks(std::vector<size_t> &order) {
+    (void) bind_gadget_bridge();
     size_t added = 0;
+    if (g_gadget_bound) for (unsigned i = 0; i < 3; ++i) {
+        const size_t slot = kGadgetBridgeSlot + i;
+        if (std::find(order.begin(), order.end(), slot) == order.end()) {
+            order.push_back(slot); ++added;
+        }
+    }
     if (g_title_custom_bound && std::find(order.begin(), order.end(), kTitleCustomSlot) == order.end()) {
         order.push_back(kTitleCustomSlot);
         ++added;
@@ -2129,6 +2210,11 @@ size_t arm_hooks(std::vector<size_t> &order) {
 void publish_indicator_dot_delta();
 
 size_t publish_hooks() {
+    __atomic_store_n(&hc_gadget_bridge_enabled,
+        uint32_t(g_gadget_requested.load(std::memory_order_acquire)
+            && g_slots[kGadgetBridgeSlot].registered
+            && g_slots[kGadgetBridgeSlot + 1].registered
+            && g_slots[kGadgetBridgeSlot + 2].registered), __ATOMIC_RELEASE);
     bool folder_ready = true;
     for (size_t i = 0; i < 5; ++i) folder_ready &= g_slots[kFolderGeometrySlotBase + i].registered;
     folder_ready &= g_slots[kKnobHookSlotBase + 2].registered
@@ -3101,6 +3187,13 @@ bool adopt_layout_state() {
     g_capacity_known = true;
     for (auto &word : g_capacity_words) word = {};
     g_widget_move_busy.clear(std::memory_order_release);
+    g_gadget_requested.store(false, std::memory_order_release);
+    g_gadget_bound = false;
+    hc_gadget_bridge_enabled = 0;
+    hc_gadget_original[0] = hc_gadget_original[1] = hc_gadget_original[2] = nullptr;
+    hc_gadget_span_continue = hc_gadget_span_reject = 0;
+    hc_gadget_put_int = hc_gadget_common = 0;
+    hc_gadget_select_continue = hc_gadget_return_continue = 0;
     g_widget_move_address = 0;
     g_widget_move_checked = g_widget_move_enabled = false;
     g_widget_move_known = true;

@@ -19,6 +19,9 @@ namespace hometweaks {
 namespace {
 
 const TargetFunction kTargets[] = {
+        {"AssistantDragDataHelper.putWidgetIntoBundle", "AssistantDragDataHelper.putWidgetIntoBundle", "OS4 Gadget 传输"},
+        {"GadgetInfoModel.cloneModel", "GadgetInfoModel.cloneModel", "OS4 Gadget 模型校验"},
+        {"BundleImpl.putInt", "BundleImpl.putInt", "OS4 Gadget 原序列化调用"},
         {"AssistantDragToPAHandler.canDragToPA", "AssistantDragToPAHandler.canDragToPA", "OS4 安卓小部件负一屏原逻辑"},
         {"AssistantDragToPAHandler._isSpanSupportedByPa", "AssistantDragToPAHandler._isSpanSupportedByPa", "OS4 小部件尺寸校验"},
         {"AssistantDragToPAHandler._ensureDragSessionId", "AssistantDragToPAHandler._ensureDragSessionId", "OS4 小部件交接校验"},
