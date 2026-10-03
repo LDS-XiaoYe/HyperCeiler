@@ -33,6 +33,122 @@
     ldp x9, x10, [x15], #16
 .endm
 
+/* No relocated Dart BL and no heap allocation. The original putInt BL and return PC
+ * retain their stack map. Both new routes rejoin the original serializer frame. */
+.globl hc_gadget_select_entry
+.p2align 4
+hc_gadget_select_entry:
+    dart_save
+    adrp x9, hc_gadget_bridge_enabled
+    add x9, x9, :lo12:hc_gadget_bridge_enabled
+    ldar w9, [x9]
+    cbz w9, 1f
+    cmp x1, #0x7f2
+    b.ne 1f
+    ldur x9, [x29, #-0x18]
+    mov x17, #0x11b
+    ldr w10, [x9, x17]
+    cmp w10, #24
+    b.ne 1f
+    ldur x10, [x9, #0x1f]
+    cmp x10, #1
+    b.ne 1f
+    ldur x10, [x9, #0x27]
+    cmp x10, #1
+    b.ne 1f
+    dart_restore
+    ldur x0, [x29, #-0x18]
+    ldur x1, [x29, #-0x10]
+    add x2, x27, #0x36, lsl #12
+    ldr x2, [x2, #0xff8] // Original widget_type pool entry.
+    mov x3, #0x1802
+    movk x3, #0x3086, lsl #16 // Smi(0x18430c01), not protocol type 5.
+    adrp x16, hc_gadget_put_int
+    ldr x16, [x16, :lo12:hc_gadget_put_int]
+    br x16 // Execute the original BL, not blr from module code.
+1:
+    dart_restore
+    cmp x1, #0x7ed
+    b.ne 2f
+    ldur x0, [x29, #-0x18]
+    ldur x1, [x29, #-0x10]
+    adrp x16, hc_gadget_select_continue
+    ldr x16, [x16, :lo12:hc_gadget_select_continue]
+    br x16
+2:
+    adrp x16, hc_gadget_common
+    ldr x16, [x16, :lo12:hc_gadget_common]
+    br x16
+
+.globl hc_gadget_return_entry
+.p2align 4
+hc_gadget_return_entry:
+    // putInt may GC: reload the original rooted model, never cache a heap pointer.
+    dart_save
+    ldur x9, [x29, #-0x18]
+    ldur x10, [x9, #-1]
+    ubfx x10, x10, #12, #20
+    cmp x10, #0x7f2
+    b.ne 3f
+    dart_restore
+    adrp x16, hc_gadget_common
+    ldr x16, [x16, :lo12:hc_gadget_common]
+    br x16
+3:
+    dart_restore
+    // Unchanged MaMl serialization, including its original Gadget id load.
+    ldur x0, [x29, #-0x18]
+    mov x17, #0x143
+    ldr w3, [x0, x17]
+    add x3, x3, x28, lsl #32
+    adrp x16, hc_gadget_return_continue
+    ldr x16, [x16, :lo12:hc_gadget_return_continue]
+    br x16
+
+/* Only the bridged Gadget12 bypasses unsupported 1x1; all other size results remain original.
+ * Original span BL has already returned: reload model through rooted handler +0x2b. */
+.globl hc_gadget_span_entry
+.p2align 4
+hc_gadget_span_entry:
+    dart_save
+    adrp x9, hc_gadget_bridge_enabled
+    add x9, x9, :lo12:hc_gadget_bridge_enabled
+    ldar w9, [x9]
+    cbz w9, 1f
+    ldur x9, [x29, #-0x18]
+    ldur w9, [x9, #0x2b]
+    add x9, x9, x28, lsl #32
+    ldur x10, [x9, #-1]
+    ubfx x10, x10, #12, #20
+    cmp x10, #0x7f2
+    b.ne 1f
+    mov x17, #0x11b
+    ldr w10, [x9, x17]
+    cmp w10, #24
+    b.ne 1f
+    ldur x10, [x9, #0x1f]
+    cmp x10, #1
+    b.ne 1f
+    ldur x10, [x9, #0x27]
+    cmp x10, #1
+    b.ne 1f
+    dart_restore
+    b 2f
+1:
+    dart_restore
+    tbnz w0, #4, 3f
+2:
+    ldur x0, [x29, #-8]
+    ldur x2, [x29, #-0x18]
+    mov x1, x0
+    adrp x16, hc_gadget_span_continue
+    ldr x16, [x16, :lo12:hc_gadget_span_continue]
+    br x16
+3:
+    adrp x16, hc_gadget_span_reject
+    ldr x16, [x16, :lo12:hc_gadget_span_reject]
+    br x16
+
 /*
  * capture_trampoline entry, original, object, hits
  *
