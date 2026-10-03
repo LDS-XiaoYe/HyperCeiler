@@ -156,7 +156,7 @@ const AIBinder_Class *window_class() {
  * are the minority.
  */
 constexpr char kCacheMagic[4] = {'H', 'C', 'L', 'C'};
-constexpr uint32_t kCacheVersion = 9;
+constexpr uint32_t kCacheVersion = 10;
 constexpr const char *kCachePath = "/data/user/0/com.miui.home/files/layout_config_cache.bin";
 constexpr const char *kCacheTmpPath = "/data/user/0/com.miui.home/files/layout_config_cache.bin.tmp";
 
@@ -206,6 +206,10 @@ void serialize_config(const Config &config, std::vector<uint8_t> &out) {
         }
     }
     put_u32(config.widget_allow_move ? 1U : 0U);
+    put_u32(kFolderLayoutMagic);
+    const auto &f = config.folder;
+    for (int value : {f.title_center, f.full_width, f.padding_enabled, f.phone_padding,
+            f.landscape_padding, f.portrait_padding, f.tablet}) put_u32(value);
 }
 
 bool parse_config(const std::vector<uint8_t> &data, Config &config) {
@@ -214,7 +218,7 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
     uint32_t version = 0;
     std::memcpy(&version, data.data() + 4, 4);
     if (version != 4 && version != 5 && version != 6 && version != 7 && version != 8
-        && version != kCacheVersion)
+        && version != 9 && version != kCacheVersion)
         return false;
     size_t at = 8;
     auto get_u32 = [&]() -> std::optional<uint32_t> {
@@ -284,6 +288,11 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
         if (!move || *move > 1) return false;
         config.widget_allow_move = *move != 0;
     }
+    config.folder = {};
+    if (version >= 10 && !read_folder_layout([&](int32_t &word) {
+            auto next = get_u32(); if (!next) return false;
+            word = static_cast<int32_t>(*next); return true;
+        }, config.folder, false)) return false;
     if (version >= 8 && at != data.size()) return false;
     return true;
 }
@@ -418,6 +427,9 @@ static bool query_binder(Config &result) {
             return AParcel_readInt32(output, &word) == STATUS_OK;
         }, candidate.widget_allow_move);
     } // Older endpoints default this new feature to off, never consume another field as a flag.
+    if (valid) valid = read_folder_layout([&](int32_t &word) {
+        return AParcel_readInt32(output, &word) == STATUS_OK;
+    }, candidate.folder);
     const auto flag = [](int32_t value) { return value == 0 || value == 1; };
     const auto within = [](int32_t value, int32_t lo, int32_t hi) {
         return value >= lo && value <= hi;

@@ -1245,3 +1245,205 @@ hc_layout_passthrough_entry:
     ldp x30, xzr, [x15], #16
     dart_restore
     ret
+
+
+/* Folder-layout original-code splices. Native helper never calls Dart, allocates,
+ * or holds a heap pointer. Each original GC return PC stays in libapp.so.
+ * All V registers and Dart scratch registers survive AAPCS; native SP remains16. */
+.macro folder_layout_splice kind
+.globl hc_folder_layout_\kind\()_entry
+.p2align 4
+hc_folder_layout_\kind\()_entry:
+    dart_save
+    adrp x9, hc_folder_layout_ready
+    add x9, x9, :lo12:hc_folder_layout_ready
+    ldar w9, [x9]
+    cbz w9, 1f
+    adrp x9, hc_folder_layout_requested
+    add x9, x9, :lo12:hc_folder_layout_requested
+    ldar x9, [x9]
+.if (\kind == 4) || (\kind == 5) || (\kind == 7)
+    tbz x9, #0, 1f
+.else
+    tbz x9, #1, 1f
+.endif
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, sp
+    mov x1, x27
+    mov w2, #\kind
+    lsl x3, x28, #32
+    bl hc_folder_layout_body
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    add sp, sp, #704
+    dart_restore
+
+.if (\kind == 1) || (\kind == 6)
+    // Helper replays the dynamically decoded original double load before adjusting it.
+    mov x15, x29
+    ldp x29, x30, [x15], #16
+    ret
+.elseif (\kind == 2) || (\kind == 3)
+    // Original freshly allocated Double store, common to fast and GC slow paths.
+    stur d0, [x0, #7]
+    mov x15, x29
+    ldp x29, x30, [x15], #16
+    ret
+.else
+    b 2f
+.endif
+1:
+    dart_restore
+2:
+    adrp x16, hc_folder_layout_original
+    add x16, x16, :lo12:hc_folder_layout_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+folder_layout_splice 0
+folder_layout_splice 1
+folder_layout_splice 2
+folder_layout_splice 3
+folder_layout_splice 4
+folder_layout_splice 5
+folder_layout_splice 6
+
+folder_layout_splice 7
+
+/* Final workspace row spacing: both fixed and variable paths, no Dart BL relocation. */
+.macro grid_autofit_splice kind
+.globl hc_grid_autofit_\kind\()_entry
+.p2align 4
+hc_grid_autofit_\kind\()_entry:
+    dart_save
+    adrp x9, hc_grid_autofit_ready
+    add x9, x9, :lo12:hc_grid_autofit_ready
+    ldar w9, [x9]
+    cbz w9, 1f
+    adrp x9, hc_grid_autofit_requested
+    add x9, x9, :lo12:hc_grid_autofit_requested
+    ldar w9, [x9]
+    tbz x9, #0, 1f
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, sp
+    mov x1, x29
+    mov w2, #\kind
+    bl hc_grid_autofit_body
+    str w0, [sp, #144]
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    ldr w16, [sp, #144]
+    add sp, sp, #704
+    dart_restore
+
+    cbz w16, 2f
+    adrp x16, hc_grid_autofit_resume
+    add x16, x16, :lo12:hc_grid_autofit_resume
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+1:
+    dart_restore
+2:
+    adrp x16, hc_grid_autofit_original
+    add x16, x16, :lo12:hc_grid_autofit_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+grid_autofit_splice 0
+grid_autofit_splice 1

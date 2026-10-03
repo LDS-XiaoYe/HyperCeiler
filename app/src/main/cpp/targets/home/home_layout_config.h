@@ -3,6 +3,7 @@
 
 #include "home_layout_knobs.h"
 #include "home_title_custom.h"
+#include "home_folder_layout.h"
 
 #include <array>
 
@@ -75,6 +76,7 @@ struct Config {
      */
     std::array<KnobConfig, HC_LAYOUT_KNOB_COUNT> knobs{};
     TweaksConfig tweaks{};
+    FolderLayoutConfig folder{};
     int title_desktop_sp = 12;
     int title_drawer_sp = 12;
     int title_color = -1;

@@ -3,6 +3,7 @@
 #include "home_title_render.h"
 #include "home_layout_knobs.h"
 #include "home_workspace_geometry.h"
+#include "home_grid_autofit.h"
 #include "home_folder_geometry.h"
 #include "home_drop_geometry.h"
 #include "home_indicator_pair.h"
@@ -79,6 +80,21 @@ bool dock_motion_screen_active();
  * and this keeps working.
  */
 extern "C" {
+void hc_grid_autofit_0_entry(); void hc_grid_autofit_1_entry();
+void *hc_grid_autofit_original[2]{};
+uintptr_t hc_grid_autofit_resume[2]{};
+uint32_t hc_grid_autofit_ready = 0, hc_grid_autofit_requested = 0;
+int hc_grid_autofit_body(uintptr_t saved, uintptr_t frame, unsigned kind);
+void hc_folder_layout_0_entry(); void hc_folder_layout_1_entry();
+void hc_folder_layout_2_entry(); void hc_folder_layout_3_entry();
+void hc_folder_layout_4_entry(); void hc_folder_layout_5_entry();
+void hc_folder_layout_6_entry();
+void hc_folder_layout_7_entry();
+void *hc_folder_layout_original[8]{};
+uint32_t hc_folder_layout_ready = 0;
+uint64_t hc_folder_layout_requested = 0;
+void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned kind, uintptr_t heap);
+
 void hc_gadget_select_entry();
 void hc_gadget_return_entry();
 void hc_gadget_span_entry();
@@ -262,7 +278,9 @@ constexpr size_t kDesktopTitleHeightSlot = kTitleLightSlot + 1;
 constexpr size_t kDrawerTitleHeightSlot = kDesktopTitleHeightSlot + 1;
 constexpr size_t kTitleCustomSlot = kDrawerTitleHeightSlot + 1;
 constexpr size_t kGadgetBridgeSlot = kTitleCustomSlot + 1;
-constexpr size_t kSlotCount = kGadgetBridgeSlot + 3;
+constexpr size_t kFolderLayoutSlotBase = kGadgetBridgeSlot + 3;
+constexpr size_t kGridAutofitSlotBase = kFolderLayoutSlotBase + 8;
+constexpr size_t kSlotCount = kGridAutofitSlotBase + 2;
 using Slot = nhk::InlineSlot<kPatchWords>;
 using Words = nhk::SlotWords<kPatchWords>;
 /* The companion slot's payload, declared here because `Words` only exists from this line down. */
@@ -292,7 +310,25 @@ uintptr_t g_title_component_method = 0, g_title_pin_method = 0;
 using CustomTitles = std::vector<home_title::CustomTitle>;
 std::shared_ptr<const CustomTitles> g_title_names;
 
+bool g_folder_layout_bound = false, g_folder_layout_checked = false;
+int g_folder_cell_width_field = -1, g_folder_gap_field = -1;
+int g_folder_screen_width_field = -1, g_folder_screen_height_field = -1;
+int g_folder_cling_width_field = -1;
+int g_folder_controller_config_field = -1, g_folder_rx_value_field = -1;
+uint32_t g_folder_center_pool = 0, g_folder_cross_center_pool = 0;
+uint32_t g_folder_alignment_start_pool = 0;
+int g_folder_enum_index_field = -1;
+
+bool g_grid_autofit_bound = false, g_grid_autofit_checked = false;
+home_layout::GridAutofitSites g_grid_autofit_fields;
+void sync_folder_layout(const home_layout::Config &config) {
+    __atomic_store_n(&hc_grid_autofit_requested,
+        config.grid_enabled ? (1u | (unsigned(config.cell_y) << 8)) : 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_folder_layout_requested,
+        home_layout::pack_folder_layout(config.folder, config.tweaks.folder_cols), __ATOMIC_RELEASE);
+}
 void sync_title_config(const home_layout::Config &config) {
+    sync_folder_layout(config);
     const auto previous = std::atomic_load_explicit(&g_title_names, std::memory_order_acquire);
     if (!previous || *previous != config.title_custom_labels) {
         std::atomic_store_explicit(&g_title_names, std::make_shared<const CustomTitles>(config.title_custom_labels),
@@ -1546,6 +1582,224 @@ void bind_indicator_dot_target() {
 home_layout::GridFieldOffsets g_grid_field{};
 void resolve_grid_fields(const char *symbol);
 
+// All original instructions are obtained from this APK, never a remembered patch VA.
+// Return-store splices leave Dart allocation and its slow-path return PC untouched.
+bool folder_layout_anchors(uint32_t grid, uint32_t cell, uint32_t config,
+        uint32_t cling, uint32_t top, const std::vector<uint32_t> &gb,
+        const std::vector<uint32_t> &cb, const std::vector<uint32_t> &wb,
+        const std::vector<uint32_t> &tb, int &gap, int &width, int &height,
+        home_layout::FolderReturnSite &cs, home_layout::FolderReturnSite &ws) {
+    if (gb.size() < 8 || gb[0] != kDartPrologue || gb[1] != 0xaa0f03fd
+        || gb[2] != 0xd10041ef || gb[3] != 0xf81f83a1
+        || !home_layout::folder_return_site(cb, 1, false, cs)) return false;
+    uint32_t target = 0;
+    // Getter is a configuration-derived scalar, not an arbitrary double in a closure.
+    if (cs.offset < 12 || !bl_target(cb[cs.offset / 4 - 3], cell + cs.offset - 12, &target)
+        || target != config || !is_ldur_word(cb[cs.offset / 4 - 2])
+        || rn(cb[cs.offset / 4 - 2]) != 0 || rt(cb[cs.offset / 4 - 2]) != 1
+        || cb[cs.offset / 4 - 1] != 0x8b1c8021) return false;
+    unsigned gaps = 0, widths = 0, heights = 0, pad_returns = 0;
+    for (size_t i = 0; i + 6 < gb.size(); ++i) {
+        if (!bl_target(gb[i], grid + uint32_t(i * 4), &target) || target != cell
+            || gb[i + 1] != 0xf85f03a1 || gb[i + 2] != 0x93417c30
+            || gb[i + 3] != 0x1e620201 || gb[i + 4] != 0x1e610802
+            || gb[i + 5] != 0xf85f83a2 || !is_ldur_double(gb[i + 6])
+            || rn(gb[i + 6]) != 2 || rt(gb[i + 6]) != 0) continue;
+        gap = imm9(gb[i + 6]); ++gaps;
+    }
+    for (size_t i = 0; i + 4 < wb.size(); ++i) {
+        if ((wb[i] & 0xffe00c1f) != 0xfc400000 || rn(wb[i]) != 0
+            || wb[i + 1] != 0xaa1d03ef || wb[i + 2] != 0xa8c179fd
+            || wb[i + 3] != 0xd65f03c0) continue;
+        // Screen-width return follows the named currentConfig call; tablet width is
+        // the other path and may reach the shared entry without a currentConfig BL.
+        if (i && bl_target(wb[i - 1], cling + uint32_t((i - 1) * 4), &target) && target == config) {
+            width = imm9(wb[i]); ++widths;
+        } else { ws = {uint32_t(i * 4), imm9(wb[i])}; ++pad_returns; }
+    }
+    for (size_t i = 0; i + 3 < tb.size(); ++i) {
+        if (!bl_target(tb[i], top + uint32_t(i * 4), &target) || target != config
+            || !is_ldur_double(tb[i + 1]) || rn(tb[i + 1]) != 0 || rt(tb[i + 1]) != 1
+            || tb[i + 2] != 0xf85f03a0 || (tb[i + 3] & 0xfff8001f) != 0x37200000) continue;
+        height = imm9(tb[i + 1]); ++heights;
+    }
+    return gaps == 1 && widths == 1 && heights == 1 && pad_returns == 1
+        && gap > 0 && gap <= 255 && (gap & 7) == 3
+        && width > 0 && height > 0 && width != height && ws.field > 0;
+}
+
+// BOTH fixed-row and variable-row paths converge here, AFTER the original max
+// height cap. Intercept final gap redistribution before GridInfo publication.
+bool bind_grid_autofit() {
+    if (g_grid_autofit_bound) return true;
+    if (g_grid_autofit_checked || !g_dart
+        || !__atomic_load_n(&hc_grid_autofit_requested, __ATOMIC_ACQUIRE)) return false;
+    const char *names[] = {"GridSizeCalRules._calVariableHeight", "GridSizeCalRules.calVarCellHeight",
+        "PhoneCellSizeHandler.calVariableValues"};
+    std::array<uint32_t, 3> va{}; std::array<std::vector<uint32_t>, 3> bodies;
+    for (size_t i = 0; i < 3; ++i) {
+        uint32_t size = 0;
+        if (!hometweaks::HomeTweaksFindSymbol(names[i], &va[i], &size)
+            || !dartscan::body(va[i], bodies[i])) return false;
+        if (i == 0) g_grid_autofit_checked = true;
+    }
+    if (bodies[0].size() < 4 || bodies[2].size() < 4
+        || bodies[0][0] != kDartPrologue || bodies[0][1] != 0xaa0f03fd
+        || bodies[0][2] != 0xd10101ef || bodies[0][3] != 0xaa0103e3
+        || bodies[2][0] != kDartPrologue || bodies[2][1] != 0xaa0f03fd
+        || bodies[2][2] != 0xd10241ef || bodies[2][3] != 0xf81f83a1) return false;
+    home_layout::GridAutofitSites fields;
+    if (!home_layout::grid_autofit_sites(bodies[0], bodies[1], bodies[2], fields)) return false;
+    unsigned cap_calls = 0;
+    for (size_t j = 0; j + 2 < bodies[0].size(); ++j) {
+        int32_t height = -1;
+        if (home_layout::dart_call_to(bodies[0][j], va[0] + uint32_t(j * 4), va[1])
+            && bodies[0][j + 1] == 0xf85f83a1
+            && home_layout::dart_ldur_d(bodies[0][j + 2], 1, 0, &height)
+            && height == fields.legacy_height) ++cap_calls;
+    }
+    if (cap_calls != 1) return false;
+    const uint32_t sites[] = {fields.legacy, fields.handler};
+    const void *entries[] = {reinterpret_cast<void *>(hc_grid_autofit_0_entry),
+        reinterpret_cast<void *>(hc_grid_autofit_1_entry)};
+    std::array<Slot, 2> prepared{};
+    for (size_t i = 0; i < 2; ++i) {
+        auto &slot = prepared[i];
+        if (!bind_dart_target(va[i ? 2 : 0] + sites[i], slot.address, slot.source, slot.original_words)) return false;
+        slot.replacement = const_cast<void *>(entries[i]); slot.original = &hc_grid_autofit_original[i];
+    }
+    g_grid_autofit_fields = fields;
+    for (size_t i = 0; i < 2; ++i) {
+        g_slots[kGridAutofitSlotBase + i] = prepared[i];
+        hc_grid_autofit_resume[i] = prepared[i].address + 16;
+    }
+    g_grid_autofit_bound = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "grid autofit original-code bank bound=2 after final cap; workspace fills; widths and stock dock preserved; Dart8");
+    return true;
+}
+
+bool bind_folder_layout() {
+    if (g_folder_layout_bound) return true;
+    if (g_folder_layout_checked) return false;
+    if (!g_dart || !(__atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE) & 3)) return false;
+    const char *names[] = {"FolderGridViewGetxController.calGridWidth",
+        "FolderGridViewGetxController.folderCellWidth",
+        "FolderGridViewGetxController.folderGridOuterHorizontalPadding",
+        "FolderGridViewGetxController.folderGridPaddingLeft",
+        "FolderHeaderWidget._buildText", "FolderHeaderWidget._buildEditor",
+        "FolderClingWidget.getFolderClingWidth",
+        "FolderClingGetxController._calcFolderPaddingTop",
+        "_FlutterTextViewState._resolveEffectiveTextAlign", "GridController.currentConfig",
+        "RxObjectMixin.value", "AndroidAttributeUtils.convertGravity", "Stack.updateRenderObject",
+        "_encodeParagraphStyle", "AndroidAttributeUtils.convertTextAlignment", "FolderHeaderWidget.build"};
+    std::array<uint32_t, 16> va{}; std::array<std::vector<uint32_t>, 16> bodies;
+    for (size_t i = 0; i < va.size(); ++i) {
+        uint32_t size = 0;
+        if (!hometweaks::HomeTweaksFindSymbol(names[i], &va[i], &size)
+            || !dartscan::body(va[i], bodies[i])) {
+            if (g_folder_layout_checked) __android_log_print(ANDROID_LOG_INFO, kTag,
+                "folder layout admission missing symbol/body=%s", names[i]);
+            return false;
+        }
+        if (i == 0) g_folder_layout_checked = true; // One admission per image, no repeated APK scans.
+    }
+    int gap = -1, width = -1, height = -1;
+    home_layout::FolderReturnSite cell, cling, outer, left;
+    if (!folder_layout_anchors(va[0], va[1], va[9], va[6], va[7],
+            bodies[0], bodies[1], bodies[6], bodies[7], gap, width, height, cell, cling)
+        || !home_layout::folder_return_site(bodies[2], 0, true, outer) || outer.field != 7
+        || !home_layout::folder_return_site(bodies[3], 0, true, left) || left.field != 7) return false;
+    // Both boxed padding values are freshly allocated Double objects. Check their tag
+    // and the original GC rejoin: the new stub must cover that shared store, not its predecessor.
+    for (size_t i : {size_t(2), size_t(3)}) {
+        uint32_t tag = 0;
+        if (!dartscan::unique_sequence(bodies[i], std::array<uint32_t, 3>{0xd29c2b81,
+                0xf2a00061, 0xf81ff001}.data(), 3, &tag)) return false;
+        const uint32_t store = i == 2 ? outer.offset : left.offset;
+        if (tag + 12 != store) return false;
+        unsigned rejoin = 0;
+        for (size_t j = store / 4 + 4; j < bodies[i].size(); ++j)
+            if ((bodies[i][j] & 0xfc000000) == 0x14000000
+                && int64_t(va[i] + j * 4) + int64_t(home_layout::bl_imm_words(bodies[i][j])) * 4
+                    == va[i] + store) ++rejoin;
+        if (rejoin != 1) return false;
+    }
+    uint32_t center = 0, independent_center = 0;
+    if (!home_layout::folder_center_pool(bodies[8], center)
+        || !home_layout::folder_text_alignment_center_pool(bodies[14], independent_center)
+        || center != independent_center) return false;
+    // Admit Text and TextField's local TextAlign store with their own surrounding ABI.
+    uint32_t text = 0, editor = 0;
+    if (!dartscan::site(va[4], {0xb801b001, 0x9141c361, 0xf9421021, 0xb802b001}, &text)
+        || !dartscan::site(va[5], {0xb805b001, 0x9142cf61, 0xf940d421, 0xb805f001}, &editor)
+        || text < 4 || editor < 4
+        || (bodies[4][text / 4 - 1] & 0xffc003ff) != 0xf9400361
+        || bodies[4][text / 4 - 1] != bodies[5][editor / 4 - 1]) return false;
+    // The header has nested Stacks, not a Column. Its outer Stack anchors the
+    // intrinsic-width text; #1b is Clip.hardEdge and must never receive an enum.
+    uint32_t cross = 0, column = 0, stack_field = 0, start_pool = 0;
+    if (!home_layout::folder_stack_center_pool(bodies[11], cross)
+        || !dartscan::site(va[15], {0xb800f001, 0x91409761, 0xf9404821, 0xb8017001}, &column)
+        || column < 8 || !dartscan::site(va[12],
+            {0xb840f002, 0x8b1c8042, 0xf85e83a1}, &stack_field)) return false;
+    const auto &header = bodies[15];
+    if ((header[column/4-2] & 0xffc003ff) != 0x91400361
+        || (header[column/4-1] & 0xffc003ff) != 0xf9400021) return false;
+    start_pool = ((header[column/4-2] >> 10) & 4095) * 4096
+        + ((header[column/4-1] >> 10) & 4095) * 8;
+    // The named paragraph encoder forwards TextAlign.index into its Int32 data;
+    // there is no Smi shift here. Enum.index is an UNBOXED 64-bit int, not a Smi.
+    unsigned index_hits = 0; int index_field = -1;
+    for (size_t j = 0; j + 2 < bodies[13].size(); ++j) {
+        const auto &w = bodies[13];
+        if ((w[j] & 0xffe00fff) == 0xf8400022 && w[j + 1] == 0x93407c42
+            && w[j + 2] == 0xb801b002) { index_field = imm9(w[j]); ++index_hits; }
+    }
+    if (index_hits != 1 || index_field <= 0 || index_field > 255) return false;
+    int controller_config = -1, rx_value = -1; unsigned rx_calls = 0, values = 0;
+    for (size_t j = 2; j < bodies[9].size(); ++j) {
+        uint32_t target = 0;
+        if (bl_target(bodies[9][j], va[9] + uint32_t(j * 4), &target) && target == va[10]
+            && is_ldur_word(bodies[9][j - 2]) && rn(bodies[9][j - 2]) == 0
+            && rt(bodies[9][j - 2]) == 1 && bodies[9][j - 1] == 0x8b1c8021) {
+            controller_config = imm9(bodies[9][j - 2]); ++rx_calls;
+        }
+    }
+    for (size_t j = 0; j + 4 < bodies[10].size(); ++j) {
+        if (is_ldur_word(bodies[10][j]) && rn(bodies[10][j]) == 1 && rt(bodies[10][j]) == 0
+            && bodies[10][j + 1] == 0x8b1c8000 && bodies[10][j + 2] == 0xf9402370
+            && bodies[10][j + 3] == 0x6b10001f
+            && (bodies[10][j + 4] & 0xff00001f) == 0x54000000) {
+            rx_value = imm9(bodies[10][j]); ++values;
+        }
+    }
+    if (rx_calls != 1 || values != 1 || controller_config <= 0 || rx_value <= 0) return false;
+    const uint32_t offsets[] = {0, cell.offset, outer.offset, left.offset, text, editor, cling.offset, column};
+    const void *entries[] = {reinterpret_cast<void *>(hc_folder_layout_0_entry),
+        reinterpret_cast<void *>(hc_folder_layout_1_entry), reinterpret_cast<void *>(hc_folder_layout_2_entry),
+        reinterpret_cast<void *>(hc_folder_layout_3_entry), reinterpret_cast<void *>(hc_folder_layout_4_entry),
+        reinterpret_cast<void *>(hc_folder_layout_5_entry), reinterpret_cast<void *>(hc_folder_layout_6_entry), reinterpret_cast<void *>(hc_folder_layout_7_entry)};
+    std::array<Slot, 8> prepared{};
+    for (size_t i = 0; i < prepared.size(); ++i) {
+        auto &slot = prepared[i];
+        if (!bind_dart_target(va[i == 7 ? 15 : i] + offsets[i], slot.address, slot.source, slot.original_words)) return false;
+        slot.replacement = const_cast<void *>(entries[i]); slot.original = &hc_folder_layout_original[i];
+    }
+    g_folder_cell_width_field = cell.field; g_folder_gap_field = gap;
+    g_folder_screen_width_field = width; g_folder_screen_height_field = height;
+    g_folder_controller_config_field = controller_config; g_folder_rx_value_field = rx_value;
+    g_folder_cling_width_field = cling.field; g_folder_center_pool = center; g_folder_cross_center_pool = cross;
+    g_folder_alignment_start_pool = start_pool;
+    g_folder_enum_index_field = index_field;
+    for (size_t i = 0; i < prepared.size(); ++i) g_slots[kFolderLayoutSlotBase + i] = prepared[i];
+    g_folder_layout_bound = true;
+    __android_log_print(ANDROID_LOG_INFO, kTag,
+        "folder layout original-code bank bound=8 fields=%d/%d/%d/%d center_pool=%x; no GC BL relocation; Dart8",
+        cell.field, gap, width, height, center);
+    return true;
+}
+
 void bind_folder_geometry() {
     resolve_grid_fields(home_layout::kDropGeometrySymbol);
     if (!g_grid_field.usable()) return;
@@ -2390,8 +2644,25 @@ bool bind_gadget_bridge() {
 }
 
 size_t arm_hooks(std::vector<size_t> &order) {
+    const bool autofit_was_checked = g_grid_autofit_checked;
+    (void) bind_grid_autofit();
+    if (!autofit_was_checked && g_grid_autofit_checked && !g_grid_autofit_bound)
+        __android_log_print(ANDROID_LOG_WARN, kTag, "grid autofit original-code guard declined image; stock retained");
+    const bool folder_was_checked = g_folder_layout_checked;
+    (void) bind_folder_layout();
+    if (!folder_was_checked && g_folder_layout_checked && !g_folder_layout_bound)
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout original-code guard declined this launcher image; stock layout retained");
     (void) bind_gadget_bridge();
     size_t added = 0;
+    if (g_grid_autofit_bound) for (size_t i = 0; i < 2; ++i) {
+        const size_t index = kGridAutofitSlotBase + i;
+        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); ++added; }
+    }
+    if (g_folder_layout_bound) for (size_t i = 0; i < 8; ++i) {
+        const size_t index = kFolderLayoutSlotBase + i;
+        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); ++added; }
+    }
     if (g_gadget_bound) for (unsigned i = 0; i < 3; ++i) {
         const size_t slot = kGadgetBridgeSlot + i;
         if (std::find(order.begin(), order.end(), slot) == order.end()) {
@@ -2506,6 +2777,12 @@ size_t arm_hooks(std::vector<size_t> &order) {
 void publish_indicator_dot_delta();
 
 size_t publish_hooks() {
+    bool autofit_ready = g_grid_autofit_bound;
+    for (size_t i = 0; i < 2; ++i) autofit_ready &= g_slots[kGridAutofitSlotBase + i].registered;
+    __atomic_store_n(&hc_grid_autofit_ready, autofit_ready ? 1u : 0u, __ATOMIC_RELEASE);
+    bool folder_layout_ready = g_folder_layout_bound;
+    for (size_t i = 0; i < 8; ++i) folder_layout_ready &= g_slots[kFolderLayoutSlotBase + i].registered;
+    __atomic_store_n(&hc_folder_layout_ready, folder_layout_ready ? 1u : 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&hc_gadget_bridge_enabled,
         uint32_t(g_gadget_requested.load(std::memory_order_acquire)
             && g_slots[kGadgetBridgeSlot].registered
@@ -2745,7 +3022,8 @@ void *worker(void *) {
         || config.tweaks.fold_enabled || config.tweaks.icon_scale_enabled
         || config.tweaks.recents_hide_clear || config.tweaks.recents_no_clear
         || config.tweaks.animation_open_enabled || config.tweaks.animation_recents_enabled
-        || config.tweaks.hotseat_unlimited || config.widget_allow_move;
+        || config.tweaks.hotseat_unlimited || config.widget_allow_move
+        || config.folder.full_width || config.folder.title_center;
     if (!config.grid_enabled && !any_knob && !top_probe && !any_tweak
         && g_title_desktop_sp.load(std::memory_order_acquire) == 12
         && g_title_drawer_sp.load(std::memory_order_acquire) == 12
@@ -3237,6 +3515,8 @@ void *worker(void *) {
             }
         }
         if (!live) {
+            __atomic_store_n(&hc_grid_autofit_ready, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&hc_folder_layout_ready, 0u, __ATOMIC_RELEASE);
             g_ready.store(false, std::memory_order_release);
             g_dart_ready.store(false, std::memory_order_release);
             g_captures_armed = false;
@@ -3247,6 +3527,96 @@ void *worker(void *) {
     }
 }
 } // namespace
+
+// Scalar stores within the original owning calculation, not a saved heap
+// pointer or an already-published GridInfo. No Dart calls/GC, polling or allocation.
+extern "C" int hc_grid_autofit_body(uintptr_t saved, uintptr_t frame, unsigned kind) {
+    const uint32_t requested = __atomic_load_n(&hc_grid_autofit_requested, __ATOMIC_ACQUIRE);
+    if (!saved || !frame || kind >= 2 || !(requested & 1)) return 0;
+    const auto &f = g_grid_autofit_fields;
+    auto u64 = [](uintptr_t p) { uint64_t v; std::memcpy(&v, reinterpret_cast<const void *>(p), 8); return v; };
+    auto num = [](uintptr_t p) { double v; std::memcpy(&v, reinterpret_cast<const void *>(p), 8); return v; };
+    auto put = [](uintptr_t p, auto v) { std::memcpy(reinterpret_cast<void *>(p), &v, sizeof(v)); };
+    const auto q = [&](unsigned n) { return saved + 160 + n * 16; };
+    const uintptr_t owner = u64(frame - 8);
+    if ((owner & 7) != 1) return 0;
+    const int64_t rows = kind == 0 ? int64_t(u64(saved)) - 1 : int64_t(u64(owner + f.rows));
+    const uintptr_t box = kind == 1 ? u64(saved) : 0;
+    if (kind == 1 && (box & 7) != 1) return 0;
+    const double base_width = kind == 0 ? num(frame - 0x30) - num(frame - 0x38) : num(owner + f.width);
+    const double remaining = kind == 0 ? num(frame - 0x28) : num(box + 7);
+    const double dock_height = num(owner + (kind == 0 ? f.legacy_dock : f.dock));
+    double height = 0;
+    if (!home_layout::grid_autofit_height(base_width, remaining, dock_height, rows, requested >> 8, height)) return 0;
+    put(owner + (kind == 0 ? f.legacy_height : f.height), height);
+    // The original cap assumed row/dock heights grew together (rows+1). Rejoin
+    // its original redistribution with ZERO leftover, preserving the stock dock.
+    put(q(0), remaining); put(q(0) + 8, uint64_t{0});
+    put(q(1), kind == 0 ? 0.0 : remaining); put(q(1) + 8, uint64_t{0});
+    put(q(2), kind == 0 ? remaining : 0.0); put(q(2) + 8, uint64_t{0});
+    return 1;
+}
+
+// UI-isolate-local native scalars only. No captured Dart pointer outlives a callback.
+static thread_local double folder_layout_gap = 0;
+static thread_local bool folder_layout_gap_valid = false;
+extern "C" void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned kind, uintptr_t heap) {
+    if (kind >= 8 || !saved) return;
+    auto read64 = [](uintptr_t at) { uint64_t value = 0; std::memcpy(&value, reinterpret_cast<const void *>(at), 8); return value; };
+    auto scalar = [](uintptr_t at) { double value = 0; std::memcpy(&value, reinterpret_cast<const void *>(at), 8); return value; };
+    const uintptr_t object = read64(saved), argument = read64(saved + 8);
+    const uint64_t packed = __atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE);
+    const bool wide = (packed & 2) != 0;
+    const uintptr_t d0 = saved + 160;
+    if (kind == 1 || kind == 6) {
+        const uint64_t zero = 0; // Original LDUR D0 clears V0's upper64.
+        std::memcpy(reinterpret_cast<void *>(d0 + 8), &zero, 8);
+    }
+    if (kind == 0) {
+        folder_layout_gap = scalar(argument + g_folder_gap_field);
+        folder_layout_gap_valid = std::isfinite(folder_layout_gap) && folder_layout_gap >= 0 && folder_layout_gap <= 200;
+    } else if (kind == 1) {
+        double value = scalar(argument + g_folder_cell_width_field);
+        if (wide && folder_layout_gap_valid) value = home_layout::folder_cell_width(value,
+            scalar(object + g_folder_screen_width_field), scalar(object + g_folder_screen_height_field),
+            folder_layout_gap, packed);
+        std::memcpy(reinterpret_cast<void *>(d0), &value, 8);
+    } else if (kind == 2 || kind == 3) {
+        if (wide && folder_layout_gap_valid) { const double zero = 0; std::memcpy(reinterpret_cast<void *>(d0), &zero, 8); }
+    } else if (kind == 6) {
+        double value = scalar(object + g_folder_cling_width_field);
+        uintptr_t config = 0;
+        uint32_t rx = 0, root = 0;
+        std::memcpy(&rx, reinterpret_cast<const void *>(object + g_folder_controller_config_field), 4);
+        if ((rx & 7) == 1 && (!pool || rx != uint32_t(read64(pool + 0x40)))) {
+            std::memcpy(&root, reinterpret_cast<const void *>((heap & ~uint64_t{0xffffffff}) + rx + g_folder_rx_value_field), 4);
+            if ((root & 7) == 1 && (!pool || root != uint32_t(read64(pool + 0x40)))) config = (heap & ~uint64_t{0xffffffff}) + root;
+        }
+        const double width = config ? scalar(config + g_folder_screen_width_field) : 0;
+        if (wide && std::isfinite(width) && width >= 100 && width <= 4000) value = width;
+        std::memcpy(reinterpret_cast<void *>(d0), &value, 8);
+    } else if (kind == 7 && (packed & 1) && pool) {
+        const uintptr_t start = read64(pool + g_folder_alignment_start_pool);
+        const uintptr_t center = read64(pool + g_folder_cross_center_pool);
+        // Only this freshly constructed header receives a new GC-rooted alignment.
+        // Clip.hardEdge and StackFit.loose are replayed exactly as originally stored.
+        if (argument == start && (start & 7) == 1 && (center & 7) == 1
+            && scalar(start + 7) == -1.0 && scalar(start + 15) == -1.0
+            && scalar(center + 7) == 0.0 && scalar(center + 15) == 0.0)
+            std::memcpy(reinterpret_cast<void *>(saved + 8), &center, 8);
+    } else if ((packed & 1) && pool) {
+        const uintptr_t center = read64(pool + (kind == 7 ? g_folder_cross_center_pool : g_folder_center_pool));
+        // Pool entries are GC roots; reread on every build. The enums must share their
+        // class, with index start=4 and center=2. No pool scan, allocation or constant writes.
+        uint64_t start_index = 0, center_index = 0;
+        if ((argument & 7) == 1 && (center & 7) == 1
+            && ((read64(argument - 1) >> 12) & 0xfffff) == ((read64(center - 1) >> 12) & 0xfffff)) {
+            std::memcpy(&start_index, reinterpret_cast<const void *>(argument + g_folder_enum_index_field), 8);
+            std::memcpy(&center_index, reinterpret_cast<const void *>(center + g_folder_enum_index_field), 8);
+            if ((kind == 7 ? start_index <= 4 : start_index == 4) && center_index == 2) std::memcpy(reinterpret_cast<void *>(saved + 8), &center, 8);
+        }
+    }
+}
 
 extern "C" uint64_t hc_title_custom_label(uint64_t original, uint64_t model, uint64_t heap,
     uint64_t thread, uint64_t dispatch, uint64_t null_object, uint32_t site) {
@@ -3541,6 +3911,19 @@ bool adopt_layout_state() {
     for (size_t i = 0; i < 2; ++i) {
         hc_layout_drop_resume[i] = 0; hc_layout_drop_hits[i] = 0; hc_layout_drop_original[i] = nullptr;
     }
+    g_grid_autofit_bound = g_grid_autofit_checked = false;
+    g_grid_autofit_fields = {};
+    __atomic_store_n(&hc_grid_autofit_ready, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_grid_autofit_requested, 0u, __ATOMIC_RELEASE);
+    for (size_t i = 0; i < 2; ++i) { hc_grid_autofit_original[i] = nullptr; hc_grid_autofit_resume[i] = 0; }
+    g_folder_layout_bound = g_folder_layout_checked = false;
+    __atomic_store_n(&hc_folder_layout_ready, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&hc_folder_layout_requested, uint64_t{0}, __ATOMIC_RELEASE);
+    g_folder_cell_width_field = g_folder_gap_field = -1;
+    g_folder_screen_width_field = g_folder_screen_height_field = g_folder_cling_width_field = -1;
+    g_folder_center_pool = g_folder_cross_center_pool = g_folder_alignment_start_pool = 0;
+    g_folder_controller_config_field = g_folder_rx_value_field = g_folder_enum_index_field = -1;
+    for (auto &original : hc_folder_layout_original) original = nullptr;
     g_probe_primed = false;
     g_hook_globals_inited = false;
     init_knob_hooks();
