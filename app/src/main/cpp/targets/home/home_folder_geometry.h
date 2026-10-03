@@ -3,23 +3,31 @@
 #include "home_workspace_geometry.h"
 
 namespace home_layout {
-// Five original-body windows, after currentConfig returns and before any
-// edit-mode transform or Dart allocator. Never replace a getter's return.
+/*
+ * Five original-body splice points, after currentConfig returns and before any edit-mode
+ * transform or Dart allocator. Never replace a getter's return.
+ *
+ * `offset` is not stored. It used to be, and that made a fixed position the identity of the
+ * site: the same four-word run sits at a different offset in each body it appears in, so the
+ * number named a function rather than a place, and a launcher that inserted a check above one
+ * of them would have had the hook applied to whatever moved into that slot. The run alone
+ * identifies the site -- it is unique in every body it occurs in -- so the offset is looked up
+ * at bind time and the body is admitted only when exactly one place matches.
+ */
 struct FolderGeometrySite {
     const char *symbol;
-    uint32_t size, offset;
     uint32_t words[4];
 };
 inline constexpr FolderGeometrySite kFolderGeometrySites[] = {
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x128,
+    {"WidgetPositionUtil.getCellPosition",
         {0xb843b001, 0x8b1c8021, 0xfc407020, 0xf85f83a0}},
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x1cc,
+    {"WidgetPositionUtil.getCellPosition",
         {0x9e620000, 0xfc5d83a1, 0x1e610802, 0xfc407020}},
-    {"FolderIconGetxController.calOriginPreviewIconLoc", 0x2a4, 0x11c,
+    {"FolderIconGetxController.calOriginPreviewIconLoc",
         {0xb843b001, 0x8b1c8021, 0xfc407020, 0xf85f83a1}},
-    {"FolderIconGetxController.calOriginPreviewIconLoc", 0x2a4, 0x1d4,
+    {"FolderIconGetxController.calOriginPreviewIconLoc",
         {0x9e620060, 0xfc5e03a1, 0x1e610802, 0xfc407020}},
-    {"WidgetPositionUtil.getCellPosition", 0x204, 0x140,
+    {"WidgetPositionUtil.getCellPosition",
         {0x1e620823, 0x1e632801, 0x4ea11c20, 0xf85e83a1}},
 };
 
@@ -81,13 +89,15 @@ inline constexpr uint32_t kFolderSizeOriginal[] = {
 };
 
 inline bool folder_grid_geometry(uintptr_t grid, double top, double bottom,
-    double side, double *g, const WorkspaceRenderSnapshot *rendered = nullptr) {
-    const int64_t columns = workspace_read<int64_t>(grid, 0x1b);
-    const int64_t rows = workspace_read<int64_t>(grid, 0x23);
+    double side, double *g, const WorkspaceRenderSnapshot *rendered,
+    const GridFieldOffsets *field) {
+    if (!field || !field->usable()) return false;
+    const int64_t columns = workspace_read<int64_t>(grid, field->columns);
+    const int64_t rows = workspace_read<int64_t>(grid, field->rows);
     if (rows < 2) return false;
     g[0] = g[1] = 0;
-    g[2] = workspace_read<double>(grid, 0x2b);
-    g[3] = workspace_read<double>(grid, 0x33);
+    g[2] = workspace_read<double>(grid, field->cell_width);
+    g[3] = workspace_read<double>(grid, field->cell_height);
     if (rendered && rendered->geometry(grid, columns, rows, g[2], g[3], g)) return true;
     return inset_workspace(g, columns, rows, top, bottom, side);
 }
@@ -98,7 +108,8 @@ inline bool folder_grid_geometry(uintptr_t grid, double top, double bottom,
 // lanes retain their original contents (LDUR D clears the upper 64 bits).
 inline bool folder_geometry_body(uintptr_t fp, uint64_t heap,
     uintptr_t saved, unsigned kind, double top, double bottom, double side,
-    WorkspaceRenderSnapshot *rendered = nullptr) {
+    WorkspaceRenderSnapshot *rendered = nullptr, const GridFieldOffsets *field = nullptr) {
+    if (!field || !field->usable()) return false;
     const uintptr_t x0 = workspace_read<uintptr_t>(saved, 0);
     const auto d = [saved](int n, double v, bool clear = true) {
         workspace_write(saved, 160 + n * 16, v);
@@ -107,9 +118,9 @@ inline bool folder_geometry_body(uintptr_t fp, uint64_t heap,
     bool valid = false;
     if (kind == 0) {
         // +128: origin pointer, decompression, origin.x, saved column.
-        const uintptr_t origin = workspace_read<uint32_t>(x0, 0x3b) + (heap << 32);
+        const uintptr_t origin = workspace_read<uint32_t>(x0, field->origin) + (heap << 32);
         double g[4];
-        valid = folder_grid_geometry(x0, top, bottom, side, g, rendered);
+        valid = folder_grid_geometry(x0, top, bottom, side, g, rendered, field);
         workspace_write(saved, 8, origin);
         d(0, workspace_read<double>(origin, 7) + (valid ? g[0] : 0));
         workspace_write(saved, 0, workspace_read<uintptr_t>(fp, -8));
@@ -144,8 +155,8 @@ inline bool folder_geometry_body(uintptr_t fp, uint64_t heap,
         valid = true;
     } else if (kind == 2) {
         // calOriginPreviewIconLoc +11c, not the rendered folder widget size.
-        const uintptr_t origin = workspace_read<uint32_t>(x0, 0x3b) + (heap << 32);
-        double g[4]; valid = folder_grid_geometry(x0, top, bottom, side, g, rendered);
+        const uintptr_t origin = workspace_read<uint32_t>(x0, field->origin) + (heap << 32);
+        double g[4]; valid = folder_grid_geometry(x0, top, bottom, side, g, rendered, field);
         if (rendered) rendered->begin_preview(fp, valid ? g[1] : 0);
         workspace_write(saved, 8, workspace_read<uintptr_t>(fp, -8));
         d(0, workspace_read<double>(origin, 7) + (valid ? g[0] : 0));

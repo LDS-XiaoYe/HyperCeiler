@@ -31,6 +31,9 @@ public:
 
     bool Find(const char* needle, uint32_t* va, uint32_t* size) const;
 
+    /* Distance to the next function in the complete ELF symbol table, not the target whitelist. */
+    bool SpanFrom(uint32_t va, uint32_t* span) const;
+
     bool Has(const char* needle) const;
 
     void ResetForTest();
@@ -44,6 +47,7 @@ private:
     char status_[192]{};
     uint32_t va_[kMaxTargetSlots]{};
     uint32_t size_[kMaxTargetSlots]{};
+    uint32_t span_[kMaxTargetSlots]{};
     bool has_[kMaxTargetSlots]{};
 };
 

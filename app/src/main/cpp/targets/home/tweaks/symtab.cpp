@@ -10,6 +10,8 @@
 #include <string.h>
 
 #include <vector>
+#include <algorithm>
+#include <limits>
 
 extern "C" {
 #include "xz/xz.h"
@@ -46,6 +48,7 @@ const TargetFunction kTargets[] = {
         {"ShortcutIconWidget._addNewInstallLight", "ShortcutIconWidget._addNewInstallLight", "OS4 新安装光效"},
         {"WidgetPositionUtil.getCellPosition", "WidgetPositionUtil.getCellPosition", "OS4 文件夹动画坐标原逻辑"},
         {"FolderIconGetxController.calOriginPreviewIconLoc", "FolderIconGetxController.calOriginPreviewIconLoc", "OS4 文件夹动画尺寸原逻辑"},
+        {"CellLayoutGetxController.isItemPosEmpty", "CellLayoutGetxController.isItemPosEmpty", "OS4 grid count bounds receiver"},
         {"CellLayoutGetxController.calculateCenterGlobalPosition", "CellLayoutGetxController.calculateCenterGlobalPosition", "OS4 拖放回位中心原逻辑"},
         // OS4 original-body splice/branch guards. Registration does not hook getters.
         {"HotSeatLayoutDelegate.cellLayout", "HotSeatLayoutDelegate.cellLayout", "OS4 原逻辑注入校验"},
@@ -53,6 +56,7 @@ const TargetFunction kTargets[] = {
         {"LauncherIndicatorState.isInEditing", "LauncherIndicatorState.isInEditing", "OS4 原逻辑注入校验"},
         {"LauncherIndicatorState._showIndicator", "LauncherIndicatorState._showIndicator", "OS4 原逻辑注入校验"},
         {"LauncherIndicatorState._animateIndicator", "LauncherIndicatorState._animateIndicator", "OS4 原逻辑注入校验"},
+        {"LauncherIndicatorState._getCurrentIndicatorType", "LauncherIndicatorState._getCurrentIndicatorType", "OS4 idle indicator type producer"},
         {"LauncherIndicatorState._refreshIndicator", "LauncherIndicatorState._refreshIndicator", "OS4 原逻辑注入校验"},
         {"HotseatLayerGetxController._isSeatsFull", "HotseatLayerGetxController._isSeatsFull", "OS4 原逻辑注入校验"},
         {"HotseatDragHandler._isSeatsFull", "HotseatDragHandler._isSeatsFull", "OS4 原逻辑注入校验"},
@@ -420,6 +424,8 @@ void SymbolIndex::ResetForTest() {
     foundCount_ = 0;
     status_[0] = '\0';
     memset(has_, 0, sizeof(has_));
+    memset(span_, 0, sizeof(span_));
+    attempted_ = false;
 }
 
 bool SymbolIndex::Has(const char* needle) const {
@@ -438,6 +444,18 @@ bool SymbolIndex::Find(const char* needle, uint32_t* va, uint32_t* size) const {
         if (va != nullptr) *va = va_[i];
         if (size != nullptr) *size = size_[i];
         return true;
+    }
+    return false;
+}
+
+// A whitelist neighbour is not a function boundary: retain bounds from all STT_FUNC entries.
+bool SymbolIndex::SpanFrom(uint32_t va, uint32_t* span) const {
+    if (!loaded_ || va == 0 || span == nullptr) return false;
+    for (size_t i = 0; i < kTargetCount; ++i) {
+        if (has_[i] && va_[i] == va && span_[i] >= 4) {
+            *span = span_[i];
+            return true;
+        }
     }
     return false;
 }
@@ -565,7 +583,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     for (uint32_t i = 0; i < count; ++i) {
         const Elf64_Sym& sym = syms[i];
         if (sym.st_shndx != SHN_UNDEF && sym.st_value != 0 &&
-            ELF64_ST_TYPE(sym.st_info) == STT_FUNC) {
+            ELF64_ST_TYPE(sym.st_info) == STT_FUNC && sym.st_value <= UINT32_MAX) {
             textVas.push_back(static_cast<uint32_t>(sym.st_value));
         }
         if (sym.st_name == 0 || sym.st_value == 0) continue;
@@ -582,8 +600,12 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
         }
     }
 
+    std::sort(textVas.begin(), textVas.end());
+    textVas.erase(std::unique(textVas.begin(), textVas.end()), textVas.end());
     for (size_t t = 0; t < kTargetCount; ++t) {
         if (!has_[t]) continue;
+        const auto next_function = std::upper_bound(textVas.begin(), textVas.end(), va_[t]);
+        if (next_function != textVas.end()) span_[t] = *next_function - va_[t];
         if (size_[t] == 0) {
             uint32_t next = 0;
             for (uint32_t candidate : textVas) {
