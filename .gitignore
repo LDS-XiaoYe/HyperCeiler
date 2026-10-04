@@ -14,11 +14,16 @@ local.properties
 /app/canary
 /app/debug
 signing.properties
+*.keystore
+*.jks
 /.kotlin
 /library/hook
 *.apk
 /handover/
 /.workbuddy/
+
+# Python bytecode from the tests/ verification scripts.
+__pycache__/
 
 # AI agent working conventions (kept locally, not tracked)
 AGENTS.md

@@ -129,6 +129,11 @@ const TargetFunction kTargets[] = {
          "GridController.workspaceIndicatorMarginBottom", "布局 指示器底部边距(上游)"},
         {"_CapsuleIndicatorState.build", "_CapsuleIndicatorState.build", "布局 胶囊组件构建探针"},
         {"Container.build", "Container.build", "布局 胶囊外边距字段布局校验"},
+        // Slot 7 reads Container.padding from the function that actually consumes it,
+        // rather than trusting Container.build's own read set - `Container.build`
+        // delegates padding at the end, so the field is only visible downstream.
+        {"Container._paddingIncludingDecoration", "Container._paddingIncludingDecoration",
+         "布局 Container.padding 字段消费侧校验"},
         {"LauncherIndicatorState.build", "LauncherIndicatorState.build",
          "布局 胶囊第三动画包装调用点"},
         {"Padding.createRenderObject", "Padding.createRenderObject",
