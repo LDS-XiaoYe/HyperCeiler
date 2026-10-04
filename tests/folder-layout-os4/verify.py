@@ -50,9 +50,9 @@ pre+='bool production_accept(const char*n,uint32_t va,uint32_t size){if(!images.
 for n in ['bool is_ldur_double(', 'bool is_ldur_word(', 'int imm9(', 'uint32_t rn(', 'uint32_t rt(', 'bool bl_target(uint32_t word, uint32_t pc, uint32_t *target) {']:pre+=fun(src,n)+'\n'
 pre+='namespace dartscan { bool function_span(uint32_t va,uint32_t*out){if(!images.count(va))return false;*out=images[va].size()*4;return true;}\n'
 for n in ['bool unique_sequence(', 'bool body(uint32_t va', 'bool site(uint32_t va, std::span', 'bool site(uint32_t va, std::initializer_list']:pre+=fun(src,n)+'\n'
-pre+='}\nconstexpr uint32_t kDartPrologue=0xa9bf79fd;constexpr int ANDROID_LOG_INFO=4;const char*kTag="test";int __android_log_print(int,const char*,const char*,...){return 0;}\n'
-pre+='namespace nhk{struct CodeSource{};}using Words=std::array<uint32_t,4>;struct Slot{uintptr_t address=0;void*replacement=nullptr;void**original=nullptr;nhk::CodeSource source;Words original_words{};bool registered=false;};\nstruct Dart{uintptr_t load_base=0x100000000;};Dart data;Dart*g_dart=&data;Slot g_slots[8];constexpr int kFolderLayoutSlotBase=0;\n'
-pre+='void*hc_folder_layout_original[8]{};uint64_t hc_folder_layout_requested=3;uint32_t hc_folder_layout_ready=0;bool g_folder_layout_bound=false,g_folder_layout_checked=false;int g_folder_cell_width_field=-1,g_folder_gap_field=-1,g_folder_screen_width_field=-1,g_folder_screen_height_field=-1,g_folder_cling_width_field=-1,g_folder_controller_config_field=-1,g_folder_rx_value_field=-1,g_folder_enum_index_field=-1;uint32_t g_folder_center_pool=0;\n'
+pre+='}\nconstexpr uint32_t kDartPrologue=0xa9bf79fd;constexpr int ANDROID_LOG_INFO=4;constexpr int ANDROID_LOG_WARN=5;const char*kTag="test";int __android_log_print(int,const char*,const char*,...){return 0;}\n'
+pre+='namespace nhk{struct CodeSource{};}using Words=std::array<uint32_t,4>;struct Slot{uintptr_t address=0;void*replacement=nullptr;void**original=nullptr;nhk::CodeSource source;Words original_words{};bool registered=false;};\nstruct Dart{uintptr_t load_base=0x100000000;std::string path="libapp.so";};Dart data;Dart*g_dart=&data;Slot g_slots[8];constexpr int kFolderLayoutSlotBase=0;\n'
+pre+='void*hc_folder_layout_original[8]{};uint64_t hc_folder_layout_requested=3;uint32_t hc_folder_layout_ready=0;bool g_folder_layout_bound=false,g_folder_layout_checked=false,g_folder_layout_attempted=false;int g_folder_cell_width_field=-1,g_folder_gap_field=-1,g_folder_screen_width_field=-1,g_folder_screen_height_field=-1,g_folder_cling_width_field=-1,g_folder_controller_config_field=-1,g_folder_rx_value_field=-1,g_folder_enum_index_field=-1;uint32_t g_folder_center_pool=0;\n'
 # The inner-Container plan and its owner-local distance. Mirrors production exactly:
 # the kind7 body reads the Container owner through the POST-dart_save x15 that the
 # splice stored in the native save block, not through x29.
@@ -78,8 +78,8 @@ ok(g_folder_controller_config_field==43&&g_folder_rx_value_field==19,"controller
 ok(g_folder_center_pool==0x5eb0,"TextAlign center independently decoded");
 ok(g_folder_inner_ready,"inner Container plan admitted");
 ok(g_slots[7].address==data.load_base+g_folder_inner.window,"slot7 targets the derived inner-Container replay window");
-ok(g_slots[7].original_words[0]==0xf85e03a3&&g_slots[7].original_words[3]==0xf81f83a3,"alignment replay preserves the original Container handoff");
-ok(g_folder_inner.window==0x146fbc8&&g_folder_inner.frame==0x50&&g_folder_inner.owner_slot==0x20,"window/frame/owner derived from the closure prologue");
+ok(g_slots[7].original_words[0]==0xf85e83a0&&g_slots[7].original_words[2]==0xf81f83a3,"alignment replay preserves the original Container handoff");
+ok(g_folder_inner.window==0x146fbcc&&g_folder_inner.frame==0x50&&g_folder_inner.owner_slot==0x20,"window/frame/owner derived from the closure prologue");
 ok(g_folder_inner.alignment==0x0f&&g_folder_inner.padding==0x13&&g_folder_inner.inset==0x7,"Container field offsets derived, not assumed");
 ok(g_folder_inner.center_pool==0x8180&&g_folder_inner.direction_pool[0]==0x70288&&g_folder_inner.direction_pool[1]==0x71048,"center and both direction roots derived from distinct code paths");
 ok(g_folder_inner.direction_bit==4,"the selecting bit derived from the TBNZ diamond");
@@ -87,6 +87,26 @@ ok(g_folder_inner_owner_local==0x50,"owner local reachable from the saved x15 wi
 ok(g_folder_inner_owner_local==32u+g_folder_inner.frame-g_folder_inner.owner_slot,"folded formula agrees with the prologue walk");
 for(auto &slot:g_slots)ok(slot.address&&slot.original,"eight replay windows bound");
 auto old=images;
+// A real editor branch enters the former patch at +4. Cover B/BL and all
+// immediate conditional families; refuse a bank with ANY interior entry.
+{
+ const auto bt=symbols["FolderHeaderWidget._buildText"].first;
+ auto &w=images[bt];const auto pc=bt+uint32_t(w.size()*4);
+ const auto target=g_folder_inner.window+4;
+ const int32_t words=int32_t(int64_t(target)-pc)/4;
+ const uint32_t ops[]={0x14000000u|(uint32_t(words)&0x3ffffff),
+     0x94000000u|(uint32_t(words)&0x3ffffff),
+     0x54000000u|((uint32_t(words)&0x7ffff)<<5),
+     0xb4000000u|((uint32_t(words)&0x7ffff)<<5),
+     0x36000000u|((uint32_t(words)&0x3fff)<<5)};
+ for(auto op:ops){
+     images[bt].push_back(op);g_folder_layout_bound=g_folder_layout_checked=false;
+     ok(!bind_folder_layout(),"interior control-flow entry refuses the whole bank");images=old;
+ }
+ g_folder_layout_bound=g_folder_layout_checked=false;
+ ok(bind_folder_layout(),"original common join readmitted after branch injection");
+}
+
 // Relocation, done as a BASE move rather than an instruction edit. Every symbol keeps
 // byte-identical instructions and simply starts 16 bytes higher, which is what a
 // rebuilt launcher actually looks like to the scanners. The earlier version of this
@@ -103,7 +123,7 @@ for(auto&[n,s]:symbols)s.first+=kRelocated;
 images=moved;
 g_folder_layout_bound=false;g_folder_layout_checked=false;
 ok(bind_folder_layout(),"relocated code resolves without old offsets");
-ok(g_folder_inner.window==0x146fbc8+kRelocated,"the replay window followed the base, it was not memorised");
+ok(g_folder_inner.window==0x146fbcc+kRelocated,"the replay window followed the base, it was not memorised");
 ok(g_folder_inner_owner_local==0x50,"the frame arithmetic is base-independent");
 // Put everything back exactly as it was: the fault-injection cases below address
 // symbols by the original VAs, so a half-restored map would silently test nothing.
@@ -223,7 +243,7 @@ const uintptr_t x15_saved=saved+0x40;
 const uintptr_t owner_real=((uintptr_t)high+8)|uintptr_t(1);
 const uintptr_t inner_heap=owner_real&~uintptr_t(0xffffffff);
 ok(inner_heap!=0&&(owner_real&7)==1,"the fake Container has a real compressed-pointer shape");
-set64(saved+128,x15_saved);
+set64(saved+128,x15_saved);set64(saved+24,owner_real);
 set64(x15_saved+g_folder_inner_owner_local,owner_real-inner_heap);
 const uint32_t ctr_pool=0x40|1, ctr_lo=0x50|1, ctr_hi=0x60|1;
 auto set32=[&](uintptr_t a,uint32_t v){std::memcpy((void*)a,&v,4);};
@@ -240,6 +260,11 @@ set64(saved+8,0);
 set32(owner_real+g_folder_inner.alignment,ctr_hi);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_pool,"direction alignment rewritten to the center root");
+// At the common join the editor's selected child is NOT the Container local.
+set32(owner_real+g_folder_inner.alignment,ctr_hi);set64(saved+24,owner_real+8);
+hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
+ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"editor child mismatch preserves all Container fields");
+set64(saved+24,owner_real);set32(owner_real+g_folder_inner.alignment,ctr_pool);
 ok(get64(saved+8)==0,"slot 7 never forges the returned pointer any more");
 set32(owner_real+g_folder_inner.alignment,ctr_lo);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
@@ -256,7 +281,7 @@ ok(get32(owner_real+g_folder_inner.alignment)==0x7777,"a foreign alignment is ne
 set32(owner_real+g_folder_inner.alignment,ctr_hi);set64(saved+128,0);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"a missing saved x15 refuses the write instead of faulting");
-set64(saved+128,x15_saved);
+set64(saved+128,x15_saved);set64(saved+24,owner_real);
 hc_folder_layout_requested=0;set32(owner_real+g_folder_inner.alignment,ctr_hi);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"disabled centring is an exact no-op");

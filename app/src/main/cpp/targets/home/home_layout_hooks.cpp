@@ -3746,9 +3746,9 @@ extern "C" void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned 
         if (wide && std::isfinite(width) && width >= 100 && width <= 4000) value = width;
         std::memcpy(reinterpret_cast<void *>(d0), &value, 8);
     } else if (kind == 7 && (packed & 1) && pool && g_folder_inner_ready) {
-        // Slot 7 no longer forges the returned pointer. It sits on the replay window,
-        // which is the FIRST consumer of the freshly built Container: the window
-        // reloads the owner local and stores it as the return value. Rewriting the
+        // Slot 7 sits at the common text/editor join after the text-only x3 reload.
+        // The selected child is saved x3; the fresh Container remains in its local.
+        // Rewriting the
         // alignment field before that replay means the launcher's own Container.build
         // later reads OUR value, so the enum identity, the StackFit and the Clip all
         // stay exactly as the launcher left them.
@@ -3766,6 +3766,9 @@ extern "C" void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned 
         uint32_t owner_off = 0;
         std::memcpy(&owner_off, reinterpret_cast<const void *>(x15_saved + g_folder_inner_owner_local), 4);
         const uintptr_t owner = base + owner_off;
+        // The editor selects a different child at this join. Preserve it exactly,
+        // even when an unrelated field happens to equal an alignment pool root.
+        if (read64(saved + 24) != owner) return;
         // Refuse anything but a live Container whose alignment is one of the two
         // AlignmentDirectional roots the launcher itself resolves between, or null.
         // A Container carrying some other alignment was built for a different call

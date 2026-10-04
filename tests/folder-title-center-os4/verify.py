@@ -79,20 +79,39 @@ ok(g_folder_controller_config_field==43&&g_folder_rx_value_field==19,"controller
 ok(g_folder_center_pool==0x5eb0,"TextAlign center independently decoded");
 for(auto &slot:g_slots)ok(slot.address&&slot.original,"eight replay windows bound");
 ok(g_folder_inner_ready,"inner Container plan admitted");
-// Slot 7 targets the replay window derived from _buildText itself: the first consumer
-// of the freshly built Container. Asserting the exact VA would pin a module offset,
-// which the whole design forbids, so assert the DERIVED relationship instead - the
-// window is the instruction right after the BL that produces the owner local.
+// Slot 7 targets the common text/editor join derived from _buildText itself.
+// Assert its relationship with the independently decoded plan, not a production
+// address constant. The text-only owner reload stays before the patch.
 ok(g_slots[7].address==g_dart->load_base+g_folder_inner.window,"slot7 targets the derived replay window");
 // The 4-word budget is the load/store pair the launcher itself executes there.
-ok(g_slots[7].original_words[0]==0xf85e03a3&&g_slots[7].original_words[3]==0xf81f83a3,"alignment replay preserves the original Container handoff");
-ok(g_folder_inner.window==0x146fbc8&&g_folder_inner.frame==0x50&&g_folder_inner.owner_slot==0x20,"window/frame/owner derived from the closure prologue");
+ok(g_slots[7].original_words[0]==0xf85e83a0&&g_slots[7].original_words[2]==0xf81f83a3,"alignment replay preserves the original Container handoff");
+ok(g_folder_inner.window==0x146fbcc&&g_folder_inner.frame==0x50&&g_folder_inner.owner_slot==0x20,"window/frame/owner derived from the closure prologue");
 ok(g_folder_inner.alignment==0x0f&&g_folder_inner.padding==0x13&&g_folder_inner.inset==0x7,"Container field offsets derived, not assumed");
 ok(g_folder_inner.center_pool==0x8180&&g_folder_inner.direction_pool[0]==0x70288&&g_folder_inner.direction_pool[1]==0x71048,"center and both direction roots derived from distinct code paths");
 ok(g_folder_inner.direction_bit==4,"the selecting bit derived from the TBNZ diamond");
 ok(g_folder_inner_owner_local==0x50,"owner local reachable from the saved x15 with no assembly change");
 ok(g_folder_inner_owner_local==32u+g_folder_inner.frame-g_folder_inner.owner_slot,"folded formula agrees with the prologue walk");
 auto old=images;
+// A real editor branch enters the former patch at +4. Cover B/BL and all
+// immediate conditional families; refuse a bank with ANY interior entry.
+{
+ const auto bt=symbols["FolderHeaderWidget._buildText"].first;
+ auto &w=images[bt];const auto pc=bt+uint32_t(w.size()*4);
+ const auto target=g_folder_inner.window+4;
+ const int32_t words=int32_t(int64_t(target)-pc)/4;
+ const uint32_t ops[]={0x14000000u|(uint32_t(words)&0x3ffffff),
+     0x94000000u|(uint32_t(words)&0x3ffffff),
+     0x54000000u|((uint32_t(words)&0x7ffff)<<5),
+     0xb4000000u|((uint32_t(words)&0x7ffff)<<5),
+     0x36000000u|((uint32_t(words)&0x3fff)<<5)};
+ for(auto op:ops){
+     images[bt].push_back(op);g_folder_layout_bound=g_folder_layout_checked=false;
+     ok(!bind_folder_layout(),"interior control-flow entry refuses the whole bank");images=old;
+ }
+ g_folder_layout_bound=g_folder_layout_checked=false;
+ ok(bind_folder_layout(),"original common join readmitted after branch injection");
+}
+
 // Relocation, done as a BASE move rather than an instruction edit. Every symbol keeps
 // byte-identical instructions and simply starts 16 bytes higher, which is what a
 // rebuilt launcher actually looks like to the scanners. The earlier version of this
@@ -109,7 +128,7 @@ for(auto&[n,s]:symbols)s.first+=kRelocated;
 images=moved;
 g_folder_layout_bound=false;g_folder_layout_checked=false;
 ok(bind_folder_layout(),"relocated code resolves without old offsets");
-ok(g_folder_inner.window==0x146fbc8+kRelocated,"the replay window followed the base, it was not memorised");
+ok(g_folder_inner.window==0x146fbcc+kRelocated,"the replay window followed the base, it was not memorised");
 ok(g_folder_inner_owner_local==0x50,"the frame arithmetic is base-independent");
 // Put everything back exactly as it was: the fault-injection cases below address
 // symbols by the original VAs, so a half-restored map would silently test nothing.
@@ -243,7 +262,7 @@ const uintptr_t owner_real=((uintptr_t)high+8)|uintptr_t(1);
 const uintptr_t inner_heap=owner_real&~uintptr_t(0xffffffff);
 ok(inner_heap!=0,"the fake Container sits above 4 GiB so the compressed round trip is real");
 ok((owner_real&7)==1,"the fake owner carries a Dart compressed-pointer tag");
-set64(saved+128,x15_saved);
+set64(saved+128,x15_saved);set64(saved+24,owner_real);
 set64(x15_saved+g_folder_inner_owner_local,owner_real-inner_heap);
 // The three pool roots are compressed pointers, so each one must carry the low-bit
 // tag the production code checks with `(center & 7) == 1`. A round 0x4000 would be
@@ -267,6 +286,11 @@ set64(saved+8,0);
 set32(owner_real+g_folder_inner.alignment,ctr_hi);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_pool,"direction alignment rewritten to the center root");
+// At the common join the editor's selected child is NOT the Container local.
+set32(owner_real+g_folder_inner.alignment,ctr_hi);set64(saved+24,owner_real+8);
+hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
+ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"editor child mismatch preserves all Container fields");
+set64(saved+24,owner_real);set32(owner_real+g_folder_inner.alignment,ctr_pool);
 ok(get64(saved+8)==0,"slot 7 never forges the returned pointer any more");
 set32(owner_real+g_folder_inner.alignment,ctr_lo);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
@@ -283,7 +307,7 @@ ok(get32(owner_real+g_folder_inner.alignment)==0x7777,"a foreign alignment is ne
 set32(owner_real+g_folder_inner.alignment,ctr_hi);set64(saved+128,0);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"a missing saved x15 refuses the write instead of faulting");
-set64(saved+128,x15_saved);
+set64(saved+128,x15_saved);set64(saved+24,owner_real);
 hc_folder_layout_requested=0;set32(owner_real+g_folder_inner.alignment,ctr_hi);
 hc_folder_layout_body(saved,(uintptr_t)ip7.data(),7,inner_heap);
 ok(get32(owner_real+g_folder_inner.alignment)==ctr_hi,"disabled centring is an exact no-op");
