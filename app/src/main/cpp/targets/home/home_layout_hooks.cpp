@@ -311,6 +311,14 @@ using CustomTitles = std::vector<home_title::CustomTitle>;
 std::shared_ptr<const CustomTitles> g_title_names;
 
 bool g_folder_layout_bound = false, g_folder_layout_checked = false;
+/*
+ * `g_folder_layout_checked` only says "the admission scan reached at least the first symbol",
+ * and the two log lines that could explain a refusal are both gated on it. So a launcher whose
+ * FIRST symbol is missing - or whose eight derivation steps fail later - produced no log at all,
+ * which is indistinguishable on the device from "the feature was never asked for". This flag
+ * marks "the scan really ran", so every refusal below can name itself.
+ */
+bool g_folder_layout_attempted = false;
 int g_folder_cell_width_field = -1, g_folder_gap_field = -1;
 int g_folder_screen_width_field = -1, g_folder_screen_height_field = -1;
 int g_folder_cling_width_field = -1;
@@ -331,8 +339,25 @@ home_layout::GridAutofitSites g_grid_autofit_fields;
 void sync_folder_layout(const home_layout::Config &config) {
     __atomic_store_n(&hc_grid_autofit_requested,
         config.grid_enabled ? (1u | (unsigned(config.cell_y) << 8)) : 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&hc_folder_layout_requested,
-        home_layout::pack_folder_layout(config.folder, config.tweaks.folder_cols), __ATOMIC_RELEASE);
+    const uint64_t packed =
+        home_layout::pack_folder_layout(config.folder, config.tweaks.folder_cols);
+    const uint64_t previous = __atomic_exchange_n(&hc_folder_layout_requested, packed, __ATOMIC_ACQ_REL);
+    /*
+     * `pack_folder_layout` collapses to 0 both for "the user asked for stock" and for "these
+     * values cannot be represented", and the original-code bank gates on two of its low bits.
+     * Without this line a closed gate is indistinguishable from a lost configuration: the bank
+     * simply never binds and the only log it can emit is gated behind its own success flag.
+     * Report the packed word itself so the two cases separate on the device.
+     */
+    if (previous != packed) {
+        const auto c = home_layout::unpack_folder_layout(packed);
+        __android_log_print(ANDROID_LOG_INFO, kTag,
+            "folder layout request packed=%#llx title_center=%d full_width=%d "
+            "padding=%d/%d/%d/%d cols=%d",
+            static_cast<unsigned long long>(packed), c.title_center, c.full_width,
+            c.padding_enabled, c.phone_padding, c.landscape_padding, c.portrait_padding,
+            config.tweaks.folder_cols);
+    }
 }
 void sync_title_config(const home_layout::Config &config) {
     sync_folder_layout(config);
@@ -1689,7 +1714,24 @@ bool bind_grid_autofit() {
 bool bind_folder_layout() {
     if (g_folder_layout_bound) return true;
     if (g_folder_layout_checked) return false;
-    if (!g_dart || !(__atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE) & 3)) return false;
+    if (!g_dart || !(__atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE) & 3)) {
+        /*
+         * This gate is polled on every pass of the layout loop, so a "not yet" answer is normal
+         * and must stay quiet. A "not ever" answer is not: without this line a launcher whose
+         * `libapp.so` never maps looks exactly like a user who never turned the feature on,
+         * because both produce no bank log whatsoever. Rate-limited, not one-shot, so a gate
+         * that opens late is still reported.
+         */
+        static unsigned gate_reported = 0;
+        if ((++gate_reported & 0x3ff) == 1) {
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "folder layout gate closed: dart=%s requested=%#llx (bit0 title_center, "
+                "bit1 full_width)", g_dart ? g_dart->path.c_str() : "(unmapped)",
+                static_cast<unsigned long long>(
+                    __atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE)));
+        }
+        return false;
+    }
     const char *names[] = {"FolderGridViewGetxController.calGridWidth",
         "FolderGridViewGetxController.folderCellWidth",
         "FolderGridViewGetxController.folderGridOuterHorizontalPadding",
@@ -1708,12 +1750,14 @@ bool bind_folder_layout() {
         // in would keep two pure liabilities in the admission set.
         "Container.build", "Container._paddingIncludingDecoration"};
     std::array<uint32_t, 16> va{}; std::array<std::vector<uint32_t>, 16> bodies;
+    g_folder_layout_attempted = true;
     for (size_t i = 0; i < va.size(); ++i) {
         uint32_t size = 0;
         if (!hometweaks::HomeTweaksFindSymbol(names[i], &va[i], &size)
             || !dartscan::body(va[i], bodies[i])) {
-            if (g_folder_layout_checked) __android_log_print(ANDROID_LOG_INFO, kTag,
-                "folder layout admission missing symbol/body=%s", names[i]);
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "folder layout admission missing symbol/body=%s (index %zu)", names[i], i);
+            g_folder_layout_checked = true;
             return false;
         }
         if (i == 0) g_folder_layout_checked = true; // One admission per image, no repeated APK scans.
@@ -1723,21 +1767,41 @@ bool bind_folder_layout() {
     if (!folder_layout_anchors(va[0], va[1], va[9], va[6], va[7],
             bodies[0], bodies[1], bodies[6], bodies[7], gap, width, height, cell, cling)
         || !home_layout::folder_return_site(bodies[2], 0, true, outer) || outer.field != 7
-        || !home_layout::folder_return_site(bodies[3], 0, true, left) || left.field != 7) return false;
+        || !home_layout::folder_return_site(bodies[3], 0, true, left) || left.field != 7) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout anchors unresolved gap=%d width=%d height=%d cell=%d/%#x "
+            "cling=%d/%#x outer=%d/%#x left=%d/%#x",
+            gap, width, height, cell.field, cell.offset, cling.field, cling.offset,
+            outer.field, outer.offset, left.field, left.offset);
+        return false;
+    }
     // Both boxed padding values are freshly allocated Double objects. Check their tag
     // and the original GC rejoin: the new stub must cover that shared store, not its predecessor.
     for (size_t i : {size_t(2), size_t(3)}) {
         uint32_t tag = 0;
         if (!dartscan::unique_sequence(bodies[i], std::array<uint32_t, 3>{0xd29c2b81,
-                0xf2a00061, 0xf81ff001}.data(), 3, &tag)) return false;
+                0xf2a00061, 0xf81ff001}.data(), 3, &tag)) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "folder layout padding prologue %zu not unique (tag=%#x want %#x)", i, tag,
+                0xd29c2b81);
+            return false;
+        }
         const uint32_t store = i == 2 ? outer.offset : left.offset;
-        if (tag + 12 != store) return false;
+        if (tag + 12 != store) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "folder layout padding %zu store=%#x does not follow tag=%#x", i, store, tag);
+            return false;
+        }
         unsigned rejoin = 0;
         for (size_t j = store / 4 + 4; j < bodies[i].size(); ++j)
             if ((bodies[i][j] & 0xfc000000) == 0x14000000
                 && int64_t(va[i] + j * 4) + int64_t(home_layout::bl_imm_words(bodies[i][j])) * 4
                     == va[i] + store) ++rejoin;
-        if (rejoin != 1) return false;
+        if (rejoin != 1) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "folder layout padding %zu rejoin count=%u want 1", i, rejoin);
+            return false;
+        }
     }
     uint32_t center = 0, independent_center = 0;
     if (!home_layout::folder_center_pool(bodies[8], center)
@@ -1746,14 +1810,23 @@ bool bind_folder_layout() {
         // _resolveEffectiveTextAlign's root, so a launcher that changes one and not
         // the other refuses the bank instead of half-centring the title.
         || !home_layout::folder_text_alignment_center_pool(bodies[13], independent_center)
-        || center != independent_center) return false;
+        || center != independent_center) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout text-align roots disagree resolve=%#x convert=%#x", center,
+            independent_center);
+        return false;
+    }
     // Admit Text and TextField's local TextAlign store with their own surrounding ABI.
     uint32_t text = 0, editor = 0;
     if (!dartscan::site(va[4], {0xb801b001, 0x9141c361, 0xf9421021, 0xb802b001}, &text)
         || !dartscan::site(va[5], {0xb805b001, 0x9142cf61, 0xf940d421, 0xb805f001}, &editor)
         || text < 4 || editor < 4
         || (bodies[4][text / 4 - 1] & 0xffc003ff) != 0xf9400361
-        || bodies[4][text / 4 - 1] != bodies[5][editor / 4 - 1]) return false;
+        || bodies[4][text / 4 - 1] != bodies[5][editor / 4 - 1]) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout TextAlign stores unresolved text=%#x editor=%#x", text, editor);
+        return false;
+    }
     // Slot 7: relocate the freshly built Container rather than the outer Stack. The
     // window is four instructions - exactly the 4-word patch budget - and rewriting the
     // Container's own alignment field needs neither a new allocation nor the enum index
@@ -1769,7 +1842,7 @@ bool bind_folder_layout() {
     home_layout::FolderInnerContainer inner;
     if (!home_layout::folder_inner_container(bodies[4], bodies[14], bodies[15],
             va[4], inner)) {
-        if (g_folder_layout_checked) __android_log_print(ANDROID_LOG_INFO, kTag,
+        __android_log_print(ANDROID_LOG_WARN, kTag,
             "folder layout inner Container plan unresolved; bank refused");
         return false;
     }
@@ -1782,7 +1855,12 @@ bool bind_folder_layout() {
         if ((w[j] & 0xffe00fff) == 0xf8400022 && w[j + 1] == 0x93407c42
             && w[j + 2] == 0xb801b002) { index_field = imm9(w[j]); ++index_hits; }
     }
-    if (index_hits != 1 || index_field <= 0 || index_field > 255) return false;
+    if (index_hits != 1 || index_field <= 0 || index_field > 255) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout paragraph index hits=%u field=%d want exactly 1 in 1..255",
+            index_hits, index_field);
+        return false;
+    }
     int controller_config = -1, rx_value = -1; unsigned rx_calls = 0, values = 0;
     for (size_t j = 2; j < bodies[9].size(); ++j) {
         uint32_t target = 0;
@@ -1800,7 +1878,13 @@ bool bind_folder_layout() {
             rx_value = imm9(bodies[10][j]); ++values;
         }
     }
-    if (rx_calls != 1 || values != 1 || controller_config <= 0 || rx_value <= 0) return false;
+    if (rx_calls != 1 || values != 1 || controller_config <= 0 || rx_value <= 0) {
+        __android_log_print(ANDROID_LOG_WARN, kTag,
+            "folder layout Rx chain rx_calls=%u values=%u config_field=%d value_field=%d "
+            "want 1/1 and both fields > 0",
+            rx_calls, values, controller_config, rx_value);
+        return false;
+    }
     const uint32_t offsets[] = {0, cell.offset, outer.offset, left.offset, text, editor, cling.offset, 0};
     const void *entries[] = {reinterpret_cast<void *>(hc_folder_layout_0_entry),
         reinterpret_cast<void *>(hc_folder_layout_1_entry), reinterpret_cast<void *>(hc_folder_layout_2_entry),
@@ -1813,7 +1897,12 @@ bool bind_folder_layout() {
         // replay window is an absolute VA derived from _buildText's own instructions,
         // so the base moves with it rather than being the Stack's `column` store.
         const uint32_t target = (i == 7) ? inner.window : va[i] + offsets[i];
-        if (!bind_dart_target(target, slot.address, slot.source, slot.original_words)) return false;
+        if (!bind_dart_target(target, slot.address, slot.source, slot.original_words)) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "folder layout slot %zu unbindable at target=%#x (symbol va=%#x offset=%#x)", i,
+                target, va[i], offsets[i]);
+            return false;
+        }
         slot.replacement = const_cast<void *>(entries[i]); slot.original = &hc_folder_layout_original[i];
     }
     g_folder_cell_width_field = cell.field; g_folder_gap_field = gap;
@@ -2686,11 +2775,17 @@ size_t arm_hooks(std::vector<size_t> &order) {
     (void) bind_grid_autofit();
     if (!autofit_was_checked && g_grid_autofit_checked && !g_grid_autofit_bound)
         __android_log_print(ANDROID_LOG_WARN, kTag, "grid autofit original-code guard declined image; stock retained");
-    const bool folder_was_checked = g_folder_layout_checked;
+    const bool folder_was_attempted = g_folder_layout_attempted;
     (void) bind_folder_layout();
-    if (!folder_was_checked && g_folder_layout_checked && !g_folder_layout_bound)
+    /*
+     * `attempted` rather than `checked`: the scan itself refuses long before the first symbol is
+     * known good, and a refusal there used to be completely silent. The detailed reason is logged
+     * by the branch that refused; this line only has to say that a refusal happened at all.
+     */
+    if (!folder_was_attempted && g_folder_layout_attempted && !g_folder_layout_bound)
         __android_log_print(ANDROID_LOG_WARN, kTag,
-            "folder layout original-code guard declined this launcher image; stock layout retained");
+            "folder layout original-code guard declined this launcher image; stock layout retained"
+            " (first symbol resolved=%d)", g_folder_layout_checked ? 1 : 0);
     (void) bind_gadget_bridge();
     size_t added = 0;
     if (g_grid_autofit_bound) for (size_t i = 0; i < 2; ++i) {
@@ -3445,6 +3540,23 @@ void *worker(void *) {
                     break;
                 }
             }
+            /*
+             * Folder-bank state, on the same cadence as the capture readout. The bank's own logs
+             * are edge-triggered - one line per transition - so a refusal that happened during
+             * early boot scrolls out of the ring buffer long before anyone reads it, and the
+             * capture line above says nothing about this feature. These five values are the whole
+             * decision: dart mapped, gate bits, whether the scan ran, whether it latched a
+             * refusal, and whether it bound.
+             */
+            __android_log_print(ANDROID_LOG_INFO, kTag,
+                "folder bank dart=%d req=%#llx gate=%#llx attempted=%d checked=%d bound=%d inner=%d",
+                g_dart ? 1 : 0,
+                static_cast<unsigned long long>(
+                    __atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE)),
+                static_cast<unsigned long long>(
+                    __atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE) & 3),
+                g_folder_layout_attempted ? 1 : 0, g_folder_layout_checked ? 1 : 0,
+                g_folder_layout_bound ? 1 : 0, g_folder_inner_ready ? 1 : 0);
             __android_log_print(ANDROID_LOG_INFO, kTag,
                 "layout captures config=%#llx dock=%#llx heap=%#llx hits=%llu/%llu bound=%zu "
                 "deltas=%d writes=%llu/%llu/%llu path0=%#x recents=%d/%llu/%.4f/%d%% "

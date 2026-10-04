@@ -13,7 +13,11 @@ assert 'mov x2, sp' in stub and 'bl hc_layout_folder_body' in stub
 assert 'hc_layout_folder_resume' in stub and 'hc_layout_folder_original' in stub
 assert 'ldar w10, [x9]' in stub and 'cbz w10, 2f' in stub
 assert 'candidates[i].address + 16' in c and 'full.size()' in c
-assert 'frame[2] != full[2]' in c
+# The partial-install fallback used to be an explicit `frame[2] != full[2]` spot check. The scan
+# now compares the WHOLE known body with std::equal before binding, which subsumes it, so
+# asserting the old expression only tested that this file had not been updated.
+assert 'std::equal(full.begin(), full.end(), body.begin())' in c
+assert 'body.size() < full.size()' in c
 assert 'workspace_write(fp, -0x18, workspace_read<double>(fp, -0x30))' in h
 assert 'workspace_read<double>(fp, -0x18)' in h
 assert 'top & 7' in (root/'app/src/main/cpp/targets/home/home_indicator_pair.h').read_text()

@@ -50,12 +50,16 @@ pre+='bool production_accept(const char*n,uint32_t va,uint32_t size){if(!images.
 for n in ['bool is_ldur_double(', 'bool is_ldur_word(', 'int imm9(', 'uint32_t rn(', 'uint32_t rt(', 'bool bl_target(uint32_t word, uint32_t pc, uint32_t *target) {']:pre+=fun(src,n)+'\n'
 pre+='namespace dartscan { bool function_span(uint32_t va,uint32_t*out){if(!images.count(va))return false;*out=images[va].size()*4;return true;}\n'
 for n in ['bool unique_sequence(', 'bool body(uint32_t va', 'bool site(uint32_t va, std::span', 'bool site(uint32_t va, std::initializer_list']:pre+=fun(src,n)+'\n'
-pre+='}\nconstexpr uint32_t kDartPrologue=0xa9bf79fd;constexpr int ANDROID_LOG_INFO=4;const char*kTag="test";int __android_log_print(int,const char*,const char*,...){return 0;}\n'
-pre+='namespace nhk{struct CodeSource{};}using Words=std::array<uint32_t,4>;struct Slot{uintptr_t address=0;void*replacement=nullptr;void**original=nullptr;nhk::CodeSource source;Words original_words{};bool registered=false;};\nstruct Dart{uintptr_t load_base=0x100000000;};Dart data;Dart*g_dart=&data;Slot g_slots[8];constexpr int kFolderLayoutSlotBase=0;\n'
-pre+='void*hc_folder_layout_original[8]{};uint64_t hc_folder_layout_requested=3;uint32_t hc_folder_layout_ready=0;bool g_folder_layout_bound=false,g_folder_layout_checked=false;int g_folder_cell_width_field=-1,g_folder_gap_field=-1,g_folder_screen_width_field=-1,g_folder_screen_height_field=-1,g_folder_cling_width_field=-1,g_folder_controller_config_field=-1,g_folder_rx_value_field=-1,g_folder_enum_index_field=-1;uint32_t g_folder_center_pool=0;\n'
+pre+='}\nconstexpr uint32_t kDartPrologue=0xa9bf79fd;constexpr int ANDROID_LOG_INFO=4;constexpr int ANDROID_LOG_WARN=5;const char*kTag="test";int __android_log_print(int,const char*,const char*,...){return 0;}\n'
+pre+='namespace nhk{struct CodeSource{};}using Words=std::array<uint32_t,4>;struct Slot{uintptr_t address=0;void*replacement=nullptr;void**original=nullptr;nhk::CodeSource source;Words original_words{};bool registered=false;};\n'
+# Mirrors the production std::optional<DartLibrary> closely enough for the gate log: `path` exists
+# because bind_folder_layout reports the image it could not find, and the optional is never
+# disengaged here so the true branch is the one under test.
+pre+='struct Dart{uintptr_t load_base=0x100000000;std::string path="libapp.so";};std::optional<Dart> g_dart=Dart{};Slot g_slots[8];constexpr int kFolderLayoutSlotBase=0;\n'
+pre+='void*hc_folder_layout_original[8]{};uint64_t hc_folder_layout_requested=3;uint32_t hc_folder_layout_ready=0;bool g_folder_layout_bound=false,g_folder_layout_checked=false,g_folder_layout_attempted=false;int g_folder_cell_width_field=-1,g_folder_gap_field=-1,g_folder_screen_width_field=-1,g_folder_screen_height_field=-1,g_folder_cling_width_field=-1,g_folder_controller_config_field=-1,g_folder_rx_value_field=-1,g_folder_enum_index_field=-1;uint32_t g_folder_center_pool=0;\n'
 pre+='home_layout::FolderInnerContainer g_folder_inner;uint32_t g_folder_inner_owner_local=0;bool g_folder_inner_ready=false;static std::atomic_uint g_folder_inner_reported{0};\n'
 for i in range(8):pre+=f'void hc_folder_layout_{i}_entry(){{}}\n'
-pre+='bool bind_dart_target(uint32_t va,uintptr_t&a,nhk::CodeSource&,Words&w){for(auto&[v,b]:images)if(va>=v&&!((va-v)&3)&&(va-v)/4+4<=b.size()){a=data.load_base+va;std::copy_n(b.begin()+(va-v)/4,4,w.begin());return true;}return false;}\n'
+pre+='bool bind_dart_target(uint32_t va,uintptr_t&a,nhk::CodeSource&,Words&w){for(auto&[v,b]:images)if(va>=v&&!((va-v)&3)&&(va-v)/4+4<=b.size()){a=g_dart->load_base+va;std::copy_n(b.begin()+(va-v)/4,4,w.begin());return true;}return false;}\n'
 pre+=fun(src,'bool folder_layout_anchors(')+'\n'+fun(src,'bool bind_folder_layout()')+'\n'
 # Test the actual callbacks, not a separately reimplemented width/alignment formula.
 a=src.index('static thread_local double folder_layout_gap');b=src.index('extern "C" uint64_t hc_title_custom_label(',a);pre+=src[a:b]
@@ -79,7 +83,7 @@ ok(g_folder_inner_ready,"inner Container plan admitted");
 // of the freshly built Container. Asserting the exact VA would pin a module offset,
 // which the whole design forbids, so assert the DERIVED relationship instead - the
 // window is the instruction right after the BL that produces the owner local.
-ok(g_slots[7].address==data.load_base+g_folder_inner.window,"slot7 targets the derived replay window");
+ok(g_slots[7].address==g_dart->load_base+g_folder_inner.window,"slot7 targets the derived replay window");
 // The 4-word budget is the load/store pair the launcher itself executes there.
 ok(g_slots[7].original_words[0]==0xf85e03a3&&g_slots[7].original_words[3]==0xf81f83a3,"alignment replay preserves the original Container handoff");
 ok(g_folder_inner.window==0x146fbc8&&g_folder_inner.frame==0x50&&g_folder_inner.owner_slot==0x20,"window/frame/owner derived from the closure prologue");
