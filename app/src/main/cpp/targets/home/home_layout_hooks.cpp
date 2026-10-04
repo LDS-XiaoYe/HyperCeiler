@@ -315,9 +315,16 @@ int g_folder_cell_width_field = -1, g_folder_gap_field = -1;
 int g_folder_screen_width_field = -1, g_folder_screen_height_field = -1;
 int g_folder_cling_width_field = -1;
 int g_folder_controller_config_field = -1, g_folder_rx_value_field = -1;
-uint32_t g_folder_center_pool = 0, g_folder_cross_center_pool = 0;
-uint32_t g_folder_alignment_start_pool = 0;
+uint32_t g_folder_center_pool = 0;
 int g_folder_enum_index_field = -1;
+// Slot 7 relocates the INNER Container instead of the outer Stack: the freshly built
+// Container is a frame local of FolderHeaderWidget._buildText, and rewriting its
+// alignment field needs no GC-rooted allocation, no enum index arithmetic and no
+// dependence on the outer Stack's cross-axis enum. Every member is derived at bind
+// time from the instruction stream (see home_layout::folder_inner_container).
+home_layout::FolderInnerContainer g_folder_inner;
+uint32_t g_folder_inner_owner_local = 0;   // offset from the post-dart_save x15
+bool g_folder_inner_ready = false;
 
 bool g_grid_autofit_bound = false, g_grid_autofit_checked = false;
 home_layout::GridAutofitSites g_grid_autofit_fields;
@@ -1691,8 +1698,15 @@ bool bind_folder_layout() {
         "FolderClingWidget.getFolderClingWidth",
         "FolderClingGetxController._calcFolderPaddingTop",
         "_FlutterTextViewState._resolveEffectiveTextAlign", "GridController.currentConfig",
-        "RxObjectMixin.value", "AndroidAttributeUtils.convertGravity", "Stack.updateRenderObject",
-        "_encodeParagraphStyle", "AndroidAttributeUtils.convertTextAlignment", "FolderHeaderWidget.build"};
+        "RxObjectMixin.value", "AndroidAttributeUtils.convertGravity",
+        "_encodeParagraphStyle", "AndroidAttributeUtils.convertTextAlignment",
+        // The last three exist only so the inner-Container scan can read the Container's
+        // own named functions. Nothing else consumes them, and a launcher build that
+        // renames any of them simply refuses slot 7 instead of guessing at a field
+        // offset. `Stack.updateRenderObject` and `FolderHeaderWidget.build` used to be
+        // admitted here for the outer-Stack route; that route is gone, and leaving them
+        // in would keep two pure liabilities in the admission set.
+        "Container.build", "Container._paddingIncludingDecoration"};
     std::array<uint32_t, 16> va{}; std::array<std::vector<uint32_t>, 16> bodies;
     for (size_t i = 0; i < va.size(); ++i) {
         uint32_t size = 0;
@@ -1727,7 +1741,11 @@ bool bind_folder_layout() {
     }
     uint32_t center = 0, independent_center = 0;
     if (!home_layout::folder_center_pool(bodies[8], center)
-        || !home_layout::folder_text_alignment_center_pool(bodies[14], independent_center)
+        // The independent semantic root is convertTextAlignment's own
+        // TEXT_ALIGNMENT_CENTER branch (index 13). It must agree with
+        // _resolveEffectiveTextAlign's root, so a launcher that changes one and not
+        // the other refuses the bank instead of half-centring the title.
+        || !home_layout::folder_text_alignment_center_pool(bodies[13], independent_center)
         || center != independent_center) return false;
     // Admit Text and TextField's local TextAlign store with their own surrounding ABI.
     uint32_t text = 0, editor = 0;
@@ -1736,23 +1754,31 @@ bool bind_folder_layout() {
         || text < 4 || editor < 4
         || (bodies[4][text / 4 - 1] & 0xffc003ff) != 0xf9400361
         || bodies[4][text / 4 - 1] != bodies[5][editor / 4 - 1]) return false;
-    // The header has nested Stacks, not a Column. Its outer Stack anchors the
-    // intrinsic-width text; #1b is Clip.hardEdge and must never receive an enum.
-    uint32_t cross = 0, column = 0, stack_field = 0, start_pool = 0;
-    if (!home_layout::folder_stack_center_pool(bodies[11], cross)
-        || !dartscan::site(va[15], {0xb800f001, 0x91409761, 0xf9404821, 0xb8017001}, &column)
-        || column < 8 || !dartscan::site(va[12],
-            {0xb840f002, 0x8b1c8042, 0xf85e83a1}, &stack_field)) return false;
-    const auto &header = bodies[15];
-    if ((header[column/4-2] & 0xffc003ff) != 0x91400361
-        || (header[column/4-1] & 0xffc003ff) != 0xf9400021) return false;
-    start_pool = ((header[column/4-2] >> 10) & 4095) * 4096
-        + ((header[column/4-1] >> 10) & 4095) * 8;
-    // The named paragraph encoder forwards TextAlign.index into its Int32 data;
-    // there is no Smi shift here. Enum.index is an UNBOXED 64-bit int, not a Smi.
+    // Slot 7: relocate the freshly built Container rather than the outer Stack. The
+    // window is four instructions - exactly the 4-word patch budget - and rewriting the
+    // Container's own alignment field needs neither a new allocation nor the enum index
+    // arithmetic the Stack route depended on. Any step that cannot be proven refuses the
+    // whole bank: a half-relocated Container is worse than an untouched one, because a
+    // mis-centred title is indistinguishable from several unrelated causes.
+    //
+    // Nothing here derives the outer Stack's alignment slot any more. That scan existed
+    // only to forge slot 7's return value; the inner route writes the Container's own
+    // field and lets the launcher's instructions run unchanged, so the whole
+    // `column`/`stack_field`/`start_pool` chain - and the `Stack.updateRenderObject`
+    // admission it needed - is gone rather than left behind as unused evidence.
+    home_layout::FolderInnerContainer inner;
+    if (!home_layout::folder_inner_container(bodies[4], bodies[14], bodies[15],
+            va[4], inner)) {
+        if (g_folder_layout_checked) __android_log_print(ANDROID_LOG_INFO, kTag,
+            "folder layout inner Container plan unresolved; bank refused");
+        return false;
+    }
+    // _encodeParagraphStyle is the paragraph encoder: it forwards TextAlign.index
+    // into an Int32 field. There is no Smi shift here - Enum.index is an UNBOXED
+    // 64-bit int, not a Smi.
     unsigned index_hits = 0; int index_field = -1;
-    for (size_t j = 0; j + 2 < bodies[13].size(); ++j) {
-        const auto &w = bodies[13];
+    for (size_t j = 0; j + 2 < bodies[12].size(); ++j) {
+        const auto &w = bodies[12];
         if ((w[j] & 0xffe00fff) == 0xf8400022 && w[j + 1] == 0x93407c42
             && w[j + 2] == 0xb801b002) { index_field = imm9(w[j]); ++index_hits; }
     }
@@ -1775,7 +1801,7 @@ bool bind_folder_layout() {
         }
     }
     if (rx_calls != 1 || values != 1 || controller_config <= 0 || rx_value <= 0) return false;
-    const uint32_t offsets[] = {0, cell.offset, outer.offset, left.offset, text, editor, cling.offset, column};
+    const uint32_t offsets[] = {0, cell.offset, outer.offset, left.offset, text, editor, cling.offset, 0};
     const void *entries[] = {reinterpret_cast<void *>(hc_folder_layout_0_entry),
         reinterpret_cast<void *>(hc_folder_layout_1_entry), reinterpret_cast<void *>(hc_folder_layout_2_entry),
         reinterpret_cast<void *>(hc_folder_layout_3_entry), reinterpret_cast<void *>(hc_folder_layout_4_entry),
@@ -1783,20 +1809,32 @@ bool bind_folder_layout() {
     std::array<Slot, 8> prepared{};
     for (size_t i = 0; i < prepared.size(); ++i) {
         auto &slot = prepared[i];
-        if (!bind_dart_target(va[i == 7 ? 15 : i] + offsets[i], slot.address, slot.source, slot.original_words)) return false;
+        // Slot 7 is the only one whose target is not expressed as symbol+offset: the
+        // replay window is an absolute VA derived from _buildText's own instructions,
+        // so the base moves with it rather than being the Stack's `column` store.
+        const uint32_t target = (i == 7) ? inner.window : va[i] + offsets[i];
+        if (!bind_dart_target(target, slot.address, slot.source, slot.original_words)) return false;
         slot.replacement = const_cast<void *>(entries[i]); slot.original = &hc_folder_layout_original[i];
     }
     g_folder_cell_width_field = cell.field; g_folder_gap_field = gap;
     g_folder_screen_width_field = width; g_folder_screen_height_field = height;
     g_folder_controller_config_field = controller_config; g_folder_rx_value_field = rx_value;
-    g_folder_cling_width_field = cling.field; g_folder_center_pool = center; g_folder_cross_center_pool = cross;
-    g_folder_alignment_start_pool = start_pool;
+    g_folder_cling_width_field = cling.field; g_folder_center_pool = center;
     g_folder_enum_index_field = index_field;
+    // `dart_save` pushes 32 bytes onto x15 before the body runs; the closure's own
+    // prologue published FP from x15 and then allocated `frame`, so FP sits
+    // dart_save + frame above the saved x15 and the Container sits owner_slot below FP.
+    // Fold all three into one distance so slot 7 needs no register it cannot read -
+    // the splice never spills x29 and must not rely on the callee preserving it.
+    g_folder_inner = inner;
+    g_folder_inner_owner_local = 32 + inner.frame - inner.owner_slot;
+    g_folder_inner_ready = true;
     for (size_t i = 0; i < prepared.size(); ++i) g_slots[kFolderLayoutSlotBase + i] = prepared[i];
     g_folder_layout_bound = true;
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "folder layout original-code bank bound=8 fields=%d/%d/%d/%d center_pool=%x; no GC BL relocation; Dart8",
-        cell.field, gap, width, height, center);
+        "folder layout bank bound=8 fields=%d/%d/%d/%d center_pool=%x inner=%#x/%#x/%#x/%#x roots=%x/%x/%x",
+        cell.field, gap, width, height, center, inner.window, inner.owner_slot, inner.frame,
+        inner.alignment, inner.center_pool, inner.direction_pool[0], inner.direction_pool[1]);
     return true;
 }
 
@@ -3595,17 +3633,51 @@ extern "C" void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned 
         const double width = config ? scalar(config + g_folder_screen_width_field) : 0;
         if (wide && std::isfinite(width) && width >= 100 && width <= 4000) value = width;
         std::memcpy(reinterpret_cast<void *>(d0), &value, 8);
-    } else if (kind == 7 && (packed & 1) && pool) {
-        const uintptr_t start = read64(pool + g_folder_alignment_start_pool);
-        const uintptr_t center = read64(pool + g_folder_cross_center_pool);
-        // Only this freshly constructed header receives a new GC-rooted alignment.
-        // Clip.hardEdge and StackFit.loose are replayed exactly as originally stored.
-        if (argument == start && (start & 7) == 1 && (center & 7) == 1
-            && scalar(start + 7) == -1.0 && scalar(start + 15) == -1.0
-            && scalar(center + 7) == 0.0 && scalar(center + 15) == 0.0)
-            std::memcpy(reinterpret_cast<void *>(saved + 8), &center, 8);
+    } else if (kind == 7 && (packed & 1) && pool && g_folder_inner_ready) {
+        // Slot 7 no longer forges the returned pointer. It sits on the replay window,
+        // which is the FIRST consumer of the freshly built Container: the window
+        // reloads the owner local and stores it as the return value. Rewriting the
+        // alignment field before that replay means the launcher's own Container.build
+        // later reads OUR value, so the enum identity, the StackFit and the Clip all
+        // stay exactly as the launcher left them.
+        //
+        // Everything here is addressed off the saved x15 rather than off x29, because
+        // the splice does not spill x29 and must not depend on the callee preserving
+        // it: FP = saved_x15 + dart_save(32) + frame, and the owner local is owner_slot
+        // below that. g_folder_inner_owner_local is that folded distance.
+        const uintptr_t base = heap & ~uint64_t{0xffffffff};
+        const uintptr_t x15_saved = read64(saved + 128);
+        // The saved x15 is a GC-root stack pointer: it is non-zero on every real
+        // entry, but the native save block is 8 raw bytes we do not own, so a zero
+        // there would fault on the dereference below. Refuse instead.
+        if (x15_saved == 0) return;
+        uint32_t owner_off = 0;
+        std::memcpy(&owner_off, reinterpret_cast<const void *>(x15_saved + g_folder_inner_owner_local), 4);
+        const uintptr_t owner = base + owner_off;
+        // Refuse anything but a live Container whose alignment is one of the two
+        // AlignmentDirectional roots the launcher itself resolves between, or null.
+        // A Container carrying some other alignment was built for a different call
+        // site and must keep it - a mis-owned write is indistinguishable from a
+        // layout bug, which is the one failure mode worth refusing to risk.
+        if (owner_off != 0 && (owner & 7) == 1) {
+            uint32_t cur = 0, center = 0, low = 0, high = 0;
+            std::memcpy(&cur, reinterpret_cast<const void *>(owner + g_folder_inner.alignment), 4);
+            std::memcpy(&center, reinterpret_cast<const void *>(pool + g_folder_inner.center_pool), 4);
+            std::memcpy(&low, reinterpret_cast<const void *>(pool + g_folder_inner.direction_pool[0]), 4);
+            std::memcpy(&high, reinterpret_cast<const void *>(pool + g_folder_inner.direction_pool[1]), 4);
+            const bool known = cur == 0 || cur == low || cur == high;
+            if (known && center != 0 && (center & 7) == 1 && center != cur) {
+                std::memcpy(reinterpret_cast<void *>(owner + g_folder_inner.alignment), &center, 4);
+                static std::atomic_uint reported{0};
+                if (!(reported.load(std::memory_order_relaxed) & 1U)
+                    && !(reported.fetch_or(1U, std::memory_order_relaxed) & 1U))
+                    __android_log_print(ANDROID_LOG_INFO, kTag,
+                        "folder inner alignment rewritten: align=%#x cur=%#x dirs=%#x/%#x -> center=%#x bit=%u",
+                        g_folder_inner.alignment, cur, low, high, center, g_folder_inner.direction_bit);
+            }
+        }
     } else if ((packed & 1) && pool) {
-        const uintptr_t center = read64(pool + (kind == 7 ? g_folder_cross_center_pool : g_folder_center_pool));
+        const uintptr_t center = read64(pool + g_folder_center_pool);
         // Pool entries are GC roots; reread on every build. The enums must share their
         // class, with index start=4 and center=2. No pool scan, allocation or constant writes.
         uint64_t start_index = 0, center_index = 0;
@@ -3613,7 +3685,7 @@ extern "C" void hc_folder_layout_body(uintptr_t saved, uintptr_t pool, unsigned 
             && ((read64(argument - 1) >> 12) & 0xfffff) == ((read64(center - 1) >> 12) & 0xfffff)) {
             std::memcpy(&start_index, reinterpret_cast<const void *>(argument + g_folder_enum_index_field), 8);
             std::memcpy(&center_index, reinterpret_cast<const void *>(center + g_folder_enum_index_field), 8);
-            if ((kind == 7 ? start_index <= 4 : start_index == 4) && center_index == 2) std::memcpy(reinterpret_cast<void *>(saved + 8), &center, 8);
+            if (start_index == 4 && center_index == 2) std::memcpy(reinterpret_cast<void *>(saved + 8), &center, 8);
         }
     }
 }
@@ -3921,8 +3993,11 @@ bool adopt_layout_state() {
     __atomic_store_n(&hc_folder_layout_requested, uint64_t{0}, __ATOMIC_RELEASE);
     g_folder_cell_width_field = g_folder_gap_field = -1;
     g_folder_screen_width_field = g_folder_screen_height_field = g_folder_cling_width_field = -1;
-    g_folder_center_pool = g_folder_cross_center_pool = g_folder_alignment_start_pool = 0;
+    g_folder_center_pool = 0;
     g_folder_controller_config_field = g_folder_rx_value_field = g_folder_enum_index_field = -1;
+    g_folder_inner = home_layout::FolderInnerContainer{};
+    g_folder_inner_owner_local = 0;
+    g_folder_inner_ready = false;
     for (auto &original : hc_folder_layout_original) original = nullptr;
     g_probe_primed = false;
     g_hook_globals_inited = false;
