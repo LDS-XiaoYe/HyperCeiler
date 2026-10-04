@@ -233,11 +233,36 @@ struct FolderInnerContainer {
     uint32_t direction_bit = 0;   // which bit of the cross-axis value selects between them
 };
 
-// 1. The replay window: a BL whose four following instructions consume the two frame
-//    locals it needs - reload both from the frame, move the second into the argument
-//    register, store the first into the frame's return slot. Exactly four instructions,
-//    which is what the 4-word patch budget can hold. Anything looser matches an
-//    unrelated call site and patches the wrong sixteen bytes.
+// Reject direct control-flow edges into the middle of a 16-byte patch. The editor
+// joins the text path after its owner reload: overwriting that reload would turn the
+// editor's branch into a jump to the middle of the native absolute-jump sequence.
+inline bool folder_window_single_entry(std::span<const uint32_t> body,
+        uint32_t va, uint32_t window) {
+    for (size_t j = 0; j < body.size(); ++j) {
+        const uint32_t op = body[j]; int64_t delta = 0;
+        if ((op & 0x7c000000) == 0x14000000) {
+            int32_t n = int32_t(op & 0x3ffffff);
+            if (n & 0x2000000) n -= 0x4000000;
+            delta = int64_t(n) * 4;
+        } else if ((op & 0xff000010) == 0x54000000
+                || (op & 0x7e000000) == 0x34000000) {
+            int32_t n = int32_t((op >> 5) & 0x7ffff);
+            if (n & 0x40000) n -= 0x80000;
+            delta = int64_t(n) * 4;
+        } else if ((op & 0x7e000000) == 0x36000000) {
+            int32_t n = int32_t((op >> 5) & 0x3fff);
+            if (n & 0x2000) n -= 0x4000;
+            delta = int64_t(n) * 4;
+        } else continue;
+        const int64_t target = int64_t(va) + int64_t(j) * 4 + delta;
+        if (target > window && target < int64_t(window) + 16) return false;
+    }
+    return true;
+}
+
+// 1. Find the Container handoff, then splice at the COMMON join one instruction
+// after the text-only owner reload. Saved x3 identifies the selected child on both
+// paths. Replay has no BL/GC return-PC relocation and all incoming edges hit its start.
 inline bool folder_inner_window(std::span<const uint32_t> body, uint32_t va,
         uint32_t &window, uint32_t &owner_slot) {
     unsigned hits = 0; uint32_t w = 0, os = 0;
@@ -250,7 +275,10 @@ inline bool folder_inner_window(std::span<const uint32_t> body, uint32_t va,
         if (insn_rn(lb) != 29) continue;
         if (insn_rt(mv) != 2 || ((mv >> 16) & 31u) != insn_rt(lb)) continue;
         if (insn_rt(st) != 3 || insn_rn(st) != 29 || insn_imm9(st) != uint32_t(-8)) continue;
-        w = va + uint32_t(i + 1) * 4;
+        const uint32_t next = body[i + 5];
+        if ((next & 0xffc003ff) != 0x91400361) continue; // ADD x1, PP, #imm, LSL #12
+        w = va + uint32_t(i + 2) * 4;
+        if (!folder_window_single_entry(body, va, w)) continue;
         os = uint32_t(-int32_t(insn_imm9(la))); ++hits;
     }
     if (hits != 1) return false;

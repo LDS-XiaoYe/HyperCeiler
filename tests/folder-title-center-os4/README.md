@@ -9,11 +9,18 @@ Run from the repository root:
 python -X utf8 tests/folder-title-center-os4/verify.py .
 ```
 
-The current snapshot passes 73 host checks. This is not a visual completion claim.
-The installed outer-Stack alignment implementation still leaves the visible folder title at start.
-A subsequent device-only probe proved that the inner fresh Container alignment and symmetric
-EdgeInsets are the remaining correction; that correction is not implemented in this commit.
-Rename/clear-button and final native deployment still require regression.
+The current snapshot passes 96 host checks. These are not a substitute for visual verification.
+The production splice now updates the freshly built inner Container's alignment before its
+first consumer. Its replay window, frame, owner local, fields and semantic roots are derived
+from launcher instructions; Dart objects remain 8-byte aligned. Folder title centering is
+installed and user-confirmed on launcher 7722. The padding field is discovered but is not
+rewritten by this callback. The splice starts at the common text/editor join, rejects incoming
+branches into its interior, and compares the selected x3 child with the fresh Container local
+before writing. This covers the editor branch that previously entered the middle of the patch.
+On launcher 7722, three editor entries, clear/rename/save and three folder-close cycles
+passed without new crash records; the original folder name was restored exactly.
+Long-title and RTL behavior still require separate device regression; do not reuse
+older preference backups that reset the user's title setting.
 
 The local handover/WORKTREE_TAKEOVER.md records the continuation details; handover is gitignored.
 Device screenshots, preference backups, debugger probes, APKs, signing material, and tool binaries
