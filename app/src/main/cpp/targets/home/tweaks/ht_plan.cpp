@@ -3,6 +3,9 @@
 #include "a64.h"
 #include "symtab.h"
 
+#include <algorithm>
+#include <array>
+#include <utility>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,19 +31,27 @@ void SetWhy(char* buf, size_t cap, const char* fmt, ...) {
 }
 
 template <typename Fn>
-void ForEachExecWord(const CodeView& code, Fn fn) {
+bool ForEachExecWord(const CodeView& code, Fn fn) {
+    if (!code.ExecutableRangesOk()) return false;
     const Image& img = code.image();
+    std::array<uint32_t, CodeView::kReadChunkWords> scratch;
     for (size_t s = 0; s < img.segmentCount; ++s) {
         const Segment& seg = img.segments[s];
-        if ((seg.flags & 0x1u) == 0) continue;
-        if (seg.end <= seg.begin) continue;
+        if ((seg.flags & 1u) == 0) continue;
         const uint32_t baseVa = static_cast<uint32_t>(seg.begin - img.base);
         const size_t words = (seg.end - seg.begin) / 4;
-        const uint32_t* p = reinterpret_cast<const uint32_t*>(seg.begin);
-        for (size_t i = 0; i < words; ++i) {
-            if (!fn(baseVa + static_cast<uint32_t>(i * 4), p[i])) return;
+        for (size_t offset = 0; offset < words;) {
+            const size_t copied = std::min(CodeView::kReadChunkWords, words - offset);
+            const uint32_t va = baseVa + static_cast<uint32_t>(offset * 4);
+            if (!code.ReadWords(va, scratch.data(), copied)) return false;
+            for (size_t i = 0; i < copied; ++i) {
+                // false means deliberate early stop, NOT a failed read.
+                if (!fn(va + static_cast<uint32_t>(i * 4), scratch[i])) return true;
+            }
+            offset += copied;
         }
     }
+    return true;
 }
 
 bool LocateFunction(const CodeView& code, const char* needle, uint32_t* va, uint32_t* size,
@@ -91,7 +102,7 @@ int CountBlTo(const CodeView& code, uint32_t lo, uint32_t hi, uint32_t target,
     int n = 0;
     for (uint32_t a = lo; a + 4 <= hi; a += 4) {
         uint32_t w = 0;
-        if (!code.Word(a, &w)) break;
+        if (!code.Word(a, &w)) return -1;
         if (!a64::IsBl(w)) continue;
         uint32_t t = 0;
         if (!a64::DecodeBranch(w, a, &t)) continue;
@@ -102,19 +113,28 @@ int CountBlTo(const CodeView& code, uint32_t lo, uint32_t hi, uint32_t target,
     return n;
 }
 
-void FindCallers(const CodeView& code, uint32_t target, std::vector<uint32_t>* out) {
-    ForEachExecWord(code, [&](uint32_t va, uint32_t w) -> bool {
+bool FindCallers(const CodeView& code, uint32_t target, std::vector<uint32_t>* out) {
+    if (out == nullptr) return false;
+    std::vector<uint32_t> found;
+    bool overflow = false;
+    const bool complete = ForEachExecWord(code, [&](uint32_t va, uint32_t w) -> bool {
         if (!a64::IsBl(w)) return true;
         uint32_t t = 0;
-        if (!a64::DecodeBranch(w, va, &t)) return true;
-        if (t == target) out->push_back(va);
+        if (!a64::DecodeBranch(w, va, &t) || t != target) return true;
+        // Bound allocation without treating a truncated call inventory as complete.
+        if (found.size() >= 65536) { overflow = true; return false; }
+        found.push_back(va);
         return true;
     });
+    if (!complete || overflow) return false;
+    *out = std::move(found);
+    return true;
 }
 
 bool HasInbound(const CodeView& code, uint32_t lo, uint32_t hi) {
+    if (lo >= hi) return true;
     bool found = false;
-    ForEachExecWord(code, [&](uint32_t va, uint32_t w) -> bool {
+    const bool complete = ForEachExecWord(code, [&](uint32_t va, uint32_t w) -> bool {
         uint32_t t = 0;
         if (!a64::DecodeBranch(w, va, &t)) return true;
         if (t >= lo && t < hi) {
@@ -123,7 +143,8 @@ bool HasInbound(const CodeView& code, uint32_t lo, uint32_t hi) {
         }
         return true;
     });
-    return found;
+    // An unreadable interval cannot prove the absence of inbound branches.
+    return !complete || found;
 }
 
 int DefReg(uint32_t w) {
@@ -179,7 +200,10 @@ bool LocateFeature9(const CodeView& code, LocatedSites* out) {
         return false;
     }
     std::vector<uint32_t> callers;
-    FindCallers(code, ovVa, &callers);
+    if (!FindCallers(code, ovVa, &callers)) {
+        SetWhy(out->why9, sizeof(out->why9), "调用方扫描不完整（读取失败或候选超限）");
+        return false;
+    }
     if (callers.empty()) {
         SetWhy(out->why9, sizeof(out->why9), "_insertClearButtonOverlay 没有任何调用方");
         return false;
@@ -1029,7 +1053,8 @@ void DeriveFeature16(const CodeView& code, const Config& cfg, const LocatedSites
     if (cols != kFolderColsOfficial) {
         /*
          * 7695 排查结论：关闭动画的图标错位与正方形修正无关（禁用它后错位依旧）——
-         * 非官方列数本身与桌面的关闭动画冲突，是桌面侧的动画缺陷，记录为已知限制。
+         * 原始动画源坐标使用未约束格宽；home_layout_hooks 的三槽 bank 现在以实际 SliverGrid
+         * 的标量快照修正源坐标，保持 Dart 分配/GC 返回点，不再作为已知限制。
          * 修正恢复启用：它的价值（图标框不纵向拉伸）不受该限制影响。
          */
         if (!s.ok16sq || s.squareSiteVa == 0 || s.squareCalleeVa == 0) {

@@ -15,7 +15,7 @@ struct TargetFunction {
 size_t TargetFunctionCount();
 const TargetFunction& TargetFunctionAt(size_t index);
 
-constexpr size_t kMaxTargetSlots = 160;
+constexpr size_t kMaxTargetSlots = 189;
 
 class SymbolIndex {
 public:
@@ -24,6 +24,14 @@ public:
     bool EnsureLoaded(const Image& image);
 
     bool loaded() const { return loaded_; }
+
+    /*
+     * True once EnsureLoaded has taken the work on, whether or not it succeeded. Callers that run on
+     * the launcher main thread use this to decide "somebody is already doing this" without touching
+     * the loader lock: calling EnsureLoaded from a dlopen callback parses the whole .gnu_debugdata
+     * (tens of MB plus an xz pass) while holding the linker lock, which is what ANR'd the desktop.
+     */
+    bool attempted() const { return attempted_; }
 
     const char* status() const { return status_; }
 

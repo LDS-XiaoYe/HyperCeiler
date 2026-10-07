@@ -16,6 +16,8 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <optional>
+#include <mutex>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -156,7 +158,7 @@ const AIBinder_Class *window_class() {
  * are the minority.
  */
 constexpr char kCacheMagic[4] = {'H', 'C', 'L', 'C'};
-constexpr uint32_t kCacheVersion = 10;
+constexpr uint32_t kCacheVersion = 11;
 constexpr const char *kCachePath = "/data/user/0/com.miui.home/files/layout_config_cache.bin";
 constexpr const char *kCacheTmpPath = "/data/user/0/com.miui.home/files/layout_config_cache.bin.tmp";
 
@@ -210,6 +212,8 @@ void serialize_config(const Config &config, std::vector<uint8_t> &out) {
     const auto &f = config.folder;
     for (int value : {f.title_center, f.full_width, f.padding_enabled, f.phone_padding,
             f.landscape_padding, f.portrait_padding, f.tablet}) put_u32(value);
+    put_u32(kBackGestureMagic);
+    put_u32(config.back_gesture.height); put_u32(config.back_gesture.width);
 }
 
 bool parse_config(const std::vector<uint8_t> &data, Config &config) {
@@ -218,7 +222,7 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
     uint32_t version = 0;
     std::memcpy(&version, data.data() + 4, 4);
     if (version != 4 && version != 5 && version != 6 && version != 7 && version != 8
-        && version != 9 && version != kCacheVersion)
+        && version != 9 && version != 10 && version != kCacheVersion)
         return false;
     size_t at = 8;
     auto get_u32 = [&]() -> std::optional<uint32_t> {
@@ -293,22 +297,26 @@ bool parse_config(const std::vector<uint8_t> &data, Config &config) {
             auto next = get_u32(); if (!next) return false;
             word = static_cast<int32_t>(*next); return true;
         }, config.folder, false)) return false;
+    config.back_gesture = {};
+    if (version >= 11 && !read_back_gesture([&](int32_t &word) {
+        auto next = get_u32(); if (!next) return false; word = static_cast<int32_t>(*next); return true;
+    }, config.back_gesture, false)) return false;
     if (version >= 8 && at != data.size()) return false;
     return true;
 }
 
-void write_config_cache(const Config &config) {
+bool write_config_cache(const Config &config) {
     std::vector<uint8_t> data;
     serialize_config(config, data);
     FILE *tmp = std::fopen(kCacheTmpPath, "wb");
-    if (tmp == nullptr) return;
+    if (tmp == nullptr) return false;
     const auto written = std::fwrite(data.data(), 1, data.size(), tmp);
-    std::fclose(tmp);
-    if (written != data.size()) {
+    const bool closed = std::fclose(tmp) == 0;
+    if (written != data.size() || !closed || std::rename(kCacheTmpPath, kCachePath) != 0) {
         std::remove(kCacheTmpPath);
-        return;
+        return false;
     }
-    std::rename(kCacheTmpPath, kCachePath);
+    return true;
 }
 
 bool read_config_cache(Config &config) {
@@ -430,6 +438,9 @@ static bool query_binder(Config &result) {
     if (valid) valid = read_folder_layout([&](int32_t &word) {
         return AParcel_readInt32(output, &word) == STATUS_OK;
     }, candidate.folder);
+    if (valid) valid = read_back_gesture([&](int32_t &word) {
+        return AParcel_readInt32(output, &word) == STATUS_OK;
+    }, candidate.back_gesture);
     const auto flag = [](int32_t value) { return value == 0 || value == 1; };
     const auto within = [](int32_t value, int32_t lo, int32_t hi) {
         return value >= lo && value <= hi;
@@ -472,38 +483,64 @@ static bool query_binder(Config &result) {
     return true;
 }
 
+// Serialize the infrequent configuration requests, not the Dart build path.
+// A persisted snapshot is only a cold-start bootstrap; it must never supersede
+// a newer successful Binder result when storage writes fail or the endpoint dies.
+struct ProcessConfigCache {
+    std::mutex mutex;
+    std::optional<Config> latest;
+    std::vector<uint8_t> persisted;
+};
+static ProcessConfigCache g_process_config;
+
+// LSPosed invokes the library-loaded callback while Android's linker lock may be
+// held. Never wait for the request mutex or enter Binder/dlsym on that path:
+// the worker can own this mutex while waiting for the same linker lock.
+// A busy cache is not a disabled snapshot; the worker publishes after loading.
+bool query_bootstrap_config(Config &result) {
+    std::unique_lock<std::mutex> lock(g_process_config.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    Config candidate;
+    if (g_process_config.latest) {
+        candidate = *g_process_config.latest;
+    } else if (!read_config_cache(candidate)) {
+        if (!debug_override_enabled()) return false;
+    }
+    // Keep calibration private, just as query_config does. Do not persist or
+    // publish a disk bootstrap as a new authoritative Binder revision here.
+    if (debug_override_enabled()) apply_debug_override(candidate);
+    result = std::move(candidate);
+    return true;
+}
+
 bool query_config(Config &result) {
+    std::lock_guard<std::mutex> lock(g_process_config.mutex);
     Config candidate;
     const bool from_binder = query_binder(candidate);
-    /*
-     * The debug properties, when present, are layered on top of the snapshot so a single knob can be
-     * calibrated without changing the settings page. They also make the query succeed when the
-     * endpoint is not up yet, which is what lets a calibration run start before system_server has
-     * bound the module.
-     */
     if (debug_override_enabled()) {
+        // Calibration never changes the authoritative in-memory or disk snapshot.
         apply_debug_override(candidate);
         result = candidate;
         return true;
     }
     if (!from_binder) {
-        /*
-         * Endpoint gone (LSPosed dispatch failure in system_server — early-boot APK parse
-         * failure, no retry): fall back to the last-known-good config so the consumer-side
-         * features keep running with the user's values instead of going dark with the endpoint.
-         * Only genuine binder configs are cached; the debug-override branch above is calibration
-         * and must not become persistent.
-         */
-        if (read_config_cache(candidate)) {
-            result = candidate;
-            __android_log_print(ANDROID_LOG_INFO, "HyperCeiler.HomeLayout",
-                "layout config from last-known cache (endpoint unavailable)");
+        if (g_process_config.latest) {
+            result = *g_process_config.latest;
             return true;
         }
-        return false;
+        if (!read_config_cache(candidate)) return false;
+        g_process_config.latest = candidate;
+        result = candidate;
+        return true;
     }
+    // Publish even when the subsequent disk write is rejected. Explicit disable,
+    // a lower/higher margin and a complete settings reset remain authoritative.
+    g_process_config.latest = candidate;
     result = candidate;
-    write_config_cache(candidate);
+    std::vector<uint8_t> serialized;
+    serialize_config(candidate, serialized);
+    if (serialized != g_process_config.persisted && write_config_cache(candidate))
+        g_process_config.persisted = std::move(serialized);
     return true;
 }
 

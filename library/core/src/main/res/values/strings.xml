@@ -103,4 +103,7 @@
     <string name="aicr_preferred_browser">Preferred browser</string>
     <string name="aicr_default_browser">Default browser</string>
 
+    <string name="home_restart_launcher">Restart launcher</string>
+    <string name="home_restart_zygote">Restart Zygote</string>
+    <string name="home_restart_zygote_confirm">Restart the Android runtime now? Apps will close and the phone will return to the lock screen.</string>
 </resources>

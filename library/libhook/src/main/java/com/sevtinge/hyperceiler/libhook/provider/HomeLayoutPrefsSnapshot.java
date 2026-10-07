@@ -11,6 +11,8 @@ import java.util.Map;
 public final class HomeLayoutPrefsSnapshot {
     public static final int SCHEMA = 1;
     private static final String[][] KEYS = {
+        {"integer", "home_navigation_back_area_height"},
+        {"integer", "home_navigation_back_area_width"},
         {"boolean", "home_layout_unlock_grids_new"},
         {"integer", "home_layout_unlock_grids_cell_x"},
         {"integer", "home_layout_unlock_grids_cell_y"},

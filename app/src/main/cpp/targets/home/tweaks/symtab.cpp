@@ -2,6 +2,7 @@
 #include "symtab.h"
 
 #include "a64.h"
+#include "scanner.h"
 
 #include <elf.h>
 #include <stdarg.h>
@@ -9,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <array>
 #include <vector>
 #include <algorithm>
 #include <limits>
@@ -46,6 +48,12 @@ const TargetFunction kTargets[] = {
         {"FolderInfoModel.hasNewInstalledApp", "FolderInfoModel.hasNewInstalledApp", "OS4 文件夹新安装标记"},
         {"FolderIconGetxController.updateNewInstallNotification", "FolderIconGetxController.updateNewInstallNotification", "OS4 新安装标记调用校验"},
         {"ShortcutIconWidget._addNewInstallLight", "ShortcutIconWidget._addNewInstallLight", "OS4 新安装光效"},
+        {"FolderGridViewGetxController.getFirstVisibleItemIndex", "FolderGridViewGetxController.getFirstVisibleItemIndex", "OS4 关闭预览原始索引取值校验"},
+        {"FolderClingGetxController.calcPositionForCellX", "FolderClingGetxController.calcPositionForCellX", "OS4 关闭预览原始坐标计算校验"},
+        {"Inst|find", "Inst|find", "OS4 文件夹原始 singleton 取值校验"},
+        {"WidgetPositionUtil.transformPointX", "WidgetPositionUtil.transformPointX", "OS4 文件夹屏幕坐标变换校验"},
+        {"SwipeController.isRtl", "SwipeController.isRtl", "OS4 文件夹方向分支校验"},
+        {"Offset.translate", "Offset.translate", "OS4 原始 Offset 分配器消费校验"},
         {"WidgetPositionUtil.getCellPosition", "WidgetPositionUtil.getCellPosition", "OS4 文件夹动画坐标原逻辑"},
         {"FolderIconGetxController.calOriginPreviewIconLoc", "FolderIconGetxController.calOriginPreviewIconLoc", "OS4 文件夹动画尺寸原逻辑"},
         {"CellLayoutGetxController.isItemPosEmpty", "CellLayoutGetxController.isItemPosEmpty", "OS4 grid count bounds receiver"},
@@ -192,6 +200,16 @@ const TargetFunction kTargets[] = {
          "候选 搜索框宽增量"},
         {"GridController.iconTopPadding", "GridController.iconTopPadding", "候选 图标上内边距"},
         {"GridController.titleHeight", "GridController.titleHeight", "候选 标题高度"},
+        {"FolderGridView._buildScrollableGrid", "FolderGridView._buildScrollableGrid", "文件夹关闭图标坐标一致性"},
+        {"SliverGridDelegateWithFixedCrossAxisCount.getLayout", "SliverGridDelegateWithFixedCrossAxisCount.getLayout", "文件夹关闭图标坐标一致性"},
+        {"FolderAnimController._setCloseGridItemAnim", "FolderAnimController._setCloseGridItemAnim", "文件夹关闭图标坐标一致性"},
+        {"FolderAnimController._refreshCachedGridParams", "FolderAnimController._refreshCachedGridParams", "文件夹关闭图标坐标一致性"},
+        {"FolderClingGetxController.gridContainerWidth", "FolderClingGetxController.gridContainerWidth", "文件夹关闭图标坐标一致性"},
+        {"FolderAnimController._calcRealIconPos", "FolderAnimController._calcRealIconPos", "文件夹图标正空隙居中边界"},
+        {"FolderAnimController._setGridEndLoc", "FolderAnimController._setGridEndLoc", "文件夹关闭图标坐标一致性"},
+        {"FolderAnimController._calcFolderPreviewLoc", "FolderAnimController._calcFolderPreviewLoc", "文件夹关闭预览落点一致性"},
+        {"FolderAnimController._initGridViewItemAnimParams", "FolderAnimController._initGridViewItemAnimParams", "文件夹动画锚点负空隙截零"},
+        {"ShortcutIconDropMixin.folderItemPadding", "ShortcutIconDropMixin.folderItemPadding", "文件夹原始图标内边距"},
         {"GridController.folderCellHeight", "GridController.folderCellHeight", "候选 文件夹格高"},
         {"FolderGridViewGetxController.folderCellHeight",
          "FolderGridViewGetxController.folderCellHeight", "文件夹行间距"},
@@ -258,6 +276,12 @@ const TargetFunction kTargets[] = {
          */
         {"FolderGridViewGetxController.calGridWidth", "FolderGridViewGetxController.calGridWidth", "文件夹原逻辑布局"},
         {"FolderClingWidget.getFolderClingWidth", "FolderClingWidget.getFolderClingWidth", "文件夹原逻辑布局"},
+        {"BigFolderCommonStrategy.calItemSize", "BigFolderCommonStrategy.calItemSize", "大文件夹工作区尺寸原逻辑"},
+        {"BigFolderCommonStrategy._calItemSizeByWidth", "BigFolderCommonStrategy._calItemSizeByWidth", "大文件夹预览尺寸原逻辑"},
+        {"BigFolderCommonStrategy._calItemSizeByHeight", "BigFolderCommonStrategy._calItemSizeByHeight", "大文件夹预览尺寸原逻辑"},
+        {"FolderLayoutStrategy.calItemSize", "FolderLayoutStrategy.calItemSize", "大文件夹工作区尺寸原逻辑"},
+        {"FolderIconGetxController.folderIconSize", "FolderIconGetxController.folderIconSize", "大文件夹工作区尺寸原逻辑"},
+        {"FolderIconGetxController.checkOrUpdateStrategy", "FolderIconGetxController.checkOrUpdateStrategy", "大文件夹工作区尺寸原逻辑"},
         {"FolderClingGetxController._calcFolderPaddingTop", "FolderClingGetxController._calcFolderPaddingTop", "文件夹原逻辑布局"},
         {"FolderHeaderWidget.build", "FolderHeaderWidget.build", "文件夹标题容器原逻辑"},
         {"AndroidAttributeUtils.convertGravity", "AndroidAttributeUtils.convertGravity", "文件夹 Stack Alignment 语义"},
@@ -345,40 +369,39 @@ const char* StrAt(const char* table, size_t tableSize, uint32_t offset) {
     return (memchr(s, '\0', max) != nullptr) ? s : nullptr;
 }
 
-bool VaInExecSegment(const Image& image, uint32_t va) {
+bool VaInExecSegment(const Image& image, uint32_t va, size_t bytes = 4) {
+    if (!bytes || (va & 3u) || (bytes & 3u) || !image.base || (image.base & 3u)
+        || image.segmentCount == 0 || image.segmentCount > std::size(image.segments)
+        || uint64_t(bytes) > uint64_t(UINT32_MAX) + 1u - va
+        || uintptr_t(va) > UINTPTR_MAX - image.base) return false;
+    const uintptr_t address = image.base + uintptr_t(va);
     for (size_t i = 0; i < image.segmentCount; ++i) {
         const Segment& s = image.segments[i];
-        if ((s.flags & 0x1u) == 0) continue;
-        const uint64_t begin = s.begin - image.base;
-        const uint64_t end = s.end - image.base;
-        if (static_cast<uint64_t>(va) >= begin && static_cast<uint64_t>(va) + 4 <= end) {
-            return true;
-        }
+        if ((s.flags & 7u) != 5u || s.begin < image.base || s.begin >= s.end
+            || (s.begin & 3u) || (s.end & 3u)) continue;
+        if (address >= s.begin && address < s.end && bytes <= s.end - address) return true;
     }
     return false;
 }
 
 bool LooksLikeDartFunction(const Image& image, uint32_t va, const char *name, uint32_t size) {
-    if (!VaInExecSegment(image, va)) return false;
-    if (va < 8) return false;
-    const uint32_t* p = reinterpret_cast<const uint32_t*>(
-            image.base + static_cast<uintptr_t>(va));
+    if (!name || va < 8 || (va & 3) || size < 8 || size > kMaxFunctionBytes
+        || (size & 3) || !VaInExecSegment(image, va, size)) return false;
+    const bool text_align = NameEquals(name, "AndroidAttributeUtils.convertTextAlignment");
+    const bool grid_width = NameEquals(name, "FolderClingGetxController.gridContainerWidth");
+    // Copy just the dispatch prefix, never dereference an execution mapping directly.
+    // A failed/partial read cannot classify even when it wrote matching initial words.
+    // Tiny normal framed bodies retain their old admission regardless of exact name.
+    const size_t required = grid_width ? 7 : text_align ? 3 : 2;
+    const size_t count = std::min<size_t>(size / sizeof(uint32_t), required);
+    std::array<uint32_t, 7> p{};
+    if (!CodeView(image).ReadWords(va, p.data(), count)) return false;
     if (p[0] == 0xA9BF79FDu && p[1] == 0xAA0F03FDu) return true;
-    // Read-only semantic root for folder alignment. This leaf has no Dart frame.
-    // Exact name and dispatch ABI only; bind_dart_target still rejects leaf patch sites.
-    if (NameEquals(name, "AndroidAttributeUtils.convertTextAlignment")) {
-        bool whole_function_exec = false;
-        for (size_t i = 0; i < image.segmentCount; ++i) {
-            const Segment &s = image.segments[i];
-            if ((s.flags & 1u) && image.base + va >= s.begin
-                && uint64_t(image.base) + va + size <= s.end) whole_function_exec = true;
-        }
-        return whole_function_exec && size >= 12 && size <= kMaxFunctionBytes && !(size & 3)
-            && p[0] == 0xaa0103e3u && p[1] == 0xf1000c7fu
-            && (p[2] & 0xff00001fu) == 0x5400000cu;
-    }
-    // These verified leaf/stub functions intentionally have no Dart frame prologue.
-    // Keep the exception exact-name/size/opcode scoped; never accept arbitrary code.
+    // Exact named read-only semantic roots, not anonymous leaf patch targets.
+    if (text_align) return size >= 12 && p[0] == 0xaa0103e3u && p[1] == 0xf1000c7fu
+        && (p[2] & 0xff00001fu) == 0x5400000cu;
+    if (grid_width) return size >= 28 && (p[0] & 0xffe00fff) == 0xb8400020 && p[1] == 0x8b1c8000
+        && (p[5] & 0xffe00fff) == 0xfc400000 && p[6] == 0xd65f03c0;
     if (NameEquals(name, "ShortcutInfoModel.getComponentName") && size == 0x48)
         return p[0] == 0xd28020f1u && p[1] == 0xb8716822u;
     if (NameEquals(name, "allocateTwoByteString") && size == 0xec)
@@ -391,6 +414,10 @@ void SetStatus(char* buf, size_t cap, const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, cap, fmt, ap);
     va_end(ap);
+}
+
+bool BytesInBuffer(uint64_t offset, uint64_t bytes, size_t total) {
+    return offset <= total && bytes <= total - offset;
 }
 
 uint64_t DictSizeFromProps(uint8_t d) {
@@ -498,6 +525,10 @@ bool SymbolIndex::SpanFrom(uint32_t va, uint32_t* span) const {
 bool SymbolIndex::EnsureLoaded(const Image& image) {
     if (attempted_) return loaded_;
     attempted_ = true;
+    if (!CodeView(image).ExecutableRangesOk()) {
+        SetStatus(status_, sizeof(status_), "目标执行段范围/权限不合法");
+        return false;
+    }
 
     Elf64_Ehdr eh{};
     if (!ReadImageFile(image, 0, &eh, sizeof(eh))) {
@@ -505,24 +536,29 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
         return false;
     }
     if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_ident[EI_VERSION] != EV_CURRENT ||
+        eh.e_machine != EM_AARCH64 || eh.e_version != EV_CURRENT ||
         eh.e_shentsize != sizeof(Elf64_Shdr) || eh.e_shnum == 0 ||
         eh.e_shnum > kMaxSections || eh.e_shstrndx >= eh.e_shnum) {
         SetStatus(status_, sizeof(status_), "ELF 节头表不合法（shnum=%u）", eh.e_shnum);
         return false;
     }
 
-    std::vector<uint8_t> shdrs(static_cast<size_t>(eh.e_shnum) * sizeof(Elf64_Shdr));
-    if (!ReadImageFile(image, eh.e_shoff, shdrs.data(), shdrs.size())) {
+    std::vector<Elf64_Shdr> shdrs(eh.e_shnum);
+    if (!ReadImageFile(image, eh.e_shoff, shdrs.data(), shdrs.size() * sizeof(Elf64_Shdr))) {
         SetStatus(status_, sizeof(status_), "读不到节头表（off=%#llx）",
                   static_cast<unsigned long long>(eh.e_shoff));
         return false;
     }
-    const Elf64_Shdr* sh = reinterpret_cast<const Elf64_Shdr*>(shdrs.data());
+    const Elf64_Shdr* sh = shdrs.data();
 
     const Elf64_Shdr& shstr = sh[eh.e_shstrndx];
-    std::vector<char> shstrBuf(static_cast<size_t>(shstr.sh_size) + 1, '\0');
-    if (shstr.sh_size == 0 || shstr.sh_size > (1u << 20) ||
-        !ReadImageFile(image, shstr.sh_offset, shstrBuf.data(), shstr.sh_size)) {
+    if (shstr.sh_type != SHT_STRTAB || shstr.sh_size == 0 || shstr.sh_size > (1u << 20)) {
+        SetStatus(status_, sizeof(status_), ".shstrtab 尺寸/类型不合法");
+        return false;
+    }
+    std::vector<char> shstrBuf(static_cast<size_t>(shstr.sh_size), '\0');
+    if (!ReadImageFile(image, shstr.sh_offset, shstrBuf.data(), shstrBuf.size())) {
         SetStatus(status_, sizeof(status_), "读不到 .shstrtab");
         return false;
     }
@@ -579,54 +615,70 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
         SetStatus(status_, sizeof(status_), "解压出来的调试数据太短");
         return false;
     }
-    const Elf64_Ehdr* deh = reinterpret_cast<const Elf64_Ehdr*>(debug.data());
-    if (memcmp(deh->e_ident, ELFMAG, SELFMAG) != 0 || deh->e_shentsize != sizeof(Elf64_Shdr) ||
-        deh->e_shnum == 0 || deh->e_shoff + static_cast<uint64_t>(deh->e_shnum) * sizeof(Elf64_Shdr) > debugSize) {
+    Elf64_Ehdr deh{};
+    memcpy(&deh, debug.data(), sizeof(deh));
+    if (memcmp(deh.e_ident, ELFMAG, SELFMAG) != 0 || deh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        deh.e_ident[EI_DATA] != ELFDATA2LSB || deh.e_ident[EI_VERSION] != EV_CURRENT ||
+        deh.e_machine != EM_AARCH64 || deh.e_version != EV_CURRENT ||
+        deh.e_shentsize != sizeof(Elf64_Shdr) || deh.e_shnum == 0 || deh.e_shnum > kMaxSections ||
+        !BytesInBuffer(deh.e_shoff, uint64_t(deh.e_shnum) * sizeof(Elf64_Shdr), debugSize)) {
         SetStatus(status_, sizeof(status_), "调试数据不是预期的 ELF");
         return false;
     }
-    const Elf64_Shdr* dsh = reinterpret_cast<const Elf64_Shdr*>(debug.data() + deh->e_shoff);
+    std::vector<Elf64_Shdr> debugSections(deh.e_shnum);
+    memcpy(debugSections.data(), debug.data() + deh.e_shoff, debugSections.size() * sizeof(Elf64_Shdr));
+    const Elf64_Shdr* dsh = debugSections.data();
 
     const Elf64_Shdr* symtab = nullptr;
     const Elf64_Shdr* strtab = nullptr;
-    for (uint32_t i = 0; i < deh->e_shnum; ++i) {
+    for (uint32_t i = 0; i < deh.e_shnum; ++i) {
         if (dsh[i].sh_type != SHT_SYMTAB) continue;
         if (dsh[i].sh_entsize != sizeof(Elf64_Sym)) continue;
-        if (dsh[i].sh_link >= deh->e_shnum) continue;
-        if (dsh[i].sh_offset + dsh[i].sh_size > debugSize) continue;
+        if (dsh[i].sh_link >= deh.e_shnum || dsh[i].sh_size % sizeof(Elf64_Sym) != 0) continue;
+        if (!BytesInBuffer(dsh[i].sh_offset, dsh[i].sh_size, debugSize)) continue;
         symtab = &dsh[i];
         strtab = &dsh[dsh[i].sh_link];
         break;
     }
-    if (symtab == nullptr || strtab == nullptr || strtab->sh_offset + strtab->sh_size > debugSize) {
+    if (symtab == nullptr || strtab == nullptr || strtab->sh_type != SHT_STRTAB ||
+        !BytesInBuffer(strtab->sh_offset, strtab->sh_size, debugSize)) {
         SetStatus(status_, sizeof(status_), "调试 ELF 里没有可用的符号表");
         return false;
     }
 
-    const uint32_t count = static_cast<uint32_t>(symtab->sh_size / sizeof(Elf64_Sym));
-    if (count > kMaxSymbols) {
-        SetStatus(status_, sizeof(status_), "符号表异常大（%u 条）", count);
+    const uint64_t wideCount = symtab->sh_size / sizeof(Elf64_Sym);
+    if (wideCount > kMaxSymbols) {
+        SetStatus(status_, sizeof(status_), "符号表异常大（%llu 条）",
+                  static_cast<unsigned long long>(wideCount));
         return false;
     }
-    const Elf64_Sym* syms = reinterpret_cast<const Elf64_Sym*>(debug.data() + symtab->sh_offset);
+    const uint32_t count = static_cast<uint32_t>(wideCount);
     const char* strtabData = reinterpret_cast<const char*>(debug.data() + strtab->sh_offset);
     const size_t strtabSize = static_cast<size_t>(strtab->sh_size);
 
     std::vector<uint32_t> textVas;
     textVas.reserve(count / 4 + 8);
+    bool ambiguous[kTargetCount]{};
 
     for (uint32_t i = 0; i < count; ++i) {
-        const Elf64_Sym& sym = syms[i];
-        if (sym.st_shndx != SHN_UNDEF && sym.st_value != 0 &&
-            ELF64_ST_TYPE(sym.st_info) == STT_FUNC && sym.st_value <= UINT32_MAX) {
-            textVas.push_back(static_cast<uint32_t>(sym.st_value));
-        }
-        if (sym.st_name == 0 || sym.st_value == 0) continue;
+        Elf64_Sym sym{};
+        memcpy(&sym, debug.data() + symtab->sh_offset + uint64_t(i) * sizeof(sym), sizeof(sym));
+        // Neither a data symbol nor a truncated 64-bit address is a function root.
+        if (sym.st_shndx == SHN_UNDEF || sym.st_shndx >= deh.e_shnum ||
+            !(dsh[sym.st_shndx].sh_flags & SHF_EXECINSTR) ||
+            ELF64_ST_TYPE(sym.st_info) != STT_FUNC || sym.st_value == 0 ||
+            sym.st_value > UINT32_MAX || (sym.st_value & 3) ||
+            sym.st_size > UINT32_MAX || (sym.st_size & 3) ||
+            !VaInExecSegment(image, static_cast<uint32_t>(sym.st_value)) ||
+            (sym.st_size && !VaInExecSegment(image, static_cast<uint32_t>(sym.st_value), sym.st_size))) continue;
+        textVas.push_back(static_cast<uint32_t>(sym.st_value));
+        if (sym.st_name == 0) continue;
         const char* name = StrAt(strtabData, strtabSize, sym.st_name);
         if (name == nullptr) continue;
         for (size_t t = 0; t < kTargetCount; ++t) {
             if (!NameEquals(name, kTargets[t].fullName)) continue;
             const uint32_t size = static_cast<uint32_t>(sym.st_size);
+            if (has_[t] && va_[t] != sym.st_value) ambiguous[t] = true;
             if (has_[t] && size_[t] >= size) break;
             va_[t] = static_cast<uint32_t>(sym.st_value);
             size_[t] = size;
@@ -639,8 +691,12 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     textVas.erase(std::unique(textVas.begin(), textVas.end()), textVas.end());
     for (size_t t = 0; t < kTargetCount; ++t) {
         if (!has_[t]) continue;
+        if (ambiguous[t]) { has_[t] = false; va_[t] = size_[t] = span_[t] = 0; continue; }
         const auto next_function = std::upper_bound(textVas.begin(), textVas.end(), va_[t]);
-        if (next_function != textVas.end()) span_[t] = *next_function - va_[t];
+        if (next_function != textVas.end()) {
+            const uint32_t span = *next_function - va_[t];
+            if (VaInExecSegment(image, va_[t], span)) span_[t] = span;
+        }
         if (size_[t] == 0) {
             uint32_t next = 0;
             for (uint32_t candidate : textVas) {

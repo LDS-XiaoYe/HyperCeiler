@@ -6,6 +6,10 @@
 #include "image.h"
 #include "scanner.h"
 #include "symtab.h"
+#include "nativehook/code_word_write.h"
+#include "nativehook/memory_io.h"
+#include <array>
+#include <sys/sysmacros.h>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -47,6 +51,8 @@ struct AppliedPatch {
     uintptr_t address;
     uint32_t oldWord;
     uint32_t newWord;
+    bool reverting = false; // A failed restore must never be repaired back to the old override.
+    nhk::WordWriteJournal recovery{};
 };
 
 struct PatchStats {
@@ -62,6 +68,7 @@ struct State {
     Image image{};
     bool imageFound = false;
     uint64_t imageId = 0;
+    bool identityTried = false; // Advisory cache: one full-file attempt per discovered process image.
 
     Config config;
     bool configLoaded = false;
@@ -89,6 +96,8 @@ struct State {
 
     std::vector<AppliedPatch> applied;
     bool repatchNeeded = true;
+    bool restoreBlocked = false;
+    bool writeRetryPending = false;
 
     char imageHow[32]{};
     char siteSource[96]{};
@@ -129,44 +138,76 @@ bool IsLauncherProcess() {
     return strcmp(buf, "com.miui.home") == 0;
 }
 
-int PageProtection(uintptr_t address) {
-    FILE* maps = fopen("/proc/self/maps", "re");
-    if (maps == nullptr) return -1;
-    char line[512];
-    int result = -1;
-    while (fgets(line, sizeof(line), maps) != nullptr) {
-        unsigned long long begin = 0, end = 0;
-        char perms[5] = {0};
-        if (sscanf(line, "%llx-%llx %4s", &begin, &end, perms) != 3) continue;
-        if (address < begin || address >= end) continue;
-        result = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) |
-                 (perms[2] == 'x' ? PROT_EXEC : 0);
-        break;
+// Permission changes are journaled separately from whether the instruction landed.
+// Fresh /proc metadata is a bounded identity check, not a lock against concurrent remapping.
+struct CodeWordOps {
+    const Image& image;
+    long PageSize() { return sysconf(_SC_PAGESIZE); }
+    bool Page(uintptr_t address, size_t size, nhk::CodePage& page) {
+        int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        try {
+            std::string text; std::array<char,4096> chunk{}; bool good = true;
+            unsigned interruptions = 0;
+            for (;;) {
+                const ssize_t n = read(fd,chunk.data(),chunk.size());
+                if (n < 0 && errno == EINTR && ++interruptions <= 32) continue;
+                if (n < 0) { good = false; break; }
+                if (n == 0) break;
+                if (size_t(n) > chunk.size() || size_t(n) > 2*1024*1024-text.size()) {
+                    good = false; break;
+                }
+                text.append(chunk.data(),size_t(n));
+            }
+            const int closed = close(fd); fd = -1;
+            if (closed != 0) good = false; // close(EINTR) must not be retried
+            return good && nhk::ParseCodePage(text,address,size,page);
+        } catch (...) {
+            if (fd >= 0) (void)close(fd);
+            return false; // Allocation/parsing faults must retain the caller journal, not escape.
+        }
+}
+    bool Accept(const nhk::CodePage& page) {
+        return page.inode && page.inode == image.sourceInode
+            && uint64_t(makedev(page.major,page.minor)) == image.sourceDevice;
     }
-    fclose(maps);
-    return result;
+    bool Read(uintptr_t address, uint32_t& out) {
+        uint32_t value = 0;
+        if (!nhk::safe_read(address,std::as_writable_bytes(std::span(&value,1)))) return false;
+        out = value; return true;
+    }
+    bool Protect(uintptr_t page, size_t size, int protection) {
+        return mprotect(reinterpret_cast<void*>(page),size,protection) == 0;
+    }
+    long Write(uintptr_t address, uint32_t word, uint32_t expected) {
+        // Preserve one aligned atomic instruction change. Kernel byte-copy APIs do not
+        // promise instruction-word atomicity. An unmapping race still requires a lease.
+        return __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(address),&expected,
+            word,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED) ? 4 : 0;
+    }
+    void Flush(uintptr_t address, size_t size) {
+        __builtin___clear_cache(reinterpret_cast<char*>(address),reinterpret_cast<char*>(address+size));
+    }
+};
+
+nhk::WordWriteResult WriteWord(State* state, uintptr_t address, uint32_t expected,
+    uint32_t word, uint32_t restore) {
+    if (!state) return {};
+    CodeWordOps ops{state->image};
+    return nhk::WriteCodeWord(ops,address,expected,word,restore);
 }
 
-bool WriteWord(uintptr_t address, uint32_t word) {
-    const long pageSize = sysconf(_SC_PAGESIZE);
-    const uintptr_t pageStart = address & ~(static_cast<uintptr_t>(pageSize) - 1);
-    const size_t span = static_cast<size_t>(address - pageStart + 4);
-    int original = PageProtection(address);
-    if (original < 0) original = PROT_READ | PROT_EXEC;
-    if (mprotect(reinterpret_cast<void*>(pageStart), span,
-                 original | PROT_WRITE | PROT_EXEC) != 0) {
-        LOGE("mprotect 失败 地址=%#lx errno=%d", static_cast<unsigned long>(address), errno);
-        return false;
-    }
-    *reinterpret_cast<volatile uint32_t*>(address) = word;
-    __builtin___clear_cache(reinterpret_cast<char*>(address),
-                            reinterpret_cast<char*>(address + 4));
-    mprotect(reinterpret_cast<void*>(pageStart), span, original);
-    return true;
+bool RecoverWrite(State* state, nhk::WordWriteJournal& recovery) {
+    if (!state) return false;
+    CodeWordOps ops{state->image};
+    return nhk::RecoverCodeWord(ops,recovery);
 }
 
-uint32_t ReadWord(uintptr_t address) {
-    return *reinterpret_cast<volatile uint32_t*>(address);
+bool ReadWord(const State* state, uintptr_t address, uint32_t* out) {
+    if (!state || !out || address < state->image.base
+        || address - state->image.base > UINT32_MAX) return false;
+    // CodeView publishes a scalar only after a complete, fault-reporting read.
+    return CodeView(state->image).Word(uint32_t(address - state->image.base), out);
 }
 
 struct FeatureSlot {
@@ -235,7 +276,9 @@ void RefreshProtectedRanges(const std::vector<AppliedPatch>& applied) {
     const long pageSize = sysconf(_SC_PAGESIZE);
     std::lock_guard<std::mutex> lock(g_protectMutex);
     g_protectedRanges.clear();
+    if (pageSize < 4 || (uint64_t(pageSize) & (uint64_t(pageSize) - 1))) return;
     for (const AppliedPatch& p : applied) {
+        if (!p.address || (p.address & 3u) || p.address > UINTPTR_MAX - uintptr_t(pageSize)) continue;
         const uintptr_t begin = p.address & ~(static_cast<uintptr_t>(pageSize) - 1);
         const uintptr_t end = begin + static_cast<uintptr_t>(pageSize);
         g_protectedRanges.emplace_back(begin, end);
@@ -279,17 +322,33 @@ void InstallMadviseGuard() {
     }
 }
 
-void RevertApplied(State* state) {
+bool RevertApplied(State* state) {
+    if (!state) return false;
+    std::vector<AppliedPatch> pending;
+    pending.reserve(state->applied.size());
     for (auto it = state->applied.rbegin(); it != state->applied.rend(); ++it) {
-        const uint32_t current = ReadWord(it->address);
-        if (current == it->newWord && current != it->oldWord) {
-            if (!WriteWord(it->address, it->oldWord)) {
-                LOGW("还原失败 地址=%#lx", static_cast<unsigned long>(it->address));
-            }
+        AppliedPatch patch = *it;
+        patch.reverting = true;
+        if (!RecoverWrite(state,patch.recovery)) { pending.push_back(patch); continue; }
+        uint32_t current = 0;
+        if (!ReadWord(state, patch.address, &current)) {
+            pending.push_back(patch);
+            continue;
+        }
+        if (current == patch.oldWord) continue;
+        if (current != patch.newWord) { pending.push_back(patch); continue; }
+        const auto result = WriteWord(state,patch.address,patch.newWord,patch.oldWord,patch.oldWord);
+        patch.recovery = result.recovery;
+        if (!result.complete || !ReadWord(state, patch.address, &current) || current != patch.oldWord) {
+            // Retain both read faults and write/readback failures. A foreign value
+            // is never overwritten, and no newer plan may mix with this old one.
+            pending.push_back(patch);
         }
     }
-    state->applied.clear();
+    std::reverse(pending.begin(), pending.end());
+    state->applied = std::move(pending);
     RefreshProtectedRanges(state->applied);
+    return state->applied.empty();
 }
 
 /*
@@ -310,23 +369,44 @@ long DecodeMovzSmi(uint32_t word) {
 PatchStats ApplyPatches(State* state, const std::vector<PlanPatch>& patches) {
     PatchStats stats;
     stats.total = patches.size();
+    for (const auto& p : state->applied) {
+        if (p.reverting) { stats.failed = patches.size(); return stats; }
+    }
+    /*
+     * Record an applied slot once. A retry pass re-examines addresses that are already in the
+     * list - the "already in place" branch below is the common case on the second attempt - and
+     * appending unconditionally made `applied` grow without bound, which in turn made every
+     * later RevertApplied/Watchdog pass walk an ever longer list.
+     */
+    auto record = [state](uintptr_t address, uint32_t oldWord, uint32_t newWord) {
+        for (auto& existing : state->applied) {
+            if (existing.address == address) {
+                existing.oldWord = oldWord;
+                existing.newWord = newWord;
+                return;
+            }
+        }
+        state->applied.push_back({address, oldWord, newWord});
+    };
     size_t& written = stats.written;
     size_t& already = stats.already;
     size_t& missing = stats.failed;
     size_t& mismatch = stats.mismatch;
     size_t& outOfRange = stats.outOfRange;
     for (const PlanPatch& p : patches) {
+        if (uintptr_t(p.va) > UINTPTR_MAX - state->image.base) { ++outOfRange; continue; }
         const uintptr_t address = state->image.base + static_cast<uintptr_t>(p.va);
-        if (!RangeInImage(state->image, address, 4)) {
+        if (!CodeView(state->image).InText(p.va)) {
             ++outOfRange;
             LOGW("跳过越界补丁 va=%#x（不在 libapp.so 的映射段内）", p.va);
             continue;
         }
-        const uint32_t current = ReadWord(address);
+        uint32_t current = 0;
+        if (!ReadWord(state, address, &current)) { ++missing; continue; }
         if (current == p.patch) {
             ++already;
             LOGI("补丁已就位 %s：va=%#x，无需改动", p.what != nullptr ? p.what : "?", p.va);
-            state->applied.push_back({address, p.expect, p.patch});
+            record(address, p.expect, p.patch);
             continue;
         }
         if (current != p.expect) {
@@ -335,7 +415,8 @@ PatchStats ApplyPatches(State* state, const std::vector<PlanPatch>& patches) {
                  p.va, current, p.expect);
             continue;
         }
-        if (WriteWord(address, p.patch)) {
+        const auto result = WriteWord(state,address,p.expect,p.patch,p.expect);
+        if (result.complete) {
             ++written;
             const long before = DecodeMovzSmi(p.expect);
             const long after = DecodeMovzSmi(p.patch);
@@ -346,9 +427,25 @@ PatchStats ApplyPatches(State* state, const std::vector<PlanPatch>& patches) {
                 LOGI("补丁 %s：va=%#x %08x → %08x", p.what != nullptr ? p.what : "?", p.va,
                      p.expect, p.patch);
             }
-            state->applied.push_back({address, p.expect, p.patch});
+            record(address, p.expect, p.patch);
         } else {
             ++missing;
+            if (result.recovery.pending()) {
+                // A pending recovery is journal state, not a known-good slot: record it once and
+                // keep the journal that the restore pass needs.
+                bool existing = false;
+                for (auto& slot : state->applied) {
+                    if (slot.address == address) {
+                        slot = {address, p.expect, p.patch, true, result.recovery};
+                        existing = true;
+                        break;
+                    }
+                }
+                if (!existing) {
+                    state->applied.push_back({address,p.expect,p.patch,true,result.recovery});
+                }
+                state->restoreBlocked = true;
+            }
         }
     }
     LOGI("补丁应用完成：新写入 %zu，已就位 %zu，越界跳过 %zu，原值不符跳过 %zu，写入失败 %zu",
@@ -359,11 +456,22 @@ PatchStats ApplyPatches(State* state, const std::vector<PlanPatch>& patches) {
 
 void Watchdog(State* state) {
     size_t repaired = 0;
-    for (const AppliedPatch& p : state->applied) {
-        const uint32_t current = ReadWord(p.address);
+    for (AppliedPatch& p : state->applied) {
+        // A pending restore belongs to the retiring plan, never to repair work.
+        if (p.reverting) continue;
+        uint32_t current = 0;
+        if (!ReadWord(state, p.address, &current)) continue;
         if (current == p.newWord) continue;
         if (current == p.oldWord) {
-            if (WriteWord(p.address, p.newWord)) ++repaired;
+            const auto result = WriteWord(state,p.address,p.oldWord,p.newWord,p.oldWord);
+            if (result.complete) ++repaired;
+            else {
+                state->writeRetryPending = state->repatchNeeded = true;
+                if (result.recovery.pending()) {
+                    p.recovery = result.recovery; p.reverting = true;
+                    state->restoreBlocked = true;
+                }
+            }
         } else {
             LOGW("补丁页被改写 地址=%#lx 现在是 %08x（期望 %08x）",
                  static_cast<unsigned long>(p.address), current, p.newWord);
@@ -512,7 +620,12 @@ bool NeedAcquire(const State* state, uint32_t wanted) {
 void AcquireSites(State* state, bool allowScan) {    CodeView code(state->image);
     const uint32_t wanted = WantedFeatureMask(state->config);
     if (wanted == 0) return;
-    if (state->imageId == 0) state->imageId = ImageIdentity(state->image);
+    // A failed identity is a cache miss, not an invitation to hash the whole file
+    // on every settings refresh. Child State reset permits the next image attempt.
+    if (!state->identityTried) {
+        state->identityTried = true;
+        state->imageId = ImageIdentity(state->image);
+    }
 
     if (!state->packTried && NeedAcquire(state, wanted)) {
         state->packTried = true;
@@ -622,7 +735,7 @@ std::string DescribePlan(const PlanResult& plan) {
         if (i != 0) s += " ";
         s += "功能";
         s += std::to_string(kFeatureSlots[i].num);
-        s += ok[i] ? "=已生效" : "=未生效";
+        s += ok[i] ? "=计划可应用" : "=计划不可应用";
     }
     return s;
 }
@@ -730,7 +843,13 @@ std::string BuildStatusText(const State* state) {
     for (const FeatureSlot& f : kFeatureSlots) {
         const bool enabled = cfg.masterEnabled() && (wanted & f.bit) != 0;
         std::string value;
-        if (!enabled) {
+        if (state->restoreBlocked) {
+            value = "旧补丁恢复待重试；新设置尚未应用";
+        } else if (state->writeRetryPending) {
+            value = "补丁写入尚未全部完成；等待重试";
+        } else if (stats.mismatch || stats.outOfRange) {
+            value = "补丁校验未通过；未确认生效";
+        } else if (!enabled) {
             value = (f.num == kFeatureHideClear && cfg.masterEnabled() &&
                      (wanted & kWantNoClear) != 0)
                     ? "未启用（与功能 9 互斥，同时打开时只应用 9）"
@@ -798,7 +917,35 @@ void WriteStatusFile(const State* state, bool alsoExternal) {
 
 void SettleLocked(State* state, bool allowScan) {
     if (state == nullptr || !state->imageFound || !state->configLoaded) return;
+    if (state->restoreBlocked) state->repatchNeeded = true;
     if (!state->repatchNeeded) {
+        /*
+         * The plan is complete and the sites are known, but a previous write failed. Retry the
+         * writes only: no revert, no re-scan. Everything the pass needs is already in state, so
+         * this is a few dozen atomic stores instead of a full image sweep.
+         */
+        if (state->writeRetryPending) {
+            // A write is only retried once no slot is mid-restore: mixing a retry with a
+            // half-finished revert is what the ApplyPatches guard refuses.
+            bool reverting = false;
+            for (const auto& p : state->applied) if (p.reverting) { reverting = true; break; }
+            if (reverting) {
+                state->restoreBlocked = true;
+                state->repatchNeeded = true;
+                return;
+            }
+            const PatchStats retry = ApplyPatches(state, state->lastPlan.patches);
+            state->patchStats = retry;
+            state->writeRetryPending = retry.failed != 0;
+            if (!state->writeRetryPending) {
+                state->statusWritten = false;
+            }
+            if (!state->statusWritten) {
+                WriteStatusFile(state, allowScan);
+                state->statusWritten = true;
+            }
+            return;
+        }
         if (!state->statusWritten) {
             WriteStatusFile(state, allowScan);
             state->statusWritten = true;
@@ -807,7 +954,17 @@ void SettleLocked(State* state, bool allowScan) {
         return;
     }
 
-    RevertApplied(state);
+    if (!RevertApplied(state)) {
+        if (!state->restoreBlocked) state->statusWritten = false;
+        state->restoreBlocked = true;
+        state->patchStats.failed = state->applied.size();
+        if (!state->statusWritten) {
+            WriteStatusFile(state, allowScan);
+            state->statusWritten = true;
+        }
+        return;
+    }
+    state->restoreBlocked = false;
     AcquireSites(state, allowScan);
 
     const uint64_t t0 = NowMs();
@@ -819,7 +976,17 @@ void SettleLocked(State* state, bool allowScan) {
 
     const uint32_t wanted = WantedFeatureMask(state->config);
     const uint32_t done = (MaskOf(state->sites) | state->attemptedMask) & wanted;
-    state->repatchNeeded = (done != wanted);
+    /*
+     * A failed write is not the same thing as an unfinished site search, and the two must drive
+     * different work. `done != wanted` means symbols are still missing, so a full re-scan is the
+     * only way forward. `stats.failed != 0` means the addresses are known and the *write* failed
+     * - typically because the target page was still being relocated during boot. Re-scanning the
+     * whole image every pass does not make that write succeed, it only burns the launcher's CPU.
+     * Keep the retry, drop the rescan: `writeRetryPending` schedules another pass but no longer
+     * sets `repatchNeeded` on its own.
+     */
+    state->writeRetryPending = stats.failed != 0;
+    state->repatchNeeded = state->restoreBlocked || (done != wanted);
 
     LOGI("配置落地：共 %zu 条补丁（%s），用时 %llu ms%s",
          plan.patches.size(), DescribePlan(plan).c_str(),
@@ -857,6 +1024,27 @@ bool TryDiscoverImage() {
         DumpImage(image);
     }
     return true;
+}
+
+uint64_t MonitorPeriodMs(const State& state) {
+    /*
+     * The period is a *policy*, and it has exactly two values.
+     *
+     * 1500 ms - the steady cadence. Taken when there is nothing left to do, and equally when
+     *           the runtime is knowingly stuck: a restore that could not complete, or a write
+     *           that keeps failing. Those states are unfinished, but re-attempting them at the
+     *           start-up rate changes nothing. During boot the target image is still being
+     *           relocated, so an unfinished pass cannot converge no matter how often it runs -
+     *           and running it twenty times a second is what starves the launcher main thread of
+     *           g_workMutex and keeps the desktop off the screen. A stuck state is therefore
+     *           retried on the *slow* cadence, not the fast one.
+     * 50 ms   - the start-up / applying cadence. Taken while the image or the configuration is
+     *           still being found, and while a plan is actively being applied. A genuinely
+     *           progressed plan settles in a pass or two, so this stays bounded.
+     */
+    if (state.imageFound && state.configLoaded && !state.repatchNeeded) return 1500;
+    if (state.restoreBlocked || state.writeRetryPending) return 1500;
+    return 50;
 }
 
 void MonitorLoop() {
@@ -899,9 +1087,7 @@ void MonitorLoop() {
 
             if (!state->applied.empty()) Watchdog(state);
 
-            if (state->imageFound && state->configLoaded && !state->repatchNeeded) {
-                periodMs = 1500;
-            }
+            periodMs = MonitorPeriodMs(*state);
         }
 
         {
@@ -1043,16 +1229,43 @@ void HomeTweaksPrepareForLauncherChild() {
 }
 
 /**
+ * While true on the calling thread, symbol lookups will not start the (expensive) index build.
+ *
+ * Owned here rather than in the layout module because HomeTweaksFindSymbol is the single choke point
+ * every symbol query goes through, so one flag covers bind_knobs, resolve_grid_fields and the probe.
+ */
+thread_local bool g_inLoaderCallback = false;
+
+bool InLoaderCallback() { return g_inLoaderCallback; }
+
+void SetInLoaderCallback(bool value) { g_inLoaderCallback = value; }
+
+/**
  * Look a function up by the name the launcher's own symbol table gives it. Reading the address out
  * of the image rather than carrying it across an OTA is the whole point: the name is part of the
  * launcher's build, the address is not.
  */
 bool HomeTweaksFindSymbol(const char *name, uint32_t *outVa, uint32_t *outSize) {
     if (name == nullptr || outVa == nullptr || outSize == nullptr) return false;
+    SymbolIndex &index = SymbolIndex::Instance();
+    /*
+     * Inside the dlopen callback the symbol table may not be built yet, and building it here is what
+     * froze the desktop: EnsureLoaded reads the whole .gnu_debugdata out of the 28 MB APK and runs an
+     * xz pass over it, on the thread that holds the linker lock while the launcher is starting. On a
+     * device under I/O pressure that exceeded the 5 s input-dispatch timeout, the launcher ANR'd, was
+     * killed, forked, and did it again - which the user reported as "the layout changes do nothing".
+     *
+     * The loader thread therefore only ever *consumes* an index that is already built. If it is not,
+     * this returns "not found" and the caller does the same thing it does for a genuinely missing
+     * symbol: leaves the site alone. The maintenance worker builds the index on its own thread and
+     * both re-run their binding passes immediately afterwards, so nothing is lost - only moved off
+     * the critical path. EnsureLoaded is idempotent and single-shot (`attempted_`), so a worker that
+     * got there first is not disturbed.
+     */
+    if (InLoaderCallback() && !index.attempted()) return false;
     TryDiscoverImage();
     std::lock_guard<std::mutex> work(g_workMutex);
     if (!g_state.imageFound) return false;
-    SymbolIndex &index = SymbolIndex::Instance();
     if (!index.EnsureLoaded(g_state.image)) return false;
     return index.Find(name, outVa, outSize);
 }
