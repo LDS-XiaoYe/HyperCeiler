@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "home_layout_config.h"
+#include "home_back_gesture.h"
 #include "home_title_render.h"
 #include "home_layout_knobs.h"
 #include "home_workspace_geometry.h"
@@ -313,7 +314,9 @@ constexpr size_t kFolderPreviewSlotBase = kGridAutofitSlotBase + 2;
 // Read-only destination observer, armed only under an explicit diagnostic property.
 constexpr size_t kFolderProbeSlot = kFolderPreviewSlotBase + 7;
 constexpr size_t kBigFolderSizeSlotBase = kFolderProbeSlot + 1;
-constexpr size_t kSlotCount = kBigFolderSizeSlotBase + 7;
+constexpr size_t kBackGestureSlot = kBigFolderSizeSlotBase + 7;
+constexpr size_t kBackWindowSlot = kBackGestureSlot + 1;
+constexpr size_t kSlotCount = kBackWindowSlot + 1;
 using Slot = nhk::InlineSlot<kPatchWords>;
 using Words = nhk::SlotWords<kPatchWords>;
 /* The companion slot's payload, declared here because `Words` only exists from this line down. */
@@ -412,8 +415,20 @@ void sync_folder_layout(const home_layout::Config &config) {
             config.tweaks.folder_cols);
     }
 }
+std::atomic_uint32_t g_back_gesture_config{60u | (100u << 16)};
+home_layout::BackGestureShape g_back_gesture_shape{};
+std::atomic_uint64_t g_back_stock{0};
+std::atomic_uint32_t g_back_stock_width{0};
+std::atomic_uint32_t g_back_stock_sequence{0};
+std::atomic_flag g_back_stock_writer=ATOMIC_FLAG_INIT;
+std::atomic_uint32_t g_back_prime_stage{0};
+std::atomic_uint32_t g_back_window_applied[2]{{60u|(100u<<16)},{60u|(100u<<16)}};
+home_layout::BackWindowShape g_back_window_shape{};
+
 void sync_title_config(const home_layout::Config &config) {
     sync_folder_layout(config);
+    g_back_gesture_config.store(static_cast<uint32_t>(config.back_gesture.height)
+        | (static_cast<uint32_t>(config.back_gesture.width) << 16), std::memory_order_release);
     const auto previous = std::atomic_load_explicit(&g_title_names, std::memory_order_acquire);
     if (!previous || *previous != config.title_custom_labels) {
         std::atomic_store_explicit(&g_title_names, std::make_shared<const CustomTitles>(config.title_custom_labels),
@@ -457,6 +472,66 @@ void *g_original_y = nullptr;
 bool g_animation_hook_armed = false;
 bool g_magic_hook_armed = false;
 std::array<Slot, kSlotCount> g_slots{};
+extern "C" void hc_back_gesture_entry();
+extern "C" void *hc_back_gesture_original = nullptr;
+extern "C" void hc_back_gesture_body(std::byte *saved) {
+    const auto packed=g_back_gesture_config.load(std::memory_order_acquire);
+    const auto integer=[&](unsigned reg){int32_t value;std::memcpy(&value,saved+reg*8,4);return value;};
+    float width;std::memcpy(&width,saved+256+8*16,4); // native S8 (not Dart register roles)
+    home_layout::BackGestureInputs in{integer(8),integer(21),integer(24),integer(28),integer(22),width};
+    if(in.screen_width>0&&in.screen_height>0&&in.screen_width<=32768&&in.screen_height<=32768
+        &&in.top>=0&&in.top<in.bottom&&in.bottom<=in.screen_height&&in.density>0&&in.density<=4096
+        &&std::isfinite(in.width_dp)&&in.width_dp>0){
+        const int pixels=int(in.width_dp*in.density/160.0f);
+        if(pixels>0&&pixels<=in.screen_width/2&&!g_back_stock_writer.test_and_set(std::memory_order_acquire)){
+            g_back_stock_sequence.fetch_add(1,std::memory_order_acq_rel);
+            g_back_stock.store(uint64_t(in.screen_width)|(uint64_t(in.screen_height)<<16)
+                |(uint64_t(in.top)<<32)|(uint64_t(in.bottom)<<48),std::memory_order_release);
+            g_back_stock_width.store(uint32_t(pixels),std::memory_order_release);
+            g_back_stock_sequence.fetch_add(1,std::memory_order_release);
+            g_back_stock_writer.clear(std::memory_order_release);
+        }
+    }
+    if(!home_layout::adjust_back_gesture_inputs(in,
+        {static_cast<int>(packed&0xffffu),static_cast<int>(packed>>16)}))return;
+    std::memcpy(saved+8*8,&in.top,4);std::memcpy(saved+21*8,&in.bottom,4);
+    std::memcpy(saved+256+8*16,&in.width_dp,4);
+}
+extern "C" void hc_back_window_entry();
+extern "C" void *hc_back_window_original=nullptr;
+Slot g_back_window_update{};
+bool stable_read(const Slot &,Words &);
+extern "C" void hc_back_window_body(std::byte *saved){
+    static thread_local bool nested=false;
+    if(nested||!g_back_window_update.address)return;
+    const auto seq=g_back_stock_sequence.load(std::memory_order_acquire);if(seq&1)return;
+    const auto stock=g_back_stock.load(std::memory_order_acquire);
+    const int stock_width=int(g_back_stock_width.load(std::memory_order_acquire));
+    if(seq!=g_back_stock_sequence.load(std::memory_order_acquire))return;
+    const int w=int(stock&0xffffu),h=int((stock>>16)&0xffffu),top=int((stock>>32)&0xffffu),bottom=int(stock>>48);
+    uintptr_t receiver=0;std::memcpy(&receiver,saved+20*8,8);if(!receiver)return;
+    unsigned char side=0;std::memcpy(&side,reinterpret_cast<const void*>(receiver+g_back_window_shape.side_field),1);if(side>1)return;
+    const auto packed=g_back_gesture_config.load(std::memory_order_acquire);
+    const auto desired=home_layout::back_window_rect(w,h,top,bottom,stock_width,side,{int(packed&0xffffu),int(packed>>16)});
+    if(!desired)return;
+    auto *scratch=saved+784+g_back_window_shape.rect_sp;
+    home_layout::BackWindowRect current{};std::memcpy(&current,scratch,16);
+    if(current==*desired)return;
+    const auto nominal=home_layout::back_window_rect(w,h,top,bottom,stock_width,side,{});
+    const auto previous=g_back_window_applied[side].load(std::memory_order_acquire);
+    const auto old=home_layout::back_window_rect(w,h,top,bottom,stock_width,side,{int(previous&0xffffu),int(previous>>16)});
+    // Preserve another app's stricter exclusion/side region, and never multiply a prior width.
+    if((!nominal||current!=*nominal)&&(!old||current!=*old))return;
+    Words live{};if(!stable_read(g_back_window_update,live)||live!=g_back_window_update.original_words)return;
+    nested=true;
+    reinterpret_cast<void(*)(uint32_t,const home_layout::BackWindowRect*)>(g_back_window_update.address)(side,&*desired);
+    nested=false;
+    std::memcpy(scratch,&*desired,16);
+    int32_t window_width=0;std::memcpy(&window_width,saved+19*8,4);
+    window_width=std::max(window_width,desired->right-desired->left);
+    std::memcpy(saved+19*8,&window_width,4);
+    g_back_window_applied[side].store(packed,std::memory_order_release);
+}
 std::string g_container_path;
 uint64_t g_view_begin = 0;
 uint64_t g_view_end = 0;
@@ -1428,6 +1503,34 @@ std::optional<Located> locate() {
 
     Located located;
     if (const auto rust = open_library(*path, "libapp_launcher.so", all)) {
+        if (!g_slots[kBackGestureSlot].backend_owned) {
+            const auto shape = home_layout::resolve_back_gesture(rust->bytes);
+            uintptr_t address = 0; nhk::CodeSource source{}; Words words{};
+            if (shape && bind_target(*rust, shape->splice, address, source, words)) {
+                g_back_gesture_shape = *shape;
+                g_slots[kBackGestureSlot] = {address, reinterpret_cast<void *>(hc_back_gesture_entry),
+                    &hc_back_gesture_original, source, words};
+                located.container_path = rust->path;
+                located.view_begin = rust->view_begin; located.view_end = rust->view_end;
+                __android_log_print(ANDROID_LOG_INFO, kTag, "back gesture original body resolved va=%#llx splice=%#llx left=%u right=%u screen=%u",
+                    static_cast<unsigned long long>(shape->entry), static_cast<unsigned long long>(shape->splice),
+                    shape->left, shape->right, shape->screen);
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, kTag, "back gesture region body not validated; original retained");
+            }
+        }
+        if(!g_slots[kBackWindowSlot].backend_owned){
+            const auto shape=home_layout::resolve_back_window(rust->bytes);
+            uintptr_t address=0,update=0;nhk::CodeSource source{},update_source{};Words words{},update_words{};
+            if(shape&&bind_target(*rust,shape->splice,address,source,words)
+                &&bind_target(*rust,shape->update,update,update_source,update_words)){
+                g_back_window_shape=*shape;
+                g_back_window_update={update,nullptr,nullptr,update_source,update_words};
+                g_slots[kBackWindowSlot]={address,reinterpret_cast<void*>(hc_back_window_entry),&hc_back_window_original,source,words};
+                __android_log_print(ANDROID_LOG_INFO,kTag,"back window apply source resolved splice=%#llx update=%#llx side=%u",
+                    (unsigned long long)shape->splice,(unsigned long long)shape->update,shape->side_field);
+            }
+        }
         const auto targets = home_layout::elf_targets::resolve(rust->bytes);
         if (targets
             && bind_target(*rust, targets->cell_count_x, located.x, located.x_source,
@@ -1460,7 +1563,7 @@ std::optional<Located> locate() {
         (void) bind_animation_consumer(located);
         (void) bind_magic_consumer(located);
     }
-    if (located.x == 0 && located.animation == 0 && located.dart_container_path.empty()) return {};
+    if (located.x == 0 && located.animation == 0 && g_slots[kBackGestureSlot].address == 0 && located.dart_container_path.empty()) return {};
     return located;
 }
 
@@ -2702,6 +2805,7 @@ bool bind_drawer_title() {
 // hook_armed before the first continuation is registered.
 std::atomic<bool> g_loader_prime_finished{false};
 std::atomic_flag g_loader_priming = ATOMIC_FLAG_INIT;
+std::atomic<bool> g_back_setup_complete{false};
 std::atomic_flag g_capacity_busy = ATOMIC_FLAG_INIT;
 std::array<nhk::SourceWordPatch,home_layout::kCapacitySiteCount> g_capacity_words{};
 bool g_capacity_bound = false;
@@ -3197,6 +3301,16 @@ size_t arm_hooks(std::vector<size_t> &order) {
             " (first symbol resolved=%d)", g_folder_layout_checked ? 1 : 0);
     (void) bind_gadget_bridge();
     size_t added = 0;
+    if (g_slots[kBackGestureSlot].address &&
+        (g_slots[kBackGestureSlot].backend_owned || g_back_gesture_config.load(std::memory_order_acquire) != (60u | (100u << 16)))
+        && std::find(order.begin(), order.end(), kBackGestureSlot) == order.end()) {
+        order.push_back(kBackGestureSlot); ++added;
+    }
+    if(g_slots[kBackWindowSlot].address&&(g_slots[kBackWindowSlot].backend_owned
+        ||g_back_gesture_config.load(std::memory_order_acquire)!=(60u|(100u<<16)))
+        &&std::find(order.begin(),order.end(),kBackWindowSlot)==order.end()){
+        order.push_back(kBackWindowSlot);++added;
+    }
     if(g_big_folder_size_bound)for(size_t i=0;i<7;++i){const size_t index=kBigFolderSizeSlotBase+i;
         if(std::find(order.begin(),order.end(),index)==order.end()){order.push_back(index);++added;}}
     if (g_folder_preview_bound) for (size_t i = 0; i < 7; ++i) {
@@ -3530,16 +3644,6 @@ void *worker(void *) {
             "layout scalar write pending; retry retained");
         delay_ms(retry < 4 ? 1500 : 30000);
     }
-    // A new worker attempt must not replace a slot with an outstanding backend
-    // or write obligation. Retry known cleanup using the existing attempt path.
-    for (Slot &slot : g_slots) {
-        if (nhk::slot_has_pending(slot) && !nhk::settle_slot_pending(slot, slot_host())) {
-            __android_log_print(ANDROID_LOG_WARN, kTag,
-                "layout pending slot retained; rebuild deferred address=%p",
-                reinterpret_cast<void *>(slot.address));
-            return attempt_finished();
-        }
-    }
     /*
      * Named for field triage. The audit that produced this worker's power fix could not attribute
      * this loop to anything: it saw five unnamed threads in the launcher and no way to tell which
@@ -3567,6 +3671,24 @@ void *worker(void *) {
     // not a new polling thread; the existing worker adopts the loader's slots.
     for (int attempt = 0; attempt < 200
         && !g_loader_prime_finished.load(std::memory_order_acquire); ++attempt) delay_ms(25);
+    // The same lease covers loader priming, pending cleanup and worker bank setup.
+    // Main-thread priming never waits; only this existing worker waits for the lease.
+    while (g_loader_priming.test_and_set(std::memory_order_acquire)) delay_ms(25);
+    struct SetupLease {
+        bool held=true;
+        void release(){if(held){held=false;g_loader_priming.clear(std::memory_order_release);}}
+        ~SetupLease(){release();}
+    } setup_lease;
+    // A new worker attempt must not replace a slot with an outstanding backend
+    // or write obligation. Retry known cleanup using the existing attempt path.
+    for (Slot &slot : g_slots) {
+        if (nhk::slot_has_pending(slot) && !nhk::settle_slot_pending(slot, slot_host())) {
+            __android_log_print(ANDROID_LOG_WARN, kTag,
+                "layout pending slot retained; rebuild deferred address=%p",
+                reinterpret_cast<void *>(slot.address));
+            return attempt_finished();
+        }
+    }
     auto sync_requested = [&]() {
         bool any = false;
         for (size_t index = 0; index < HC_LAYOUT_KNOB_COUNT; ++index) {
@@ -3843,6 +3965,8 @@ void *worker(void *) {
         }
     }
 
+    g_back_setup_complete.store(true, std::memory_order_release);
+    setup_lease.release();
     int iterations = 0;
     /*
      * Worker-local throttle state. Both intervals are wall-clock rather than iteration counts because
@@ -4643,6 +4767,7 @@ bool adopt_layout_state() {
     g_magic_hook_armed = false;
     g_loader_prime_finished.store(false, std::memory_order_release);
     g_loader_priming.clear(std::memory_order_release);
+    g_back_setup_complete.store(false, std::memory_order_release);
     g_capacity_busy.clear(std::memory_order_release);
     if (!nhk::source_words_owned(g_capacity_words)) {
         g_capacity_bound = g_capacity_enabled = false;
@@ -4667,6 +4792,15 @@ bool adopt_layout_state() {
     }
     g_widget_generation_valid = false;
     g_widget_bind_reported = g_widget_reported = false;
+    if (!g_slots[kBackGestureSlot].backend_owned) {
+        hc_back_gesture_original = nullptr; g_back_gesture_shape = {};
+    }
+    if(!g_slots[kBackWindowSlot].backend_owned){hc_back_window_original=nullptr;g_back_window_update={};g_back_window_shape={};}
+    g_back_stock.store(0,std::memory_order_release);g_back_stock_width.store(0,std::memory_order_release);
+    g_back_stock_sequence.store(0,std::memory_order_release);g_back_stock_writer.clear(std::memory_order_release);
+    g_back_prime_stage.store(0,std::memory_order_release);
+    for(auto &applied:g_back_window_applied)applied.store(60u|(100u<<16),std::memory_order_release);
+    g_back_gesture_config.store(60u | (100u << 16), std::memory_order_release);
     g_grid_field = {};
     g_folder_geometry_checked=false;
     g_big_folder_size_bound=g_big_folder_size_checked=false;g_big_folder_size_fields={};
@@ -4997,6 +5131,41 @@ void report_start_verdict(const char *site, const char *verdict, bool adopted, i
  * `site` names the signal that asked for the worker (native-init / property / setprogname / library /
  * configure), so the log above can say which of the five call sites got what verdict.
  */
+void prime_back_regions(HookFunction hook,UnhookFunction unhook){
+    if(!hook||gettid()!=getpid()||g_dart_ready.load(std::memory_order_acquire)
+        ||g_back_setup_complete.load(std::memory_order_acquire))return;
+    if(g_loader_priming.test_and_set(std::memory_order_acquire))return;
+    struct Release{~Release(){g_loader_priming.clear(std::memory_order_release);}} release;
+    if(g_back_setup_complete.load(std::memory_order_acquire)||g_slots[kBackWindowSlot].backend_owned)return;
+    g_back_prime_stage.store(1,std::memory_order_relaxed);
+    home_layout::Config config;if(!home_layout::query_bootstrap_config(config))return;
+    g_back_prime_stage.store(2,std::memory_order_relaxed);
+    if(config.back_gesture.height==60&&config.back_gesture.width==100)return;
+    std::ifstream maps("/proc/self/maps");if(!maps)return;
+    const auto all=nhk::parse_file_mappings(maps);const auto path=launcher_apk(all);if(!path)return;
+    g_back_prime_stage.store(3,std::memory_order_relaxed);
+    const auto rust=open_library(*path,"libapp_launcher.so",all);if(!rust)return;
+    g_back_prime_stage.store(4,std::memory_order_relaxed);
+    const auto core=home_layout::resolve_back_gesture(rust->bytes);
+    const auto window=home_layout::resolve_back_window(rust->bytes);
+    if(!core||!window)return;
+    uintptr_t a=0,b=0,c=0;nhk::CodeSource sa{},sb{},sc{};Words wa{},wb{},wc{};
+    if(!bind_target(*rust,core->splice,a,sa,wa)||!bind_target(*rust,window->splice,b,sb,wb)
+        ||!bind_target(*rust,window->update,c,sc,wc))return;
+    g_back_prime_stage.store(5,std::memory_order_relaxed);
+    g_hook_function=hook;g_unhook_function=unhook;
+    g_container_path=rust->path;g_view_begin=rust->view_begin;g_view_end=rust->view_end;
+    g_back_gesture_shape=*core;g_back_window_shape=*window;
+    g_slots[kBackGestureSlot]={a,reinterpret_cast<void*>(hc_back_gesture_entry),&hc_back_gesture_original,sa,wa};
+    g_slots[kBackWindowSlot]={b,reinterpret_cast<void*>(hc_back_window_entry),&hc_back_window_original,sb,wb};
+    g_back_window_update={c,nullptr,nullptr,sc,wc};
+    g_back_gesture_config.store(uint32_t(config.back_gesture.height)|(uint32_t(config.back_gesture.width)<<16),std::memory_order_release);
+    const std::vector<size_t> order{kBackGestureSlot,kBackWindowSlot};
+    const bool live=nhk::ensure_slots_live(g_slots,slot_host(),order);
+    g_back_prime_stage.store(live?7:6,std::memory_order_release);
+    __android_log_print(ANDROID_LOG_INFO,kTag,"back original regions pre-init stage=%d",live?7:6);
+}
+
 void start_home_layout_hooks(const char *site, HookFunction hook, UnhookFunction unhook) {
     /*
      * Adopt (and therefore reset) inherited state before reading a single gate: a desktop that
@@ -5004,6 +5173,9 @@ void start_home_layout_hooks(const char *site, HookFunction hook, UnhookFunction
      * relying on its own prepare call is exactly the discipline that failed here.
      */
     const bool adopted = adopt_layout_state();
+    if(site&&(std::strcmp(site,"property")==0||std::strcmp(site,"library")==0))prime_back_regions(hook,unhook);
+    // A property call made recursively by the primer must not start a competing worker.
+    if(g_loader_priming.test(std::memory_order_acquire))return;
     const int attempts = g_attempts.load(std::memory_order_acquire);
     const char *verdict = nullptr;
     if (hook == nullptr) verdict = "hook-null";

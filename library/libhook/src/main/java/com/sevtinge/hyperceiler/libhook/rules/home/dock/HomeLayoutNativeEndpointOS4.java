@@ -304,7 +304,13 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     public record Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
         int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
-        boolean widgetAllowMove, int[] folder) {
+        boolean widgetAllowMove, int[] folder, int[] backGesture) {
+        public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
+            int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
+            boolean widgetAllowMove, int[] folder) {
+            this(acknowledgment, gridEnabled, cellX, cellY, knobEnabled, knobDeltaDp, tweaks, title,
+                customTitles, widgetAllowMove, folder, new int[]{60, 100});
+        }
         public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
             int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
             boolean widgetAllowMove) {
@@ -372,7 +378,7 @@ public final class HomeLayoutNativeEndpointOS4 {
                     || read.tweaks().length != TWEAK_COUNT
                     || read.title() == null || read.title().length != TITLE_COUNT
                     || read.customTitles() == null || read.customTitles().length > 1024
-                    || !validFolder(read.folder())) {
+                    || !validFolder(read.folder()) || !validBackGesture(read.backGesture())) {
                 return denied("snapshot shape is wrong: " + describe(read));
             }
             for (int index = 0; index < KNOB_ROWS.length; ++index) {
@@ -395,7 +401,7 @@ public final class HomeLayoutNativeEndpointOS4 {
             }
             final Snapshot accepted = new Snapshot(ACK, read.gridEnabled(), read.cellX(), read.cellY(),
             read.knobEnabled(), read.knobDeltaDp(), read.tweaks(), read.title(), read.customTitles(),
-            read.widgetAllowMove(), read.folder().clone());
+            read.widgetAllowMove(), read.folder().clone(), read.backGesture().clone());
             final String summary = describe(accepted);
             if (!summary.equals(lastAccepted)) {
                 lastAccepted = summary;
@@ -531,9 +537,19 @@ public final class HomeLayoutNativeEndpointOS4 {
                 ? HomeLayoutPrefsSnapshot.customTitles(values != null
                     && values.get("home_title_title_icontitlecustomization") instanceof String packet ? packet : null)
                 : new String[0][],
-            readBoolean(values, "home_widget_allow_moved_to_minus_one_screen", false), readFolder(values));
+            readBoolean(values, "home_widget_allow_moved_to_minus_one_screen", false), readFolder(values), new int[]{
+                boundedBack(readInt(values, "home_navigation_back_area_height", 60), 10, 100, 60),
+                boundedBack(readInt(values, "home_navigation_back_area_width", 100), 100, 400, 100)});
     }
 
+    public static final int BACK_GESTURE_MAGIC = 0x48434231;
+    private static int boundedBack(int value, int low, int high, int def) {
+        return value >= low && value <= high ? value : def;
+    }
+    private static boolean validBackGesture(int[] values) {
+        return values != null && values.length == 2 && values[0] >= 10 && values[0] <= 100
+            && values[1] >= 100 && values[1] <= 400;
+    }
     public static final int FOLDER_MAGIC = 0x48434631;
     public static final int FOLDER_COUNT = 7;
     private static final int[] FOLDER_MAX = {1, 1, 1, 50, 450, 200, 1};

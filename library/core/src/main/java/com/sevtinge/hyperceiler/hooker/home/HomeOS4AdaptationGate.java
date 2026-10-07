@@ -35,7 +35,10 @@ public final class HomeOS4AdaptationGate {
             disableLeaves(screen, ADAPTED_RECENT_KEYS);
         } else if (xml == R.xml.home_other_new) {
             disableLeaves(screen, ADAPTED_OTHER_KEYS);
-        } else if (xml == R.xml.home_gesture || xml == R.xml.home_drawer) {
+        } else if (xml == R.xml.home_gesture) {
+            disableLeaves(screen, Set.of("prefs_key_home_navigation_back_area_height",
+                "prefs_key_home_navigation_back_area_width"));
+        } else if (xml == R.xml.home_drawer) {
             disableLeaves(screen, Set.of());
         }
     }

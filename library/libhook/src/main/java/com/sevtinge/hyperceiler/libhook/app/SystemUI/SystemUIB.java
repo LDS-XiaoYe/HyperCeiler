@@ -118,6 +118,8 @@ public class SystemUIB extends BaseLoad {
         initHook(new com.sevtinge.hyperceiler.libhook.rules.home.dock.DockGlassRendererSystemUI(),
             isHyperOSVersion(4f));
         MiuiStub.createHook();
+        initHook(new com.sevtinge.hyperceiler.libhook.rules.systemui.navigation.BackGestureWidthOS4(),
+            isHyperOSVersion(4f));
         // PluginHelper
         initHook(NewPluginHelperKt.INSTANCE);
         // Actions

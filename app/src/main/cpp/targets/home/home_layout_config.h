@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #pragma once
+#include "home_back_gesture.h"
 
 #include "home_layout_knobs.h"
 #include "home_title_custom.h"
@@ -82,6 +83,7 @@ struct Config {
     int title_color = -1;
     bool title_hide_new_install = false;
     bool widget_allow_move = false;
+    BackGestureConfig back_gesture{};
     std::vector<home_title::CustomTitle> title_custom_labels;
 };
 
