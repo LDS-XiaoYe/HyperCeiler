@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #pragma once
+#include "home_folder_auto_close.h"
 #include "home_back_gesture.h"
 
 #include "home_layout_knobs.h"
@@ -84,6 +85,7 @@ struct Config {
     bool title_hide_new_install = false;
     bool widget_allow_move = false;
     BackGestureConfig back_gesture{};
+    bool folder_auto_close = false;
     std::vector<home_title::CustomTitle> title_custom_labels;
 };
 

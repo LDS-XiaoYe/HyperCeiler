@@ -20,7 +20,7 @@ public final class HomeOS4AdaptationGate {
     // Keep the OS4 clear-button implementation and the framework-backed home-mode setting.
     private static final Set<String> ADAPTED_RECENT_KEYS = Set.of("prefs_key_home_recent_clear_action_os4");
     private static final Set<String> ADAPTED_OTHER_KEYS = Set.of(
-        "prefs_key_home_other_home_mode", "prefs_key_home_widget_allow_moved_to_minus_one_screen");
+        "prefs_key_home_folder_auto_close", "prefs_key_home_other_home_mode", "prefs_key_home_widget_allow_moved_to_minus_one_screen");
 
     private HomeOS4AdaptationGate() {}
 

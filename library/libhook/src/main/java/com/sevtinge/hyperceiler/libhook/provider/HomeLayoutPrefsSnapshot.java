@@ -31,6 +31,7 @@ public final class HomeLayoutPrefsSnapshot {
         {"string", "home_other_seek_points"},
         {"boolean", "home_dock_unlock_hotseat"},
         {"boolean", "home_widget_allow_moved_to_minus_one_screen"},
+        {"boolean", "home_folder_auto_close"},
         {"integer", "home_title_font_size"},
         {"integer", "home_drawer_title_font_size"},
         {"integer", "home_title_title_color"},

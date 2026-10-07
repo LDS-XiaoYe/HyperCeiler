@@ -304,7 +304,13 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     public record Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
         int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
-        boolean widgetAllowMove, int[] folder, int[] backGesture) {
+        boolean widgetAllowMove, int[] folder, int[] backGesture, boolean folderAutoClose) {
+        public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
+            int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
+            boolean widgetAllowMove, int[] folder, int[] backGesture) {
+            this(acknowledgment, gridEnabled, cellX, cellY, knobEnabled, knobDeltaDp, tweaks, title,
+                customTitles, widgetAllowMove, folder, backGesture, false);
+        }
         public Snapshot(int acknowledgment, int gridEnabled, int cellX, int cellY,
             int[] knobEnabled, int[] knobDeltaDp, int[] tweaks, int[] title, String[][] customTitles,
             boolean widgetAllowMove, int[] folder) {
@@ -401,7 +407,7 @@ public final class HomeLayoutNativeEndpointOS4 {
             }
             final Snapshot accepted = new Snapshot(ACK, read.gridEnabled(), read.cellX(), read.cellY(),
             read.knobEnabled(), read.knobDeltaDp(), read.tweaks(), read.title(), read.customTitles(),
-            read.widgetAllowMove(), read.folder().clone(), read.backGesture().clone());
+            read.widgetAllowMove(), read.folder().clone(), read.backGesture().clone(), read.folderAutoClose());
             final String summary = describe(accepted);
             if (!summary.equals(lastAccepted)) {
                 lastAccepted = summary;
@@ -539,9 +545,10 @@ public final class HomeLayoutNativeEndpointOS4 {
                 : new String[0][],
             readBoolean(values, "home_widget_allow_moved_to_minus_one_screen", false), readFolder(values), new int[]{
                 boundedBack(readInt(values, "home_navigation_back_area_height", 60), 10, 100, 60),
-                boundedBack(readInt(values, "home_navigation_back_area_width", 100), 100, 400, 100)});
+                boundedBack(readInt(values, "home_navigation_back_area_width", 100), 100, 400, 100)}, readBoolean(values, "home_folder_auto_close", false));
     }
 
+    public static final int FOLDER_AUTO_CLOSE_MAGIC = 0x48434641;
     public static final int BACK_GESTURE_MAGIC = 0x48434231;
     private static int boundedBack(int value, int low, int high, int def) {
         return value >= low && value <= high ? value : def;
