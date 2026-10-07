@@ -2887,6 +2887,10 @@ bool g_widget_move_checked = false;
 bool g_widget_move_enabled = false;
 bool g_widget_move_known = true;
 std::array<nhk::SourceWordPatch,2> g_widget_move_words{};
+std::array<nhk::SourceWordPatch,1> g_auto_close_words{};
+std::atomic_flag g_auto_close_busy = ATOMIC_FLAG_INIT;
+bool g_auto_close_generation_valid = false;
+bool g_auto_close_reported = false, g_auto_close_request = false, g_auto_close_result = false;
 bool g_widget_generation_valid = true;
 bool g_widget_bind_reported = false;
 bool g_widget_reported = false, g_widget_report_request = false, g_widget_report_result = false;
@@ -2921,6 +2925,11 @@ void refresh_scalar_generation(const std::vector<nhk::ExecutableMapping>& invent
             }
             if (!g_capacity_generation_valid) g_capacity_known = false;
         }
+    }
+    if (claim(g_auto_close_busy)) {
+        Release release{held == &g_auto_close_busy ? nullptr : &g_auto_close_busy};
+        if (g_auto_close_words[0].address)
+            g_auto_close_generation_valid = g_auto_close_words[0].pending() || matches(g_auto_close_words[0]);
     }
     if (claim(g_widget_move_busy)) {
         Release release{held == &g_widget_move_busy ? nullptr : &g_widget_move_busy};
@@ -3024,6 +3033,54 @@ bool sync_widget_move(bool enabled) {
     return applied;
 }
 
+
+bool sync_folder_auto_close(bool enabled) {
+    if (g_auto_close_busy.test_and_set(std::memory_order_acquire)) return false;
+    struct Release { ~Release() { g_auto_close_busy.clear(std::memory_order_release); } } release;
+    if (!g_dart || (!enabled && !g_auto_close_words[0].address)) return !enabled;
+    if (!g_auto_close_words[0].address) {
+        uint32_t va=0,span=0,close=0,rx=0,registered=0,size=0;
+        std::vector<uint32_t> body;
+        if (hometweaks::HomeTweaksFindSymbol(home_layout::kFolderAutoClickSymbol,&va,&size)
+            && hometweaks::HomeTweaksFindSymbol("FolderClingGetxController.handleFolderClingClose",&close,&size)
+            && hometweaks::HomeTweaksFindSymbol("RxObjectMixin.value",&rx,&size)
+            && hometweaks::HomeTweaksFindSymbol("Inst|isRegistered",&registered,&size)
+            && dartscan::function_span(va,&span) && dart_function_words(va,span,body)) {
+            const auto offset=home_layout::resolve_folder_auto_close(body,va,close,rx,registered);
+            if (offset && *offset <= UINT32_MAX-va && g_dart->load_base <= UINTPTR_MAX-va-*offset) {
+                const uint32_t site=va+uint32_t(*offset);
+                const uintptr_t address=g_dart->load_base+site;
+                const auto file=dart_file_offset(site,4);
+                const auto source=nhk::source_at(g_dart->owned,address,4);
+                if (file && source && !nhk::add_overflows(g_dart->view_begin,*file)
+                    && source->file_offset==g_dart->view_begin+*file && !(address&3)) {
+                    g_auto_close_words[0]={address,body[*offset/4],home_layout::kFolderAutoCloseReplacement,*source};
+                    g_auto_close_generation_valid=true;
+                    __android_log_print(ANDROID_LOG_INFO,kTag,"folder auto-close dynamic gate=%#x close=%#x original=%#x",site,close,body[*offset/4]);
+                }
+            }
+        }
+    }
+    bool applied=false;
+    if(g_auto_close_words[0].address) {
+        if(!g_auto_close_generation_valid) {
+            const auto inventory=current_mappings();
+            if(inventory)refresh_scalar_generation(*inventory,&g_auto_close_busy);
+        }
+        const auto factory=[](const nhk::SourceWordPatch& site){return nhk::SourceWordOps{site.address,site.source};};
+        bool protected_word=true;
+        if(enabled)protected_word=slot_host().protect_range && slot_host().protect_range(g_auto_close_words[0].address,4);
+        if(g_auto_close_generation_valid && protected_word)
+            applied=nhk::apply_source_words(g_auto_close_words,enabled,factory);
+    }
+    if(!g_auto_close_reported || g_auto_close_request!=enabled || g_auto_close_result!=applied) {
+        g_auto_close_reported=true;g_auto_close_request=enabled;g_auto_close_result=applied;
+        __android_log_print(applied?ANDROID_LOG_INFO:ANDROID_LOG_WARN,kTag,
+            "folder auto-close source-word requested=%d applied=%d registered/open/launch guards=original",enabled,applied);
+    }
+    return applied;
+}
+
 // Pending protection/rollback obligations survive setting disable, a worker
 // restart, and a fork. Settle them before any "nothing enabled" early return.
 bool settle_scalar_pending() {
@@ -3040,7 +3097,8 @@ bool settle_scalar_pending() {
     };
     const bool capacity = settle(g_capacity_words,g_capacity_busy);
     const bool widget = settle(g_widget_move_words,g_widget_move_busy);
-    return capacity && widget;
+    const bool auto_close = settle(g_auto_close_words,g_auto_close_busy);
+    return capacity && widget && auto_close;
 }
 
 /* Inject the exact inlined load that _buildTextWidget actually uses. It is a different cache
@@ -3732,7 +3790,7 @@ void *worker(void *) {
         || config.tweaks.fold_enabled || config.tweaks.icon_scale_enabled
         || config.tweaks.recents_hide_clear || config.tweaks.recents_no_clear
         || config.tweaks.animation_open_enabled || config.tweaks.animation_recents_enabled
-        || config.tweaks.hotseat_unlimited || config.widget_allow_move
+        || config.tweaks.hotseat_unlimited || config.widget_allow_move || config.folder_auto_close
         || config.folder.full_width || config.folder.title_center;
     if (!config.grid_enabled && !any_knob && !top_probe && !any_tweak
         && g_title_desktop_sp.load(std::memory_order_acquire) == 12
@@ -3916,6 +3974,7 @@ void *worker(void *) {
     publish_hooks();
     (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
     (void) sync_widget_move(config.widget_allow_move);
+    (void) sync_folder_auto_close(config.folder_auto_close);
     const bool grid_live =
         config.grid_enabled && located && located->x != 0 && located->y != 0;
     g_ready.store(grid_live, std::memory_order_release);
@@ -4078,6 +4137,7 @@ void *worker(void *) {
                 }
                 (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
                 (void) sync_widget_move(config.widget_allow_move);
+    (void) sync_folder_auto_close(config.folder_auto_close);
                 (void) knobs_changed;
             }
             any_knob = sync_requested();
@@ -4777,6 +4837,9 @@ bool adopt_layout_state() {
     g_capacity_generation_valid = false;
     g_capacity_reported = false;
     g_widget_move_busy.clear(std::memory_order_release);
+    g_auto_close_busy.clear(std::memory_order_release);
+    if (!nhk::source_words_owned(g_auto_close_words)) g_auto_close_words = {};
+    g_auto_close_generation_valid = false; g_auto_close_reported = false;
     g_gadget_requested.store(false, std::memory_order_release);
     g_gadget_bound = false;
     hc_gadget_bridge_enabled = 0;
@@ -5032,6 +5095,7 @@ void prime_home_layout_knobs(HookFunction hook, UnhookFunction unhook) {
     if (have_config) {
         (void) sync_hotseat_capacity(config.tweaks.hotseat_unlimited);
         (void) sync_widget_move(config.widget_allow_move);
+    (void) sync_folder_auto_close(config.folder_auto_close);
     }
     g_loader_prime_finished.store(true, std::memory_order_release);
 }

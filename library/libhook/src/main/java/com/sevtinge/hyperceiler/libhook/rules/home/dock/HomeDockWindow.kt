@@ -647,6 +647,8 @@ class HomeDockWindow : BaseHook() {
                         reply.writeInt(HomeLayoutNativeEndpointOS4.BACK_GESTURE_MAGIC)
                         val backGesture = result?.backGesture() ?: intArrayOf(60, 100)
                         for (value in backGesture) reply.writeInt(value)
+                        reply.writeInt(HomeLayoutNativeEndpointOS4.FOLDER_AUTO_CLOSE_MAGIC)
+                        reply.writeInt(if (result?.folderAutoClose() == true) 1 else 0)
                     } else {
                         val acknowledgment = nativeMotionReply.get() ?: DockNativeMotionEndpoint.ACK
                         nativeMotionReply.remove()
