@@ -12,7 +12,7 @@ def fun(name):
  a=source.index(name);a=source.rfind('\n',0,a)+1;b=source.index('{',a);dep=1;j=b+1
  while dep:dep+=(source[j]=='{')-(source[j]=='}');j+=1
  return source[a:j]
-names=['GridCellDelegate.performLayout','GridOccupiedCellDelegate.performLayout','CellLayoutGetxController.calculateCenterGlobalPosition','CellLayoutGetxController.isItemPosEmpty','GridController.currentConfig','HotSeatLayoutDelegate.cellLayout','LauncherIndicatorState.build','LauncherIndicatorState._wrapWithAnimation','LauncherIndicatorState._buildScreenIndicator','LauncherIndicatorState.isInEditing','LauncherIndicatorState._showIndicator','LauncherIndicatorState._animateIndicator','LauncherIndicatorState._refreshIndicator','LauncherIndicatorState._getCurrentIndicatorType','Container.build','Padding.createRenderObject','ShortcutIconWidget.getTextColor','Color.withAlpha','ShortcutIconWidget._buildTextWidget','ShortcutInfoModel.getPackageName','ShortcutInfoModel.getComponentName','PinShortcutInfoModel.getComponentName','allocateTwoByteString','ShortcutInfoModel.copyShortcutModel','PinShortcutInfoModel.copyShortcutModel','PinShortcutInfoModel.makePinAppComponentName','ShortcutIconWidget.getPrefixAssetName','GridConfig.getTitleTextSize','AppIcon.build','ShortcutIconWidgetConfig.customShortcutIconConfig','FolderInfoModel.hasNewInstalledApp','ShortcutIconWidget._addNewInstallLight','FolderIconGetxController.updateNewInstallNotification']
+names=['_CapsuleIndicatorState.build','Workspace._createIndicator','GridCellDelegate.performLayout','GridOccupiedCellDelegate.performLayout','CellLayoutGetxController.calculateCenterGlobalPosition','CellLayoutGetxController.isItemPosEmpty','GridController.currentConfig','HotSeatLayoutDelegate.cellLayout','LauncherIndicatorState.build','LauncherIndicatorState._wrapWithAnimation','LauncherIndicatorState._buildScreenIndicator','LauncherIndicatorState.isInEditing','LauncherIndicatorState._showIndicator','LauncherIndicatorState._animateIndicator','LauncherIndicatorState._refreshIndicator','LauncherIndicatorState._getCurrentIndicatorType','Container.build','Padding.createRenderObject','ShortcutIconWidget.getTextColor','Color.withAlpha','ShortcutIconWidget._buildTextWidget','ShortcutInfoModel.getPackageName','ShortcutInfoModel.getComponentName','PinShortcutInfoModel.getComponentName','allocateTwoByteString','ShortcutInfoModel.copyShortcutModel','PinShortcutInfoModel.copyShortcutModel','PinShortcutInfoModel.makePinAppComponentName','ShortcutIconWidget.getPrefixAssetName','GridConfig.getTitleTextSize','AppIcon.build','ShortcutIconWidgetConfig.customShortcutIconConfig','FolderInfoModel.hasNewInstalledApp','ShortcutIconWidget._addNewInstallLight','FolderIconGetxController.updateNewInstallNotification']
 images={};spans={}
 for n in names:
  v,z=sym.by_name[n];span=vas[bisect.bisect_right(vas,v)]-v;spans[v]=span
@@ -74,10 +74,13 @@ for n in names:
  v,z=sym.by_name[n];pre+=f'symbols["{n}"]={{{v},{z}}};spans[{v}]={spans[v]};\n'
 for v,w in images.items():pre+=f'images[{v}]={{'+','.join(hex(x) for x in w)+'};\n'
 W=sym.by_name['LauncherIndicatorState._wrapWithAnimation'][0];L=sym.by_name['LauncherIndicatorState.build'][0];P=sym.by_name['LauncherIndicatorState._buildScreenIndicator'][0];B=sym.by_name['ShortcutIconWidget._buildTextWidget'][0];A=sym.by_name['AppIcon.build'][0]
+new_insets='inset_original_frame' in source
+if new_insets: W=L=sym.by_name['Workspace._createIndicator'][0]
+site_offset=(0x488 if "frame-preserved" in source else 0x480) if new_insets else 0x230
 C=sym.by_name['Container.build'][0];PD=sym.by_name['Padding.createRenderObject'][0]
 PF=sym.by_name['ShortcutIconWidget.getPrefixAssetName'][0];HC=sym.by_name['FolderIconGetxController.updateNewInstallNotification'][0]
 pre+='resolve_grid_fields("CellLayoutGetxController.calculateCenterGlobalPosition");ok(g_grid_field.usable()&&g_grid_field.columns==0x1b&&g_grid_field.rows==0x23&&g_grid_field.origin==0x3b&&g_grid_field.item_col==0x37&&g_grid_field.item_row==0x3f&&g_grid_field.dock_columns==0x13,"complete production GridInfo resolver publishes actual owning contract");\n'
-pre+=f'uint32_t patch=0;IndicatorPolicyAnchors anchors;ok(capsule_wrapper_layout_compatible({W},0,&patch)&&patch=={L+0x230},"real capsule packing splice");ok(indicator_policy_compatible({P},0,&anchors)&&anchors.gate==0x3d8&&anchors.result==0x3fc,"real indicator gate/result");\n'
+pre+=f'uint32_t patch=0;IndicatorPolicyAnchors anchors;ok(capsule_wrapper_layout_compatible({W},0,&patch)&&patch=={L+site_offset},"real indicator original-insets or legacy packing splice");ok(indicator_policy_compatible({P},0,&anchors)&&anchors.gate==0x3d8&&anchors.result==0x3fc,"real indicator gate/result");\n'
 SH=sym.by_name['LauncherIndicatorState._showIndicator'][0];RF=sym.by_name['LauncherIndicatorState._refreshIndicator'][0]
 pre+=f'uint32_t sp=0,idle=0;ok(indicator_slide_compatible({SH},&sp,&idle)&&sp==0xe0&&idle=={RF+0x140},"real slide and idle-caller anchors");\n'
 pre+='ok(bind_title_color(),"real title color allocator, fields and splice");ok(bind_title_custom(),"real custom title model and allocators");ok(bind_drawer_title(),"real drawer getter call and font/height sites");ok(bind_desktop_title(),"real desktop font/config/height sites");\n'
@@ -85,7 +88,7 @@ pre+=f'ok(g_slots[0].address==data.load_base+{B+0xf0}&&g_slots[1].address==data.
 pre+=f'ok(bind_title_hide()&&g_slots[6].address==data.load_base+{PF+0x64}&&hc_title_folder_new_caller==data.load_base+{HC+0x78},"real hide prefix and folder caller");\n'
 pre+=f'''for(auto va:{{{L}u,{P}u,{B}u,{A}u,{SH}u,{RF}u}}){{auto&v=images[va];for(auto&w:v)if((w&0xfc000000)==0x94000000)w=(w&0xfc000000)|((w-8)&0x03ffffff);v.insert(v.begin(),8,0xd503201f);spans[va]+=32;}}
 g_title_color_bound=g_title_custom_bound=g_drawer_title_bound=g_desktop_title_bound=false;
-ok(capsule_wrapper_layout_compatible({W},0,&patch)&&patch=={L+0x250},"capsule shifted window follows original allocator");
+ok(capsule_wrapper_layout_compatible({W},0,&patch)&&patch=={L+site_offset+0x20},"indicator shifted window follows original allocator");
 ok(indicator_policy_compatible({P},0,&anchors)&&anchors.gate==0x3f8&&anchors.result==0x41c,"shifted indicator bank and continuations");
 ok(indicator_slide_compatible({SH},&sp,&idle)&&sp==0x100&&idle=={RF+0x160},"shifted slide and idle return PC");
 ok(bind_title_color()&&bind_title_custom()&&bind_drawer_title()&&bind_desktop_title(),"all production title binders survive shifted builders");
@@ -94,7 +97,7 @@ ok(g_slots[0].address==data.load_base+{B+0x110}&&g_slots[1].address==data.load_b
 pre+=f'auto&pv=images[{PF}];pv.insert(pv.begin()+4,4,0xd503201f);spans[{PF}]+=16;auto&cv=images[{HC}];for(auto&w:cv)if((w&0xfc000000)==0x94000000)w=(w&0xfc000000)|((w-8)&0x3ffffff);cv.insert(cv.begin(),8,0xd503201f);spans[{HC}]+=32;g_title_hide_bound=false;ok(bind_title_hide()&&g_slots[6].address==data.load_base+{PF+0x74}&&hc_title_folder_new_caller==data.load_base+{HC+0x98},"hide prefix and folder caller follow moved code");\n'
 pre+=f'''auto save=images[{B}];images[{B}].insert(images[{B}].end(),save.begin()+0x110/4,save.begin()+0x120/4);spans[{B}]+=16;g_title_color_bound=false;ok(!bind_title_color(),"ambiguous title replay window rejected");images[{B}]=save;spans[{B}]-=16;
 auto policy=images[{P}];images[{P}][0x418/4]^=1;ok(!indicator_policy_compatible({P},0,&anchors),"foreign editing call refused");images[{P}]=policy;
-auto cap=images[{L}];images[{L}][0x250/4]^=1;ok(!capsule_wrapper_layout_compatible({W},0,&patch),"capsule replay register mismatch refused");
+auto cap=images[{L}];images[{L}][{(site_offset+0x20)//4}]^=1;ok(!capsule_wrapper_layout_compatible({W},0,&patch),"capsule replay register mismatch refused");
 std::cout<<"BINDINGS_AUDIT="<<checks<<" checks; failed="<<failed<<"\\n";return failed?1:0;}}
 '''
 out=D/('bindings-'+ROOT.name);out.mkdir(exist_ok=True);(out/'test.cpp').write_text(pre,encoding='utf8')

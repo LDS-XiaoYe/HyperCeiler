@@ -1,10 +1,19 @@
 # dynamic-address-audit
 
-Proves that every Dart-side hook site and heap-field offset used by
-`app/src/main/cpp/targets/home/` is **derived at runtime** rather than stored as a
-constant. The project rule is that a launcher build bump must not silently turn
-into a wrong-address write, so a hardcoded offset is treated as a defect, not a
-tradeoff.
+These suites validate the original workspace/Dock/capsule/title/widget paths they
+explicitly exercise. They do **not** prove all current OS4 launcher entries or
+all newly added folder features. A runtime-derived address still needs its
+consumer/control-flow/ABI/lifetime contract proved.
+
+Additional production-binder coverage:
+- `tests/os4-audit-big-folder-20261005/verify.py`: 1506 checks, dynamic strategy
+  fields, full original continuation, live parent-frame ratio, settings race.
+- `tests/os4-audit-folder-geometry-20261005/verify.py`: real ELF, independently
+  relocated callers/callees, moved grid fields, NOP-shifted scalar windows,
+  incoming branch refusal, anonymous runtime helper bodies and atomic admission.
+
+Full audit status and unresolved areas live in `handover/OS4_CODE_AUDIT.md`.
+No suite here implies that the full OS4 audit is complete.
 
 The audit is a three-legged A/B:
 
