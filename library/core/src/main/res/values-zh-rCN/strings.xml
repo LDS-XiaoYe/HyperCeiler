@@ -82,4 +82,7 @@
     <string name="aicr_modify_browser_copy">修改复制直达使用的浏览器</string>
     <string name="aicr_preferred_browser">选择打开的浏览器</string>
     <string name="aicr_default_browser">默认浏览器</string>
+    <string name="home_restart_launcher">重启桌面</string>
+    <string name="home_restart_zygote">重启 Zygote</string>
+    <string name="home_restart_zygote_confirm">确定立即重启 Android 运行时吗？应用会关闭，手机将暂时回到锁屏。</string>
 </resources>
