@@ -37,6 +37,17 @@ namespace {
 
 constexpr const char* kModuleVersion = "2.3";
 
+/*
+ * Debug property switch. Read once on first use and cached: __system_property_get is a cheap
+ * shared-memory read but it is not free, and this is asked on a path that runs on every pass.
+ */
+constexpr const char* kPropConfigBlob = "debug.hyperceiler.hometweaks.blob";
+
+bool DebugPropertyEnabled(const char* name) {
+    char value[PROP_VALUE_MAX] = {};
+    return __system_property_get(name, value) > 0 && value[0] == '1';
+}
+
 const NativeAPIEntries* g_entries = nullptr;
 std::mutex g_wakeMutex;
 std::condition_variable g_wakeCv;
@@ -103,7 +114,6 @@ struct State {
     char siteSource[96]{};
     PlanResult lastPlan;
     PatchStats patchStats;
-    bool statusWritten = false;
 };
 
 State g_state;
@@ -118,9 +128,8 @@ uint64_t NowMs() {
 }
 
 /*
- * Render a count that may legitimately be unset. "0" in the status report or in the load line would
- * read as a setting someone deliberately chose, which is the one thing this value never is
- * (see kColsUnset).
+ * Render a count that may legitimately be unset. "0" in the load line would read as a setting
+ * someone deliberately chose, which is the one thing this value never is (see kColsUnset).
  */
 std::string DescribeCount(uint32_t count) {
     if (count == kColsUnset) return std::string("未设置");
@@ -490,11 +499,7 @@ void Watchdog(State* state) {
  * correct rather than poison - and the question is asked on every monitor pass.
  */
 bool config_blob_channel_enabled() {
-    static const bool enabled = [] {
-        char value[PROP_VALUE_MAX] = {};
-        return __system_property_get("debug.hyperceiler.hometweaks.blob", value) > 0
-            && value[0] == '1';
-    }();
+    static const bool enabled = [] { return DebugPropertyEnabled(kPropConfigBlob); }();
     return enabled;
 }
 
@@ -740,180 +745,28 @@ std::string DescribePlan(const PlanResult& plan) {
     return s;
 }
 
-const char* WhyOf(const PlanResult& plan, uint32_t num) {
-    switch (num) {
-        case kFeatureNoClear: return plan.why9;
-        case kFeatureFolderCols: return plan.why16;
-        case kFeatureHideClear: return plan.why18;
-        case kFeaturePadGrid: return plan.why4;
-        case kFeaturePhoneGrid: return plan.why19;
-        case kFeatureFoldGrid: return plan.why20;
-        case kFeatureIconSize: return plan.why21;
-        default: return "";
-    }
-}
-
-std::string JoinEnabled(const Config& cfg) {
-    std::string s;
-    for (uint32_t n : cfg.enabled) {
-        if (!s.empty()) s += ",";
-        s += std::to_string(n);
-    }
-    return s.empty() ? std::string("（一个都没开）") : s;
-}
-
-std::string BuildStatusText(const State* state) {
-    const Config& cfg = state->config;
-    const PlanResult& plan = state->lastPlan;
-    const PatchStats& stats = state->patchStats;
-    char line[640];
-    std::string s;
-
-    s += "HomeTweaks 模块状态 v";
-    s += kModuleVersion;
-    s += "\n";
-
-    time_t now = time(nullptr);
-    struct tm tmv {};
-    localtime_r(&now, &tmv);
-    snprintf(line, sizeof(line), "写入时间: %04d-%02d-%02d %02d:%02d:%02d\n",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min,
-             tmv.tm_sec);
-    s += line;
-
-    if (state->imageFound) {
-        snprintf(line, sizeof(line), "镜像: 已找到 %s（%s）\n", kTargetLibName,
-                 state->imageHow[0] != '\0' ? state->imageHow : "来源未知");
-        s += line;
-        snprintf(line, sizeof(line), "镜像指纹: %016llx（站点缓存按它索引）\n",
-                 static_cast<unsigned long long>(state->imageId));
-        s += line;
-    } else {
-        s += "镜像: 还没找到 libapp.so（模块可能刚注入，或者桌面根本不是它）\n";
-    }
-
-    if (state->imageFound && state->image.path[0] != '\0') {
-        char apkPath[sizeof(state->image.path)];
-        snprintf(apkPath, sizeof(apkPath), "%s", state->image.path);
-        char* bang = strstr(apkPath, "!/");
-        if (bang != nullptr) *bang = '\0';
-        struct stat st {};
-        if (stat(apkPath, &st) == 0) {
-            snprintf(line, sizeof(line), "桌面 APK: %s（%lld 字节）\n", apkPath,
-                     static_cast<long long>(st.st_size));
-        } else {
-            snprintf(line, sizeof(line), "桌面 APK: %s（stat 失败）\n", apkPath);
-        }
-        s += line;
-    }
-
-    snprintf(line, sizeof(line), "站点来源: 符号表 / 签名（无写死地址）\n");
-    s += line;
-    snprintf(line, sizeof(line), "站点来源: %s\n",
-             state->siteSource[0] != '\0' ? state->siteSource : "（本次还没定位）");
-    s += line;
-    const char* sym = SymbolIndex::Instance().status();
-    snprintf(line, sizeof(line), "运行期符号表: %s\n",
-             (sym != nullptr && sym[0] != '\0') ? sym : "（还没走到这一步）");
-    s += line;
-
-    if (!state->configLoaded) {
-        s += "配置: 还没读到\n";
-    } else if (false) {
-        s += "配置: 读不到任何配置文件，先用写死的默认配置（功能 9 + 16）\n";
-    } else {
-        snprintf(line, sizeof(line), "配置来源: %s\n", state->configPath);
-        s += line;
-    }
-    if (state->configLoaded) {
-        snprintf(line, sizeof(line), "总开关: %s；启用功能: %s\n",
-                 cfg.masterEnabled() ? "开" : "关", JoinEnabled(cfg).c_str());
-        s += line;
-        snprintf(line, sizeof(line),
-                 "数值: 文件夹每行 %s；手机 %s 列 × %u 行（0=自动）；折叠屏 %u×%u；平板 %u×%u；图标 ×%.4g\n",
-                 DescribeCount(cfg.folderCols).c_str(), DescribeCount(cfg.phoneCols).c_str(),
-                 cfg.phoneRows,
-                 cfg.foldMajor, cfg.foldMinor, cfg.padMajor, cfg.padMinor,
-                 IconScaleValueFromCode(cfg.iconScaleCode));
-        s += line;
-    }
-
-    const uint32_t wanted = WantedFeatureMask(cfg);
-    s += "功能状态:\n";
-    for (const FeatureSlot& f : kFeatureSlots) {
-        const bool enabled = cfg.masterEnabled() && (wanted & f.bit) != 0;
-        std::string value;
-        if (state->restoreBlocked) {
-            value = "旧补丁恢复待重试；新设置尚未应用";
-        } else if (state->writeRetryPending) {
-            value = "补丁写入尚未全部完成；等待重试";
-        } else if (stats.mismatch || stats.outOfRange) {
-            value = "补丁校验未通过；未确认生效";
-        } else if (!enabled) {
-            value = (f.num == kFeatureHideClear && cfg.masterEnabled() &&
-                     (wanted & kWantNoClear) != 0)
-                    ? "未启用（与功能 9 互斥，同时打开时只应用 9）"
-                    : "未启用";
-        } else if (FeatureOk(state->sites, f.num)) {
-            value = "已生效";
-            if (f.num == kFeatureFolderCols) {
-                value += "（每行 " + std::string(DescribeCount(cfg.folderCols)) + " 个）";
-            } else if (f.num == kFeaturePhoneGrid) {
-                value += "（" + std::string(DescribeCount(cfg.phoneCols)) + " 列 × ";
-                value += (cfg.phoneRows == kPhoneRowsAuto)
-                         ? std::string("官方自动行")
-                         : std::to_string(cfg.phoneRows) + " 行";
-                value += "）";
-                if (cfg.phoneRows != kPhoneRowsAuto && !state->sites.ok19r) {
-                    value += "，但行数那两份落点没定位到（行数仍是官方值）";
-                }
-            } else if (f.num == kFeatureFoldGrid) {
-                value += "（" + std::to_string(cfg.foldMajor) + "×" +
-                         std::to_string(cfg.foldMinor) + "）";
-            } else if (f.num == kFeaturePadGrid) {
-                value += "（" + std::to_string(cfg.padMajor) + "×" +
-                         std::to_string(cfg.padMinor) + "）";
-            } else if (f.num == kFeatureIconSize) {
-                char scale[32];
-                snprintf(scale, sizeof(scale), "%.4g", IconScaleValueFromCode(cfg.iconScaleCode));
-                value += "（×";
-                value += scale;
-                value += "；官方滑块与 Rust 侧 min/max 已失效）";
-            }
-        } else {
-            const char* why = WhyOf(plan, f.num);
-            value = "没生效 —— 定位失败：";
-            value += (why != nullptr && why[0] != '\0') ? why : "原因未记录";
-        }
-        snprintf(line, sizeof(line), "  功能 %u（%s）: %s\n", f.num, f.name, value.c_str());
-        s += line;
-    }
-
-    snprintf(line, sizeof(line),
-             "补丁: 共 %zu 条（新写入 %zu，已就位 %zu，越界 %zu，原值不符 %zu，写入失败 %zu）\n",
-             stats.total, stats.written, stats.already, stats.outOfRange, stats.mismatch,
-             stats.failed);
-    s += line;
-
-    s += "\n说明：功能 4（平板）/ 19（手机）/ 20（折叠屏）是三条互不影响的链路，\n";
-    s += "一台设备只会走其中一条 —— 手上是手机的话，只有「手机桌面网格」那条会真的\n";
-    s += "改到布局。这三项改的是桌面启动时那一次网格初始化，所以必须重启桌面；\n";
-    s += "折叠屏 / 平板还要再清一次「系统桌面」的应用数据才会重算。\n";
-    s += "功能 21（图标大小）三端各有一条独立链路，改的是「图标尺寸 = 基础尺寸 × 用户\n";
-    s += "倍率」那一步里的倍率，所以不管手上是哪种设备都会生效，同样要重启桌面。\n";
-    return s;
-}
-
-void WriteStatusFile(const State* state, bool alsoExternal) {
-    const std::string text = BuildStatusText(state);
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(text.data());
-    if (!WriteWholeFileAtomic(kLocalStatusPath, data, text.size())) {
-        LOGW("状态文件写入失败：%s", kLocalStatusPath);
-    }
-    if (alsoExternal) {
-        WriteWholeFileAtomic(kExternalStatusPath, data, text.size());
-    }
-}
+/*
+ * The status report used to live here: BuildStatusText() rendered a multi-line plain-text summary of
+ * the located sites, the applied patches and the failures, and WriteStatusFile() wrote it to a file
+ * in the launcher's data dir plus a second copy in Downloads.
+ *
+ * It is gone on purpose, along with WhyOf() and JoinEnabled() which existed only to feed it. It was
+ * a diagnostics feature that ran unconditionally on every settle pass, and the Downloads copy alone
+ * was reason enough to remove it:
+ *
+ *   - MediaProvider indexes everything under /sdcard. Every write landed as `hometweaks.status.tmp`
+ *     and was then renamed, so the indexer raced the rename and logged "Database update failed while
+ *     renaming ... .tmp" every single time.
+ *   - HyperOS's gallery cached the path and re-queried it, logging a miss on each pass.
+ *   - It showed up in the user's Downloads, which is not where a module's private bookkeeping
+ *     belongs.
+ *
+ * Nothing ever read either copy back - it was write-only - so the entire feature is gone rather
+ * than gated behind a property. Everything it used to say is already in logcat, which is where a
+ * device that misbehaves is actually diagnosed: LogPlanReasons() below names each failed feature and
+ * its reason, and ApplyPatches() logs every skip and write failure. `logcat -s HomeTweaks` is the
+ * replacement for `cat hometweaks.status`, and it costs no file in any user-visible directory.
+ */
 
 void SettleLocked(State* state, bool allowScan) {
     if (state == nullptr || !state->imageFound || !state->configLoaded) return;
@@ -937,31 +790,15 @@ void SettleLocked(State* state, bool allowScan) {
             const PatchStats retry = ApplyPatches(state, state->lastPlan.patches);
             state->patchStats = retry;
             state->writeRetryPending = retry.failed != 0;
-            if (!state->writeRetryPending) {
-                state->statusWritten = false;
-            }
-            if (!state->statusWritten) {
-                WriteStatusFile(state, allowScan);
-                state->statusWritten = true;
-            }
             return;
         }
-        if (!state->statusWritten) {
-            WriteStatusFile(state, allowScan);
-            state->statusWritten = true;
-            state->repatchNeeded = false;
-        }
+        state->repatchNeeded = false;
         return;
     }
 
     if (!RevertApplied(state)) {
-        if (!state->restoreBlocked) state->statusWritten = false;
         state->restoreBlocked = true;
         state->patchStats.failed = state->applied.size();
-        if (!state->statusWritten) {
-            WriteStatusFile(state, allowScan);
-            state->statusWritten = true;
-        }
         return;
     }
     state->restoreBlocked = false;
@@ -993,9 +830,6 @@ void SettleLocked(State* state, bool allowScan) {
          static_cast<unsigned long long>(NowMs() - t0),
          state->repatchNeeded ? "（尚未全部定位，后台继续）" : "");
     LogPlanReasons(plan, state->config);
-
-    WriteStatusFile(state, allowScan);
-    state->statusWritten = true;
 }
 
 bool TryDiscoverImage() {
@@ -1322,7 +1156,6 @@ void PushTweaksConfig(const Config& config) {
         g_state.configLoaded = true;
         g_state.configFromBaked = false;
         g_state.repatchNeeded = true;
-        g_state.statusWritten = false;
         g_state.packTried = false;
         g_state.cacheTried = false;
     }
