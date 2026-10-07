@@ -691,6 +691,7 @@ class HomeDockWindow : BaseHook() {
                     // system_server survives a launcher restart. Bypass its old 30 s style limit
                     // once per new window, asynchronously, never query under WMS/layers locks.
                     glassClient.refreshRevealStyle(force = true)
+                    glassClient.refreshGeometry(force = true)
                 }
                 registerDisplayListener()
                 updateLayer(window)
@@ -973,7 +974,15 @@ class HomeDockWindow : BaseHook() {
                 layer.motion.finish()
             }
             val glass = updateGlass(layer, config, bounds, dark, visible)
-            val resumeGlass = visible && glass != null && (layer.lastVisible == false || glass.retainedCapture)
+            // A parameter edit creates a new host. A late departure command can cancel its
+            // first readiness loop AFTER the visibility return; no retained texture exists yet.
+            // Reopen once the existing return animation settles, not on a polling timer.
+            val resumeFirstReadiness = visible && glass?.readinessSuspended == true &&
+                !layer.overview && !layer.nativeApplied &&
+                !layer.motion.isRunning(SystemClock.uptimeMillis()) && !isDisplayRotated()
+            val resumeGlass = visible && glass != null &&
+                (layer.lastVisible == false || glass.retainedCapture || resumeFirstReadiness)
+            if (resumeFirstReadiness) glassClient.releaseDepartureHold(glass!!)
             if (visible && layer.lastVisible == false && glass != null) glassClient.releaseDepartureHold(glass)
             if (!visible && layer.lastVisible == true && glass != null) {
                 // A display rotation hides the launcher behind the foreground app. Freeze the
@@ -1929,6 +1938,15 @@ class HomeDockWindow : BaseHook() {
                     }
                     directRecoveryDelay = 100L
                     if (needsFrame) scheduleAnimationFrame()
+                    else if (layers.any { (window, layer) ->
+                            layer.lastVisible == true && !layer.overview && !layer.overlayHidden &&
+                                layer.glass?.readinessSuspended == true &&
+                                window.callMethod("isVisible") == true
+                        }) {
+                        // The terminal pose has committed. One traversal reopens a cancelled
+                        // first readiness loop; resume clears the latch before posting IPC.
+                        requestTraversal()
+                    }
                 }
             }
         }.onFailure {

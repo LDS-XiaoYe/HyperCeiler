@@ -751,7 +751,8 @@ HC_LAYOUT_KNOBS(HC_ASM_KNOB)
 #undef HC_ASM_KNOB
 
 /* Interior original RenderBox layout splices. Preserve all live Dart registers
- * and NZCV; the helper writes only verified local frame slots, never heap fields.
+ * and NZCV; helpers write verified scalar frame slots (indicator also reuses its
+ * freshly allocated original EdgeInsets). They never reserve Dart heap space.
  * Original loops retain constraints, hit testing and ParentData.offset ownership. */
 .macro workspace_layout_splice name, slot, occupied
 .globl \name
@@ -765,7 +766,7 @@ HC_LAYOUT_KNOBS(HC_ASM_KNOB)
     str x10, [x9]
     adrp x9, hc_layout_dart_\slot\()_enabled
     add x9, x9, :lo12:hc_layout_dart_\slot\()_enabled
-    ldrb w10, [x9]
+    ldarb w10, [x9] // Acquire the release-published scalar/gate pair.
     cbz w10, 1f
     sub sp, sp, #704
     stp x0, x1, [sp, #0]
@@ -796,9 +797,9 @@ HC_LAYOUT_KNOBS(HC_ASM_KNOB)
     mov x0, x29
     mov x1, x28
     .if \occupied == 3
-    mov x2, x26
+    ldr x2, [sp, #0] /* original x0: freshly allocated EdgeInsets */
     mov x3, x22
-    bl hc_layout_indicator_pair
+    bl hc_layout_indicator_position
     .else
     mov x2, #\occupied
     bl hc_layout_workspace_layout
@@ -1014,7 +1015,8 @@ folder_geometry_splice hc_layout_folder_4_entry, 4
 drop_geometry_splice hc_layout_drop_0_entry, 0
 drop_geometry_splice hc_layout_drop_1_entry, 1
 
-/* Both finished animation branches receive the same fresh outer Padding. */
+/* Both branches use the same original outer Insets. Entry runs after its bottom
+ * store; the helper changes only that object, never the animation/height frame local. */
 workspace_layout_splice hc_layout_capsule_entry, IndicatorMargin, 3
 
 /* The original screen-indicator builder owns its Dart frame and every Dart call.
@@ -1447,3 +1449,355 @@ hc_grid_autofit_\kind\()_entry:
 .endm
 grid_autofit_splice 0
 grid_autofit_splice 1
+
+// Folder preview coordinates consume the actually rendered SliverGrid, not unclamped metrics.
+.macro folder_preview_splice kind
+.globl hc_folder_preview_\kind\()_entry
+.p2align 4
+hc_folder_preview_\kind\()_entry:
+    dart_save
+    adrp x9, hc_folder_preview_enabled
+    add x9, x9, :lo12:hc_folder_preview_enabled
+    ldar w9, [x9]
+    cbz w9, 1f
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, sp
+    mov x1, x29
+    mov w2, #\kind
+    lsl x3, x28, #32
+    bl hc_folder_preview_body
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    add sp, sp, #704
+    dart_restore
+
+    b 2f
+1:
+    dart_restore
+2:
+    adrp x16, hc_folder_preview_original
+    add x16, x16, :lo12:hc_folder_preview_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+folder_preview_splice 0
+folder_preview_splice 1
+folder_preview_splice 2
+
+/*
+ * The DESTINATION preview inside FolderAnimController._calcFolderPreviewLoc is spliced twice:
+ *
+ *  kind 3 sits on the four words that end with the absolute index in x2, and only records it.
+ *  kind 4 sits on the write-back of the finished Offset and rewrites its two doubles.
+ *
+ * Both windows replay the original four words verbatim and then jump one word past the window,
+ * so the launcher's own arithmetic, GC call and write barrier are untouched. Neither window
+ * contains a branch or a Dart call, which is what makes a plain 16-byte splice safe here.
+ */
+.macro folder_preview_register_entry name, kind
+.globl \name
+.p2align 4
+\name:
+    dart_save
+    adrp x9, hc_folder_preview_enabled
+    add x9, x9, :lo12:hc_folder_preview_enabled
+    ldar w9, [x9]
+    cbz w9, 1f
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, sp
+    mov x1, x29
+    mov w2, #\kind
+    lsl x3, x28, #32
+    bl hc_folder_preview_body
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    add sp, sp, #704
+    dart_restore
+    b 2f
+1:
+    dart_restore
+2:
+    /*
+     * The backend continuation replays the four displaced words and returns into the launcher, so
+     * kind 3's x2 read and kind 4's Offset rewrite happen before that replay runs. Kind 4 stores the
+     * compressed pointer unchanged; kind 3 has already stashed its index.
+     */
+    adrp x16, hc_folder_preview_original
+    add x16, x16, :lo12:hc_folder_preview_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+folder_preview_register_entry hc_folder_preview_3_entry, 3
+folder_preview_register_entry hc_folder_preview_4_entry, 4
+folder_preview_register_entry hc_folder_preview_5_entry, 5
+folder_preview_register_entry hc_folder_preview_6_entry, 6
+
+// Read-only destination observer: records _calcRealIconPos' incoming receiver/item and the
+// cached grid insets it adds, without touching any of them. Never rewrites a field.
+.macro folder_probe_splice kind
+.globl hc_folder_probe_\kind\()_entry
+.p2align 4
+hc_folder_probe_\kind\()_entry:
+    dart_save
+    adrp x9, hc_folder_probe_enabled
+    add x9, x9, :lo12:hc_folder_probe_enabled
+    ldar w9, [x9]
+    cbz w9, 1f
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, sp
+    mov x1, x29
+    mov w2, #\kind
+    lsl x3, x28, #32
+    bl hc_folder_probe_body
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    add sp, sp, #704
+    dart_restore
+
+    b 2f
+1:
+    dart_restore
+2:
+    adrp x16, hc_folder_probe_original
+    add x16, x16, :lo12:hc_folder_probe_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+folder_probe_splice 0
+
+/* Large-folder original size producer and workspace-size consumers. No relocated calls. */
+.macro big_folder_size_splice name, kind
+.globl \name
+.p2align 4
+\name:
+    dart_save
+    adrp x9, hc_big_folder_size_enabled
+    add x9, x9, :lo12:hc_big_folder_size_enabled
+    ldar w10, [x9]
+    cbz w10, 2f
+    sub sp, sp, #704
+    stp x0, x1, [sp, #0]
+    stp x2, x3, [sp, #16]
+    stp x4, x5, [sp, #32]
+    stp x6, x7, [sp, #48]
+    stp x8, x9, [sp, #64]
+    stp x10, x11, [sp, #80]
+    stp x12, x13, [sp, #96]
+    stp x14, x18, [sp, #112]
+    stp x15, x30, [sp, #128]
+    stp q0, q1, [sp, #160]
+    stp q2, q3, [sp, #192]
+    stp q4, q5, [sp, #224]
+    stp q6, q7, [sp, #256]
+    stp q8, q9, [sp, #288]
+    stp q10, q11, [sp, #320]
+    stp q12, q13, [sp, #352]
+    stp q14, q15, [sp, #384]
+    stp q16, q17, [sp, #416]
+    stp q18, q19, [sp, #448]
+    stp q20, q21, [sp, #480]
+    stp q22, q23, [sp, #512]
+    stp q24, q25, [sp, #544]
+    stp q26, q27, [sp, #576]
+    stp q28, q29, [sp, #608]
+    stp q30, q31, [sp, #640]
+    mov x0, x29
+    mov x1, x28
+    mov x2, sp
+    mov x3, #\kind
+    mov x4, x26
+    mov x5, x22
+    bl hc_big_folder_size_body
+    ldp q0, q1, [sp, #160]
+    ldp q2, q3, [sp, #192]
+    ldp q4, q5, [sp, #224]
+    ldp q6, q7, [sp, #256]
+    ldp q8, q9, [sp, #288]
+    ldp q10, q11, [sp, #320]
+    ldp q12, q13, [sp, #352]
+    ldp q14, q15, [sp, #384]
+    ldp q16, q17, [sp, #416]
+    ldp q18, q19, [sp, #448]
+    ldp q20, q21, [sp, #480]
+    ldp q22, q23, [sp, #512]
+    ldp q24, q25, [sp, #544]
+    ldp q26, q27, [sp, #576]
+    ldp q28, q29, [sp, #608]
+    ldp q30, q31, [sp, #640]
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x18, [sp, #112]
+    ldp x15, x30, [sp, #128]
+    add sp, sp, #704
+    dart_restore
+    adrp x16, hc_big_folder_size_resume
+    add x16, x16, :lo12:hc_big_folder_size_resume
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+2:
+    // Partial registration must use untouched original arithmetic, including
+    // the screen-index local; never run a half-installed scalar carry path.
+    dart_restore
+    adrp x16, hc_big_folder_size_original
+    add x16, x16, :lo12:hc_big_folder_size_original
+    ldr x16, [x16, #(\kind * 8)]
+    br x16
+.endm
+
+big_folder_size_splice hc_big_folder_size_0_entry, 0
+big_folder_size_splice hc_big_folder_size_1_entry, 1
+big_folder_size_splice hc_big_folder_size_2_entry, 2
+big_folder_size_splice hc_big_folder_size_3_entry, 3
+big_folder_size_splice hc_big_folder_size_4_entry, 4
+
+big_folder_size_splice hc_big_folder_size_5_entry, 5
+big_folder_size_splice hc_big_folder_size_6_entry, 6

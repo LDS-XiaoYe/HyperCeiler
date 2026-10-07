@@ -260,6 +260,92 @@ inline bool folder_window_single_entry(std::span<const uint32_t> body,
     return true;
 }
 
+// Resolve the default TEXT_ALIGNMENT_* start root from the named converter's
+// case 1 fallthrough (cmp #1; b.gt; cmp #0; b.le; pool root; ret).
+// Pool high/low immediates are data, not a launcher version signature.
+inline bool folder_pool_load(std::span<const uint32_t> b, size_t at,
+        unsigned reg, uint32_t &pool, size_t &count) {
+    if (at >= b.size() || reg > 30) return false;
+    const auto w = b[at];
+    if (insn_is_ldr_x(w) && insn_rt(w) == reg && insn_rn(w) == 27) {
+        pool = insn_imm12(w) * 8; count = 1; return pool != 0;
+    }
+    if ((w & 0xff800000u) != 0x91000000u || insn_rt(w) != reg
+        || insn_rn(w) != 27 || at + 1 >= b.size()) return false;
+    const auto load = b[at + 1];
+    if (!insn_is_ldr_x(load) || insn_rt(load) != reg || insn_rn(load) != reg) return false;
+    pool = (insn_imm12(w) << ((w & 0x400000u) ? 12 : 0)) + insn_imm12(load) * 8;
+    count = 2; return pool != 0;
+}
+inline bool folder_start_pool(std::span<const uint32_t> b, uint32_t &pool) {
+    unsigned hits = 0; uint32_t found = 0;
+    for (size_t i = 0; i + 5 < b.size(); ++i) {
+        // CMP Xn,#1 / CMP Xn,#0, same input register and signed GT/LE.
+        if ((b[i] & 0xfffffc1fu) != 0xf100041fu
+            || (b[i + 2] & 0xfffffc1fu) != 0xf100001fu
+            || insn_rn(b[i]) != insn_rn(b[i + 2])
+            || (b[i + 1] & 0xff00001fu) != 0x5400000cu
+            || (b[i + 3] & 0xff00001fu) != 0x5400000du) continue;
+        uint32_t root = 0; size_t count = 0;
+        if (!folder_pool_load(b, i + 4, 0, root, count)
+            || i + 4 + count >= b.size() || b[i + 4 + count] != 0xd65f03c0u) continue;
+        bool targets_ok = true;
+        for (size_t j : {i + 1, i + 3}) {
+            int32_t d = int32_t((b[j] >> 5) & 0x7ffffu);
+            if (d & 0x40000) d -= 0x80000;
+            const int64_t target = int64_t(j) + d;
+            if (target <= int64_t(i + 4 + count) || target >= int64_t(b.size())) targets_ok = false;
+        }
+        if (targets_ok) { found = root; ++hits; }
+    }
+    if (hits != 1) return false;
+    pool = found; return true;
+}
+// Keep the existing splice ABI: X0 is the freshly built Text/TextField, X1 is
+// TextAlign.start. Derive its store field and following replay, independently
+// for each owner. Never place a trampoline over a call/GC PC or an interior join.
+inline bool folder_text_align_store(std::span<const uint32_t> b, uint32_t va,
+        uint32_t start_pool, uint32_t &offset) {
+    unsigned hits = 0; uint32_t found = 0;
+    for (size_t i = 1; i + 3 < b.size(); ++i) {
+        const auto w = b[i]; const int field = int32_t(insn_imm9(w));
+        if (!insn_is_stur_w(w) || insn_rn(w) != 0 || insn_rt(w) != 1
+            || field <= 0 || field > 255 || (field & 3) != 3) continue;
+        bool producer = false;
+        for (size_t back = 1; back <= 2 && back <= i; ++back) {
+            uint32_t root = 0; size_t count = 0;
+            if (folder_pool_load(b, i - back, 1, root, count)
+                && count == back && root == start_pool) producer = true;
+        }
+        if (!producer) continue;
+        // X1 must be replaced immediately after the first store, so overriding
+        // it cannot leak into another unrelated constructor field.
+        const auto next = b[i + 1];
+        const bool reload = (insn_is_ldr_x(next) && insn_rt(next) == 1
+                && (insn_rn(next) == 27 || insn_rn(next) == 1))
+            || ((next & 0xff800000u) == 0x91000000u && insn_rt(next) == 1
+                && (insn_rn(next) == 27 || insn_rn(next) == 22))
+            || (insn_is_ldur_x(next) && insn_rt(next) == 1 && insn_rn(next) == 29);
+        if (!reload) continue;
+        bool replay = true;
+        for (size_t j = i + 1; j <= i + 3; ++j) {
+            const auto op = b[j];
+            const bool allowed = (insn_is_stur_w(op) && insn_rn(op) == 0)
+                || (insn_is_ldr_x(op) && insn_rt(op) == 1
+                    && (insn_rn(op) == 27 || insn_rn(op) == 1))
+                || ((op & 0xff800000u) == 0x91000000u && insn_rt(op) == 1
+                    && (insn_rn(op) == 27 || insn_rn(op) == 22))
+                || (insn_is_ldur_x(op) && insn_rt(op) == 1 && insn_rn(op) == 29);
+            if (!allowed) replay = false;
+        }
+        if (i > (UINT32_MAX - va) / 4 || va + i * 4 > UINT32_MAX - 16) return false;
+        if (!replay || !folder_window_single_entry(b, va, va + uint32_t(i * 4))) continue;
+        found = uint32_t(i * 4); ++hits;
+    }
+    if (hits != 1) return false;
+    offset = found; return true;
+}
+
 // 1. Find the Container handoff, then splice at the COMMON join one instruction
 // after the text-only owner reload. Saved x3 identifies the selected child on both
 // paths. Replay has no BL/GC return-PC relocation and all incoming edges hit its start.

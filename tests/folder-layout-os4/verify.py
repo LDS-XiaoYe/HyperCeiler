@@ -45,13 +45,18 @@ int bl_imm_words(uint32_t w){int n=int(w&0x3ffffff);if(n&0x2000000)n-=0x4000000;
 '''
 registry_source=(ROOT/'app/src/main/cpp/targets/home/tweaks/symtab.cpp').read_text(encoding='utf8')
 pre+='struct Segment{uintptr_t begin,end;uint32_t flags;};struct Image{uintptr_t base;Segment segments[16];size_t segmentCount;};constexpr uint32_t kMaxFunctionBytes=0x4000;\n'
+if 'CodeView(image)' in registry_source:
+ sys.path.insert(0,str(W/'tests/os4-audit-symbol-prologue-20261005'));from fixture_support import codeview_fixture
+ pre+=codeview_fixture(ROOT,'for(const auto& [va,b]:images){const uintptr_t begin=reinterpret_cast<uintptr_t>(b.data());const size_t bytes=b.size()*4;if(address>=begin&&address-begin<=bytes&&out.size()<=bytes-(address-begin)){std::memcpy(out.data(),reinterpret_cast<void*>(address),out.size());return true;}}return false;',True)
 for name in ['bool NameEquals(', 'bool VaInExecSegment(', 'bool LooksLikeDartFunction(']:pre+=fun(registry_source,name)+'\n'
-pre+='bool production_accept(const char*n,uint32_t va,uint32_t size){if(!images.count(va))return false;auto&b=images[va];uintptr_t begin=(uintptr_t)b.data();Image im{};im.base=begin-va;im.segmentCount=1;im.segments[0]={begin,begin+b.size()*4,1};return LooksLikeDartFunction(im,va,n,size); }\n'
+pre+='bool production_accept(const char*n,uint32_t va,uint32_t size){if(!images.count(va))return false;auto&b=images[va];uintptr_t begin=(uintptr_t)b.data();Image im{};im.base=begin-va;im.segmentCount=1;im.segments[0]={begin,begin+b.size()*4,5};return LooksLikeDartFunction(im,va,n,size); }\n'
 for n in ['bool is_ldur_double(', 'bool is_ldur_word(', 'int imm9(', 'uint32_t rn(', 'uint32_t rt(', 'bool bl_target(uint32_t word, uint32_t pc, uint32_t *target) {']:pre+=fun(src,n)+'\n'
 pre+='namespace dartscan { bool function_span(uint32_t va,uint32_t*out){if(!images.count(va))return false;*out=images[va].size()*4;return true;}\n'
 for n in ['bool unique_sequence(', 'bool body(uint32_t va', 'bool site(uint32_t va, std::span', 'bool site(uint32_t va, std::initializer_list']:pre+=fun(src,n)+'\n'
 pre+='}\nconstexpr uint32_t kDartPrologue=0xa9bf79fd;constexpr int ANDROID_LOG_INFO=4;constexpr int ANDROID_LOG_WARN=5;const char*kTag="test";int __android_log_print(int,const char*,const char*,...){return 0;}\n'
 pre+='namespace nhk{struct CodeSource{};}using Words=std::array<uint32_t,4>;struct Slot{uintptr_t address=0;void*replacement=nullptr;void**original=nullptr;nhk::CodeSource source;Words original_words{};bool registered=false;};\nstruct Dart{uintptr_t load_base=0x100000000;std::string path="libapp.so";};Dart data;Dart*g_dart=&data;Slot g_slots[8];constexpr int kFolderLayoutSlotBase=0;\n'
+if 'g_folder_layout_retry_at_ms' in src:
+ pre+='uint64_t test_clock=1;uint64_t monotonic_ms(){return test_clock;}uint64_t g_folder_layout_retry_at_ms=0;unsigned g_folder_layout_retry_failures=0;\n'
 pre+='void*hc_folder_layout_original[8]{};uint64_t hc_folder_layout_requested=3;uint32_t hc_folder_layout_ready=0;bool g_folder_layout_bound=false,g_folder_layout_checked=false,g_folder_layout_attempted=false;int g_folder_cell_width_field=-1,g_folder_gap_field=-1,g_folder_screen_width_field=-1,g_folder_screen_height_field=-1,g_folder_cling_width_field=-1,g_folder_controller_config_field=-1,g_folder_rx_value_field=-1,g_folder_enum_index_field=-1;uint32_t g_folder_center_pool=0;\n'
 # The inner-Container plan and its owner-local distance. Mirrors production exactly:
 # the kind7 body reads the Container owner through the POST-dart_save x15 that the
@@ -62,7 +67,7 @@ pre+='bool bind_dart_target(uint32_t va,uintptr_t&a,nhk::CodeSource&,Words&w){fo
 pre+=fun(src,'bool folder_layout_anchors(')+'\n'+fun(src,'bool bind_folder_layout()')+'\n'
 # Test the actual callbacks, not a separately reimplemented width/alignment formula.
 a=src.index('static thread_local double folder_layout_gap');b=src.index('extern "C" uint64_t hc_title_custom_label(',a);pre+=src[a:b]
-cs=(ROOT/'app/src/main/cpp/targets/home/home_layout_config.cpp').read_text(encoding='utf8');a=cs.index("constexpr char kCacheMagic");b=cs.index('void write_config_cache(',a);pre+='namespace home_layout {\n'+cs[a:b]+'\n}\n'
+cs=(ROOT/'app/src/main/cpp/targets/home/home_layout_config.cpp').read_text(encoding='utf8');a=cs.index("constexpr char kCacheMagic");b=cs.index('bool write_config_cache(' if 'bool write_config_cache(' in cs else 'void write_config_cache(',a);pre+='namespace home_layout {\n'+cs[a:b]+'\n}\n'
 pre+='int checks=0,failed=0;void ok(bool v,const char*n){++checks;if(!v){++failed;std::cout<<"FAIL "<<n<<"\\n";}}\nint main(){\n'
 for n in names:
  v,z=s.by_name[n];span=vas[bisect.bisect_right(vas,v)]-v;words=struct.unpack('<'+'I'*(span//4),e.read(v,span));pre+=f'symbols["{n}"]={{{v},{z}}};images[{v}]={{'+','.join(hex(w) for w in words)+'};\n'

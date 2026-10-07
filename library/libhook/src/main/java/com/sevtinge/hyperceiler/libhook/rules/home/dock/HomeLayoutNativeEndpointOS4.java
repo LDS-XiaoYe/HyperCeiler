@@ -54,6 +54,8 @@ public final class HomeLayoutNativeEndpointOS4 {
     private static boolean paused;
     private static long refreshEpoch;
     private static long notificationVersion;
+    private static long queryVersion;
+    private static long publishedQueryVersion;
     private static final String RELOAD_CACHE_KEY = "OS4.HomeLayout.ProviderSnapshot.v1";
     private static final Object refresherLock = new Object();
 
@@ -218,9 +220,13 @@ public final class HomeLayoutNativeEndpointOS4 {
     /** One Binder query / one physical settings revision, including an explicit empty reset. */
     static boolean refreshFromProvider() {
         final long epoch;
+        final long notificationAtQuery;
+        final long query;
         synchronized (refresherLock) {
             if (paused) return false;
             epoch = refreshEpoch;
+            notificationAtQuery = notificationVersion;
+            query = ++queryVersion;
         }
         final android.content.Context context =
             com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
@@ -253,7 +259,14 @@ public final class HomeLayoutNativeEndpointOS4 {
         } catch (RuntimeException | Error unavailable) { return false; }
         final java.util.Map<String, Object> complete = java.util.Collections.unmodifiableMap(values);
         synchronized (refresherLock) {
-            if (paused || refreshEpoch != epoch) return false;
+            // An update received while this cursor was being read invalidates its
+            // whole revision. Keep the last-good height until the existing worker
+            // retries; never expose an older position for even one layout frame.
+            // Also reject an older query completing after a newer accepted query.
+            if (paused || refreshEpoch != epoch
+                || notificationVersion != notificationAtQuery
+                || query <= publishedQueryVersion) return false;
+            publishedQueryVersion = query;
             // Boot-classloader Map/String/Integer only; no endpoint, callback or Thread crosses reload.
             BaseHook.putHotReloadRuntimeState(RELOAD_CACHE_KEY, complete);
             cachedValues = complete;

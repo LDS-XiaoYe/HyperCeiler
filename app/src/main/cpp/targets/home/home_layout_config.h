@@ -85,7 +85,11 @@ struct Config {
     std::vector<home_title::CustomTitle> title_custom_labels;
 };
 
-/** Read the module preference snapshot through the authenticated WMS Binder endpoint. */
+/** Loader callback: nonblocking cache-only bootstrap, never Binder/dlsym.
+ * False means unavailable/busy, not an authoritative disabled snapshot. */
+bool query_bootstrap_config(Config &result);
+
+/** Worker only: read the snapshot through the authenticated WMS Binder endpoint. */
 bool query_config(Config &result);
 
 } // namespace home_layout
