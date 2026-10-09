@@ -406,17 +406,36 @@ inline std::vector<ExecutableMapping> owned_image_mappings(
             || length % sizeof(uint32_t) != 0
             || length > kMaxExecutableCodeBytes
             || length > kMaxExecutableCodeBytes - total
-            || result.size() >= kMaxExecutableMappings) return {};
+            || result.size() >= 16384) return {};
         total += static_cast<size_t>(length);
         result.push_back({mapping.begin, mapping.end,
             mapping.file_offset - owner->view_begin, mapping.device_major,
             mapping.device_minor, mapping.inode, owner->view_begin});
     }
     std::ranges::sort(result, {}, &ExecutableMapping::begin);
-    for (size_t i = 1; i < result.size(); ++i) {
-        if (result[i - 1].end > result[i].begin) return {};
+    // mprotect/inline patching splits one ELF segment into many RX VMAs.
+    // Count immutable backing runs, not incidental kernel VMA boundaries.
+    std::vector<ExecutableMapping> runs;
+    for (const auto &mapping : result) {
+        if (!runs.empty()) {
+            auto &previous = runs.back();
+            if (previous.end > mapping.begin) return {};
+            const uint64_t length = previous.end - previous.begin;
+            if (previous.end == mapping.begin
+                && previous.device_major == mapping.device_major
+                && previous.device_minor == mapping.device_minor
+                && previous.inode == mapping.inode
+                && previous.container_offset == mapping.container_offset
+                && !add_overflows(previous.file_offset, length)
+                && previous.file_offset + length == mapping.file_offset) {
+                previous.end = mapping.end;
+                continue;
+            }
+        }
+        if (runs.size() >= kMaxExecutableMappings) return {};
+        runs.push_back(mapping);
     }
-    return result;
+    return runs;
 }
 
 /**
