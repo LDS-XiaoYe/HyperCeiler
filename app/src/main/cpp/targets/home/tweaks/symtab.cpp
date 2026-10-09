@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "symtab.h"
+#include "htcache.h"
 
 #include "a64.h"
 #include "scanner.h"
@@ -10,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
 #include <array>
 #include <vector>
 #include <algorithm>
@@ -455,19 +457,25 @@ bool PatchBlockDictSize(std::vector<uint8_t>* blob, uint8_t newProps) {
     return true;
 }
 
+uint64_t SymbolNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 enum xz_ret RunDecoder(const std::vector<uint8_t>& packed, uint32_t dictMax,
-                       std::vector<uint8_t>* out) {
+                       std::vector<uint8_t>* out, uint64_t deadline = 0) {
     struct xz_dec* dec = xz_dec_init(XZ_PREALLOC, dictMax);
     if (dec == nullptr) return XZ_MEM_ERROR;
-    struct xz_buf buf {};
-    buf.in = packed.data();
-    buf.in_size = packed.size();
+    struct xz_buf buf{}; buf.in = packed.data(); buf.in_size = packed.size();
     buf.out = out->data();
-    buf.out_size = out->size();
     enum xz_ret ret = XZ_OK;
-    for (int round = 0; round < 4; ++round) {
+    for (unsigned round = 0; round < 1024; ++round) {
+        if (deadline && SymbolNowMs() >= deadline) break;
+        buf.out_size = deadline ? std::min(out->size(), buf.out_pos + size_t(65536)) : out->size();
+        const size_t input = buf.in_pos, output = buf.out_pos;
         ret = xz_dec_run(dec, &buf);
-        if (ret != XZ_UNSUPPORTED_CHECK) break;
+        if (ret == XZ_UNSUPPORTED_CHECK) continue;
+        if (ret != XZ_OK || (input == buf.in_pos && output == buf.out_pos)
+            || buf.out_pos == out->size()) break;
     }
     xz_dec_end(dec);
     if (ret == XZ_STREAM_END && out->size() != buf.out_pos) out->resize(buf.out_pos);
@@ -485,6 +493,7 @@ SymbolIndex& SymbolIndex::Instance() {
 }
 
 void SymbolIndex::ResetForTest() {
+    cachePersistTried_ = false;
     loaded_ = false;
     foundCount_ = 0;
     status_[0] = '\0';
@@ -525,8 +534,82 @@ bool SymbolIndex::SpanFrom(uint32_t va, uint32_t* span) const {
     return false;
 }
 
-bool SymbolIndex::EnsureLoaded(const Image& image) {
-    if (attempted_) return loaded_;
+namespace {
+uint64_t SymbolRegistryId() {
+    uint64_t h = 1469598103934665603ull;
+    for (const auto& target : kTargets) {
+        for (const char* p = target.fullName; *p; ++p) { h ^= uint8_t(*p); h *= 1099511628211ull; }
+        h ^= 0; h *= 1099511628211ull;
+    }
+    return h;
+}
+uint32_t SymbolRead32(const uint8_t* p) {
+    return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+}
+void SymbolPut32(std::vector<uint8_t>& out, uint32_t v) {
+    for (unsigned k = 0; k < 4; ++k) out.push_back(uint8_t(v >> (k * 8)));
+}
+}
+bool SymbolIndex::TryLoadCached(const Image& image, uint64_t imageId) {
+    if (loaded_) return true;
+    if (!CodeView(image).ExecutableRangesOk()) return false;
+    if (!imageId) imageId = ImageIdentity(image);
+    std::vector<uint8_t> payload;
+    if (!LoadSymbolCache(imageId, &payload) || payload.size() != 12 + kTargetCount * 16
+        || SymbolRead32(payload.data()) != uint32_t(SymbolRegistryId())
+        || SymbolRead32(payload.data() + 4) != uint32_t(SymbolRegistryId() >> 32)
+        || SymbolRead32(payload.data() + 8) != kTargetCount) return false;
+    std::array<uint32_t, kMaxTargetSlots> va{}, size{}, span{};
+    std::array<bool, kMaxTargetSlots> has{};
+    int found = 0;
+    for (size_t i = 0; i < kTargetCount; ++i) {
+        const uint8_t* p = payload.data() + 12 + i * 16;
+        const uint32_t flag = SymbolRead32(p);
+        va[i] = SymbolRead32(p + 4); size[i] = SymbolRead32(p + 8); span[i] = SymbolRead32(p + 12);
+        if (flag > 1 || (!flag && (va[i] || size[i] || span[i]))) return false;
+        if (!flag) continue;
+        if (!span[i] || span[i] > 0x100000 || (span[i] & 3)
+            || !VaInExecSegment(image, va[i], span[i])
+            || !LooksLikeDartFunction(image, va[i], kTargets[i].fullName, size[i])) return false;
+        has[i] = true; ++found;
+    }
+    if (!found) return false;
+    for (size_t i = 0; i < kTargetCount; ++i) {
+        va_[i] = va[i]; size_[i] = size[i]; span_[i] = span[i]; has_[i] = has[i];
+    }
+    foundCount_ = found; loaded_ = true; attempted_ = true; cachePersistTried_ = true;
+    SetStatus(status_, sizeof(status_), "原始镜像符号缓存命中：%d/%zu", found, kTargetCount);
+    LOGI("%s；不解压符号表", status_); return true;
+}
+bool SymbolIndex::SaveCached(const Image& image) {
+    if (!loaded_) return false;
+    std::vector<uint8_t> payload;
+    const uint64_t registry = SymbolRegistryId();
+    SymbolPut32(payload, uint32_t(registry)); SymbolPut32(payload, uint32_t(registry >> 32));
+    SymbolPut32(payload, uint32_t(kTargetCount));
+    for (size_t i = 0; i < kTargetCount; ++i) {
+        const bool valid = has_[i] && span_[i] && span_[i] <= 0x100000;
+        SymbolPut32(payload, valid ? 1u : 0u);
+        SymbolPut32(payload, valid ? va_[i] : 0u); SymbolPut32(payload, valid ? size_[i] : 0u);
+        SymbolPut32(payload, valid ? span_[i] : 0u);
+    }
+    return SaveSymbolCache(ImageIdentity(image), payload);
+}
+
+bool SymbolIndex::EnsureLoaded(const Image& image, uint64_t budgetMs) {
+    if (attempted_) {
+        if (loaded_ && !budgetMs && !cachePersistTried_) {
+            cachePersistTried_ = true; (void)SaveCached(image);
+        }
+        return loaded_;
+    }
+    const uint64_t deadline = budgetMs ? SymbolNowMs() + std::min(budgetMs, uint64_t(300)) : 0;
+    const auto expired = [&]() { return deadline && SymbolNowMs() >= deadline; };
+    struct ResetBudgetAttempt {
+        SymbolIndex* self; bool bounded;
+        ~ResetBudgetAttempt() { if (bounded && !self->loaded()) self->ResetForTest(); }
+    } reset{this, budgetMs != 0};
+    if (TryLoadCached(image)) return true;
     attempted_ = true;
     if (!CodeView(image).ExecutableRangesOk()) {
         SetStatus(status_, sizeof(status_), "目标执行段范围/权限不合法");
@@ -597,13 +680,14 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     uint8_t smallProps = 0;
     const bool patched = PropsForDictSize(kXzDictDesired, &smallProps) &&
                          PatchBlockDictSize(&packed, smallProps);
-    enum xz_ret ret = RunDecoder(packed, patched ? kXzDictDesired : kXzDictMax, &debug);
-    if (ret != XZ_STREAM_END && patched) {
+    if (expired()) return false;
+    enum xz_ret ret = RunDecoder(packed, patched ? kXzDictDesired : kXzDictMax, &debug, deadline);
+    if (ret != XZ_STREAM_END && patched && !expired()) {
         LOGW("改了块头字典尺寸后解压失败（ret=%d），改回原样重试", static_cast<int>(ret));
         packed.resize(static_cast<size_t>(debugSec->sh_size));
         if (ReadImageFile(image, debugSec->sh_offset, packed.data(), packed.size())) {
             debug.resize(kXzOutCap);
-            ret = RunDecoder(packed, kXzDictMax, &debug);
+            ret = RunDecoder(packed, kXzDictMax, &debug, deadline);
         }
     }
     if (ret != XZ_STREAM_END) {
@@ -664,6 +748,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     bool ambiguous[kTargetCount]{};
 
     for (uint32_t i = 0; i < count; ++i) {
+        if ((i & 255u) == 0 && expired()) return false;
         Elf64_Sym sym{};
         memcpy(&sym, debug.data() + symtab->sh_offset + uint64_t(i) * sizeof(sym), sizeof(sym));
         // Neither a data symbol nor a truncated 64-bit address is a function root.
@@ -693,6 +778,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     std::sort(textVas.begin(), textVas.end());
     textVas.erase(std::unique(textVas.begin(), textVas.end()), textVas.end());
     for (size_t t = 0; t < kTargetCount; ++t) {
+        if (expired()) return false;
         if (!has_[t]) continue;
         if (ambiguous[t]) { has_[t] = false; va_[t] = size_[t] = span_[t] = 0; continue; }
         const auto next_function = std::upper_bound(textVas.begin(), textVas.end(), va_[t]);
@@ -725,6 +811,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     for (size_t t = 0; t < kTargetCount; ++t) {
         if (has_[t]) ++foundCount_;
     }
+    if (expired()) return false;
     loaded_ = foundCount_ > 0;
     if (loaded_) {
         SetStatus(status_, sizeof(status_), "符号表解析成功：%d/%zu 个目标函数（%u 条符号）",
@@ -732,6 +819,7 @@ bool SymbolIndex::EnsureLoaded(const Image& image) {
     } else {
         SetStatus(status_, sizeof(status_), "符号表里没找到任何目标函数（%u 条符号）", count);
     }
+    if (loaded_ && !budgetMs) { cachePersistTried_ = true; (void)SaveCached(image); }
     return loaded_;
 }
 

@@ -18,5 +18,8 @@ bool LoadSitesCache(uint64_t imageId, LocatedSites* out);
 bool SaveSitesCache(uint64_t imageId, const LocatedSites& sites);
 
 void DropSitesCache();
+// Same image lease and private atomic I/O as sites; bounded symbol-index payload.
+bool LoadSymbolCache(uint64_t imageId, std::vector<uint8_t>* out);
+bool SaveSymbolCache(uint64_t imageId, const std::vector<uint8_t>& payload);
 
 }

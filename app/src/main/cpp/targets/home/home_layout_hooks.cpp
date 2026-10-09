@@ -1918,7 +1918,11 @@ bool bind_folder_preview() {
     if (g_folder_preview_bound) return true;
     if (g_folder_preview_checked || !g_dart
         || !folder_preview_requested(__atomic_load_n(&hc_folder_layout_requested, __ATOMIC_ACQUIRE))) return false;
-    g_folder_preview_checked = true;
+    // Loader priming deliberately does not decode the symbol index. A missing
+    // symbol/body here is pending admission, not a completed negative scan.
+    // Keep the seven slots unpublished until a later worker attempt can prove
+    // every owner. Never perform index decoding on the loader/Dart UI thread.
+    static bool waiting_logged = false;
     const char *names[] = {"FolderGridView._buildScrollableGrid",
         "SliverGridDelegateWithFixedCrossAxisCount.getLayout", "FolderAnimController._setCloseGridItemAnim",
         "FolderAnimController._refreshCachedGridParams", "FolderGridViewGetxController.calGridWidth",
@@ -1929,10 +1933,16 @@ bool bind_folder_preview() {
     for (size_t i = 0; i < va.size(); ++i) {
         uint32_t size = 0;
         if (!hometweaks::HomeTweaksFindSymbol(names[i], &va[i], &size) || !dartscan::body(va[i], body[i])) {
-            __android_log_print(ANDROID_LOG_WARN, kTag, "folder preview admission missing=%s; stock retained", names[i]);
+            if (!waiting_logged) {
+                __android_log_print(ANDROID_LOG_INFO, kTag,
+                    "folder preview admission pending=%s; retry after symbol index readiness", names[i]);
+                waiting_logged = true;
+            }
             return false;
         }
     }
+    waiting_logged = false;
+    g_folder_preview_checked = true;
     home_layout::FolderPreviewPlan fields;
     if (!home_layout::folder_preview_plan(body[0], body[1], body[2], body[3], body[4], va[0], va[5], body[6], body[7], body[8], body[9], body[10], fields)) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "folder preview original-code guard declined image; stock retained");
@@ -3576,8 +3586,11 @@ void publish_indicator_dot_delta() {
         && nhk::slot_ready(g_slots[kKnobHookSlotBase + 7]) && nhk::slot_ready(g_slots[kIndicatorDotSlot])
         && hc_layout_dart_SearchBarMargin_original != nullptr
         && hc_layout_dart_SearchBarWidth_original != nullptr && hc_layout_dart_IndicatorDot_original != nullptr;
-    __atomic_store_n(&hc_layout_indicator_mode,
-        ready && mode >= 0 && mode <= 2 ? static_cast<uint32_t>(mode) : 0u, __ATOMIC_RELEASE);
+    const uint32_t applied = ready && mode >= 0 && mode <= 2 ? static_cast<uint32_t>(mode) : 0u;
+    const uint32_t previous = __atomic_exchange_n(&hc_layout_indicator_mode, applied, __ATOMIC_ACQ_REL);
+    if (previous != applied) __android_log_print(ANDROID_LOG_INFO, kTag,
+        "layout indicator policy published requested=%d mode=%u registered=%d", mode, applied, ready ? 1 : 0);
+
 }
 
 /*
@@ -4300,6 +4313,7 @@ void *worker(void *) {
              */
             if (nhk::ensure_slots_live(g_slots, slot_host(), order) && bank_live(order)) {
                 live = true;
+                publish_hooks();
                 __android_log_print(ANDROID_LOG_INFO, kTag, "layout hook bank re-armed");
             }
         }

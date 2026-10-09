@@ -206,7 +206,7 @@ packet.clear();at=0;output=f;ok(read_folder_layout(read,output)&&output==FolderL
 Config config;config.cell_x=4;config.cell_y=6;config.folder=f;config.widget_allow_move=true;
 std::vector<uint8_t> cache;serialize_config(config,cache);Config restored;
 ok(parse_config(cache,restored)&&restored.folder==f&&restored.widget_allow_move,"version10 cache roundtrip");
-auto legacy=cache;legacy.resize(legacy.size()-32);legacy[4]=9;restored.folder=f;
+auto legacy=cache;legacy.resize(legacy.size()-52);legacy[4]=9;restored.folder=f;
 ok(parse_config(legacy,restored)&&restored.folder==FolderLayoutConfig{}&&restored.widget_allow_move,"version9 cache compatibility preserves existing widget setting");
 cache.pop_back();ok(!parse_config(cache,restored),"truncated v10 rejected");
 alignas(8) unsigned char buffer[2048]{};uintptr_t saved=(uintptr_t)buffer, controller=(uintptr_t)buffer+800+1, root=(uintptr_t)buffer+1000+1, child=(uintptr_t)buffer+1200+1;
@@ -303,6 +303,6 @@ std::cout<<"FOLDER_NATIVE="<<checks<<" checks; failed="<<failed<<"\n";return fai
 '''
 out=D/('run-'+ROOT.name);out.mkdir(exist_ok=True);(out/'test.cpp').write_text(pre,encoding='utf8')
 zig=W/'tests/dynamic-address-audit/runtime/zig-windows-x86_64-0.13.0/zig.exe'
-r=subprocess.run([str(zig),'c++','-std=c++20','-O0','-I'+str(ROOT/'app/src/main/cpp/targets/home'),str(out/'test.cpp'),'-o',str(out/'test.exe')],capture_output=True,text=True,encoding='utf8');print(r.stdout+r.stderr,end='')
+r=subprocess.run([str(zig),'c++','-std=c++20','-O0','-I'+str(ROOT/'app/src/main/cpp/targets/home'),'-I'+str(ROOT/'app/src/main/cpp'),str(out/'test.cpp'),'-o',str(out/'test.exe')],capture_output=True,text=True,encoding='utf8');print(r.stdout+r.stderr,end='')
 if r.returncode:sys.exit(r.returncode)
 r=subprocess.run([str(out/'test.exe')],capture_output=True,text=True,encoding='utf8');print(r.stdout+r.stderr,end='');sys.exit(r.returncode)

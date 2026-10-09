@@ -111,9 +111,9 @@ int OpenCacheDirectory(bool create) {
     if (fd >= 0 && !PrivateDirectory(fd)) { close(fd); return -1; }
     return fd;
 }
-bool ReadWhole(int dir, uint8_t* buf, size_t cap, size_t* outLen) {
+bool ReadWhole(int dir, uint8_t* buf, size_t cap, size_t* outLen, const char* name = kCacheName) {
     if (!buf || !cap || !outLen) return false;
-    const int fd = openat(dir, kCacheName, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    const int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) return false;
     struct stat before{}, after{}; bool ok = false;
     if (fstat(fd, &before) == 0 && S_ISREG(before.st_mode) && before.st_uid == geteuid()
@@ -131,7 +131,7 @@ bool ReadWhole(int dir, uint8_t* buf, size_t cap, size_t* outLen) {
     // Never retry close(EINTR): the descriptor may already have been released.
     return close(fd) == 0 && ok;
 }
-bool WriteWholeAtomic(int dir, const uint8_t* data, size_t len) {
+bool WriteWholeAtomic(int dir, const uint8_t* data, size_t len, const char* name = kCacheName) {
     if (!data || !len || len > kCacheMaxBytes) return false;
     static std::atomic<uint64_t> serial{0};
     char tmp[96]; int fd = -1;
@@ -158,7 +158,7 @@ bool WriteWholeAtomic(int dir, const uint8_t* data, size_t len) {
         && !(st.st_mode & 0077) && uint64_t(st.st_size) == len;
     if (ok) { int result; do { result = fsync(fd); } while (result < 0 && errno == EINTR); ok = result == 0; }
     if (close(fd) != 0) ok = false;
-    if (ok) ok = renameat(dir, tmp, dir, kCacheName) == 0;
+    if (ok) ok = renameat(dir, tmp, dir, name) == 0;
     if (!ok) { unlinkat(dir, tmp, 0); return false; }
     int result; do { result = fsync(dir); } while (result < 0 && errno == EINTR);
     // A directory-sync failure may follow a visible rename; report persistence as unconfirmed.
@@ -283,6 +283,29 @@ bool SaveSitesCache(uint64_t imageId, const LocatedSites& sites) {
     if (close(dir) != 0) ok = false;
     if (ok) LOGI("站点缓存已写入私有目录（%zu 字节，指纹 %016llx）", file.size(),
         static_cast<unsigned long long>(imageId));
+    return ok;
+}
+bool LoadSymbolCache(uint64_t imageId, std::vector<uint8_t>* out) {
+    if (!imageId || !out) return false;
+    const int dir = OpenCacheDirectory(false); if (dir < 0) return false;
+    std::array<uint8_t, kCacheMaxBytes> buf{}; size_t len = 0;
+    bool ok = ReadWhole(dir, buf.data(), buf.size(), &len, "hometweaks-symbols.bin");
+    if (close(dir) != 0) ok = false;
+    if (!ok || len < kHeaderBytes || memcmp(buf.data(), "HSY1", 4)
+        || ReadU32(buf.data() + 4) != 1 || ReadU64(buf.data() + 12) != imageId
+        || ReadU32(buf.data() + 20) != len - kHeaderBytes
+        || Fnv32(buf.data() + kHeaderBytes, len - kHeaderBytes) != ReadU32(buf.data() + 8)) return false;
+    out->assign(buf.begin() + kHeaderBytes, buf.begin() + len); return true;
+}
+bool SaveSymbolCache(uint64_t imageId, const std::vector<uint8_t>& payload) {
+    if (!imageId || payload.empty() || payload.size() > kCacheMaxBytes - kHeaderBytes) return false;
+    std::vector<uint8_t> file{'H','S','Y','1'};
+    AppendU32(&file, 1); AppendU32(&file, Fnv32(payload.data(), payload.size()));
+    AppendU64(&file, imageId); AppendU32(&file, uint32_t(payload.size()));
+    file.insert(file.end(), payload.begin(), payload.end());
+    const int dir = OpenCacheDirectory(true); if (dir < 0) return false;
+    bool ok = WriteWholeAtomic(dir, file.data(), file.size(), "hometweaks-symbols.bin");
+    if (close(dir) != 0) ok = false;
     return ok;
 }
 void DropSitesCache() {
