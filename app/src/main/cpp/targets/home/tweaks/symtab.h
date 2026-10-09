@@ -21,7 +21,10 @@ class SymbolIndex {
 public:
     static SymbolIndex& Instance();
 
-    bool EnsureLoaded(const Image& image);
+    // A nonzero startup budget resets incomplete roots on timeout; workers use zero.
+    bool EnsureLoaded(const Image& image, uint64_t budgetMs = 0);
+    // Loader path: cached original image only, never XZ/signature scanning.
+    bool TryLoadCached(const Image& image, uint64_t imageId = 0);
 
     bool loaded() const { return loaded_; }
 
@@ -48,7 +51,10 @@ public:
 
 private:
     SymbolIndex() = default;
+    bool SaveCached(const Image& image);
 
+    // Persistence is attempted only once per process; failed I/O never repeats per lookup.
+    bool cachePersistTried_ = false;
     bool loaded_ = false;
     bool attempted_ = false;
     int foundCount_ = 0;

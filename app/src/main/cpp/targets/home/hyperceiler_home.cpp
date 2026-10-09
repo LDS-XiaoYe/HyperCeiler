@@ -30,6 +30,7 @@ void home_layout_set_title_color(int argb);
 namespace hometweaks {
 void StartHomeTweaks();
 void HomeTweaksOnLibraryLoaded(const char *name);
+bool HomeTweaksPrimeCachedSymbols();
 void HomeTweaksPrepareForLauncherChild();
 }
 
@@ -253,6 +254,10 @@ void on_library_loaded(const char *name, void *) {
     // site is available and nothing has read the old constants yet. Scoped to the Dart image, since
     // every other library loaded here would otherwise cost a Binder round trip each.
     if (std::string_view(name).ends_with("libapp.so")) {
+        if (launcher) {
+            hometweaks::HomeTweaksPrepareForLauncherChild();
+            (void)hometweaks::HomeTweaksPrimeCachedSymbols();
+        }
         // Patch before the dart runtime runs: the probe target is called exactly once, at start-up.
         prime_home_layout_probe(g_hook_function, g_unhook_function);
         prime_home_layout_knobs(g_hook_function, g_unhook_function);

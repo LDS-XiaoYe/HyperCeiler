@@ -1068,6 +1068,30 @@ void HomeTweaksPrepareForLauncherChild() {
  * Owned here rather than in the layout module because HomeTweaksFindSymbol is the single choke point
  * every symbol query goes through, so one flag covers bind_knobs, resolve_grid_fields and the probe.
  */
+// Cache miss: small output chunks and an explicit deadline; timeout resets unpublished roots.
+// Worker later persists a completed index, never fsync in this bounded loader attempt.
+bool HomeTweaksPrimeCachedSymbols() {
+    Image image{};
+    if (!FindImageByName(kTargetLibName, &image)
+        && !FindImageFromApkMaps(kDesktopApkMarker, kTargetLibName, &image)) return false;
+    std::unique_lock<std::mutex> work(g_workMutex, std::try_to_lock);
+    if (!work.owns_lock()) return false;
+    if (!g_state.imageFound) {
+        g_state.image = image; g_state.imageFound = true;
+        g_imageKnown.store(true, std::memory_order_release);
+    }
+    if (!g_state.identityTried) {
+        g_state.identityTried = true; g_state.imageId = ImageIdentity(g_state.image);
+    }
+    auto& index = SymbolIndex::Instance();
+    if (index.TryLoadCached(g_state.image, g_state.imageId)) return true;
+    const uint64_t start = NowMs();
+    const bool ready = index.EnsureLoaded(g_state.image, 300);
+    LOGI("首次无符号缓存预算解析：ready=%d elapsed=%llu ms（预算300ms）", ready ? 1 : 0,
+        static_cast<unsigned long long>(NowMs() - start));
+    return ready;
+}
+
 thread_local bool g_inLoaderCallback = false;
 
 bool InLoaderCallback() { return g_inLoaderCallback; }
