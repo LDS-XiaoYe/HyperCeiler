@@ -2,13 +2,39 @@
 
 <img src="\imgs\icon.webp" width="160" height="160" style="display: block; margin: 0 auto;" alt="icon" />
 
-# HyperCeiler
+# HyperCeiler Next
 
 ### Make HyperOS Great Again!
 
 简体中文&nbsp;&nbsp;|&nbsp;&nbsp;[繁體中文](/README_zh-HK.md)&nbsp;&nbsp;|&nbsp;&nbsp;[English](/README_en-US.md)&nbsp;&nbsp;|&nbsp;&nbsp;[Українська](/README_uk_UA.md)&nbsp;&nbsp;|&nbsp;&nbsp;[Português (Brasil)](/README_pt-BR.md)
 
 </div>
+
+## Next 分支说明
+
+**HyperCeiler Next** 是基于现有 HyperCeiler 渐进演进的模块化 Hook 平台，采用 Native-first 路线：先实现 Native 插件，再扩展 Java/Kotlin Dex 插件。保留已有 Hook 和管理界面，逐步复用、拆分现有基础设施。
+
+> **当前状态：架构重构开发分支。** 本分支以 `os4-personal` 的现有代码为基础，保留 LSPosed/Xposed 接入、Native Hook 与 Resolver、HyperOS 4 桌面适配及回归测试。目前仓库尚未包含 Next 插件 SDK、远程加载器、签名发布工具及插件管理页面，以下 Next 能力属于开发目标，不能视为已经可用。
+
+### Next 目标能力
+
+| 能力 | 设计目标 | 当前状态 |
+|:---|:---|:---|
+| Native Plugin SDK | 稳定 C ABI、API 版本和结构体大小检查，Hook 独立编译为 `.so` | 待实现 |
+| 内置 Runtime | 插件注册、兼容性检查、生命周期与错误管理；断网也能启动 | 待实现 |
+| 远程分发 | HTTPS 索引与插件包，支持 GitHub Releases 或静态存储 | 待实现 |
+| 可信验证 | APK 内置可信公钥，验证覆盖 Manifest 与二进制的 Ed25519 签名及 SHA-256 | 待实现 |
+| 安全缓存 | 版本化缓存、原子安装与激活，区分下载、验证、安装、激活和运行成功 | 待实现 |
+| 管理与恢复 | 更新、启停、历史版本、Last Known Good、崩溃检测及紧急禁用 | 待实现 |
+| Dex 插件 | 复用分发与验证协议，提供独立 Dex 执行后端 | 后续阶段 |
+
+### 远程 Hook 的预期使用方式
+
+发布者独立编译 `.so`，生成签名 `manifest.json`，上传插件文件并更新远程索引。Manager 主动检查兼容更新，下载并验证后安装到本地缓存；用户激活后，目标进程下次启动时加载对应版本。
+
+**Native 插件更新或回滚需要重启目标进程；桌面 Hook 需要重启桌面，不要求重启手机。** 不在 Zygote 或宿主启动路径请求网络，不通过 `dlclose()` 撤销已执行的 Hook，不强制热替换运行中的 Native 插件。
+
+签名与发布权限是 Native 插件的信任边界：插件进入宿主后没有进程级隔离。远程插件不能替换 Runtime 核心；未经可信签名或不符合宿主版本、APK 指纹、系统与 ABI 要求的插件应被拒绝。正式开放前需要完成真实设备上的加载、权限、动态链接、崩溃恢复和性能验证。
 
 ## 当前支持的版本
 
@@ -34,11 +60,9 @@ HyperCeiler 已停止维护 Android 11-13 的 MIUI ROM 和 Android 13/14 的 Hyp
 
 ## 项目规划
 
-Xiaomi HyperOS 3 or 4 将是本项目的一个终点，就目前来说，小米官方有选择性的根据 Xposed 的功能调整了自己的（反人类）功能，模块的功能也随着系统的更新在逐渐减少。
+按阶段推进：Native 基础设施与独立测试插件 → 本地 Native Plugin Runtime → 可信远程分发 PoC → 真实桌面 Native Hook 迁移 → NestJS/MySQL 分发后端 → Dex Hook 插件化。
 
-也是一步步看着澎湃从没 Root 不能用到变得差不多能用的样子（小米平板除外）
-
-未来本模块会深度适配 HyperOS 3.0 及以上版本（但不保证功能上都能用），HyperOS 2 会在后续维护中归档（因为变化差距大）
+优先保留现有功能，每阶段完成可用的编译与测试。远程 Native 插件首个迁移目标为 HyperOS 4 系统桌面底栏；既有功能的支持范围与未来插件的兼容范围分别验证，不能因分支更名而视为扩大系统支持。
 
 ## 作用域包含的应用
 

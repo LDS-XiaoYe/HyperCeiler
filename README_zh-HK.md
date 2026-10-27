@@ -2,7 +2,7 @@
 
 <img src="\imgs\icon.webp" width="160" height="160" style="display: block; margin: 0 auto;" alt="icon" />
 
-# HyperCeiler
+# HyperCeiler Next
 
 ### Make HyperOS Great Again!
 
@@ -12,6 +12,12 @@
 &nbsp;&nbsp;|&nbsp;&nbsp;[Português (Brasil)](/README_pt-BR.md)
 
 </div>
+
+## Next 開發分支
+
+HyperCeiler Next 以保留現有功能為前提，逐步引入獨立 Native `.so` 外掛程式、可信簽章、遠端分發、版本管理及回復機制，再擴展 Dex 外掛程式。
+
+**目前本分支保留既有 Hook 實作，尚未包含 Next 外掛 SDK、遠端載入器、簽章工具及外掛管理頁面。** 上述能力屬開發目標；完整狀態請參閱[簡體中文說明](README.md)。預期 Native 外掛更新與回復須重新啟動目標程序，桌面外掛須重新啟動桌面，不需要重新啟動整部手機。
 
 ## 當前支持的版本
 
@@ -41,12 +47,9 @@ HyperCeiler 已停止維護 Android 11-13 的 MIUI ROM 和 Android 13/14 的 Hyp
 
 ## 項目規劃
 
-Xiaomi HyperOS 3 或 4 將會是本項目的終點，就目前來說，小米官方已選擇性地根據 Xposed
-的功能調整了自家的（反人類）功能，模組的功能也隨著系統的更新在逐漸減少。
+依序推進 Native 基礎設施與獨立測試外掛、本地 Native Plugin Runtime、可信遠端分發、真實桌面 Hook 遷移、NestJS/MySQL 分發服務及 Dex 外掛。
 
-也是一步步看著澎湃從沒 Root 不能用到變得差不多能用的樣子（小米平板除外）
-
-未來本模組會深度適配 HyperOS 3.0 及以上版本（但不保證所有功能都能使用），HyperOS 2 將在後續維護中歸檔（因為變化差距大）
+首個遠端 Native 遷移目標為 HyperOS 4 桌面底欄。每階段保留現有功能並完成可用的編譯與測試；外掛相容性須獨立驗證，分支更名不代表擴大系統支援。
 
 ## 作用域包含的應用
 

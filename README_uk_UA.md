@@ -2,13 +2,15 @@
 
 <img src="\imgs\icon.webp" width="160" height="160" style="display: block; margin: 0 auto;" alt="icon" />
 
-# HyperCeiler
+# HyperCeiler Next
 
 ### Зробімо HyperOS знову чудовим!
 
 [简体中文](/README.md)&nbsp;&nbsp;|&nbsp;&nbsp;[繁體中文](/README_zh-HK.md)&nbsp;&nbsp;|&nbsp;&nbsp;[English](/README_en-US.md)&nbsp;&nbsp;|&nbsp;&nbsp;Українська&nbsp;&nbsp;|&nbsp;&nbsp;[Português (Brasil)](/README_pt-BR.md)
 
 </div>
+
+> **Гілка розробки Next.** Наявні функції збережено. Віддалені Native-плагіни, перевірка підписів і відновлення версій є запланованими можливостями; їх реалізації немає в цій гілці. Поточний стан описано в [English README](README_en-US.md).
 
 ## Наразі підтримувані версії
 

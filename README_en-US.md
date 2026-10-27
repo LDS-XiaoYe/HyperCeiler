@@ -2,13 +2,29 @@
 
 <img src="\imgs\icon.webp" width="160" height="160" style="display: block; margin: 0 auto;" alt="icon" />
 
-# HyperCeiler
+# HyperCeiler Next
 
 ### Make HyperOS Great Again!
 
 [简体中文](/README.md)&nbsp;&nbsp;|&nbsp;&nbsp;[繁體中文](/README_zh-HK.md)&nbsp;&nbsp;|&nbsp;&nbsp;English&nbsp;&nbsp;|&nbsp;&nbsp;[Українська](/README_uk_UA.md)&nbsp;&nbsp;|&nbsp;&nbsp;[Português (Brasil)](/README_pt-BR.md)
 
 </div>
+
+## Next branch
+
+**HyperCeiler Next** evolves the existing HyperCeiler into a modular Hook platform, starting with Native plugins and later extending to Java/Kotlin Dex plugins while preserving existing features.
+
+**Development status:** this branch contains the existing `os4-personal` implementation, including LSPosed/Xposed integration, Native hooks, resolvers and HyperOS 4 launcher adaptations. The Next plugin SDK, remote loader, signing tools and plugin management UI are not present in this checkout. The following are planned capabilities:
+
+- A stable C ABI for independently compiled `.so` plugins and an APK-embedded Runtime.
+- HTTPS distribution with manifests, pinned publisher keys, Ed25519 signatures and SHA-256 verification.
+- Host version, APK fingerprint, Android, HyperOS and ABI compatibility checks.
+- Versioned caches, atomic installation and activation, offline use, Last Known Good recovery and emergency disable.
+- Plugin updates, history and rollback in the existing Manager; a shared distribution protocol with a later Dex execution backend.
+
+The intended flow is publish → check for updates → download → verify → install → activate → load on the next target process start. **Launcher plugin updates and rollbacks require restarting the launcher; a full device reboot is not required.** Startup must not depend on network requests, and running Native hooks must not be replaced through forced unloading.
+
+Native plugins have no process isolation after loading. Trusted signatures and release permissions are the security boundary. Real-device loading, linker and access restrictions, crash recovery and performance must be verified before public use. See the [Chinese README](README.md) for the detailed capability and status table.
 
 ## Currently supported versions
 
@@ -34,11 +50,9 @@ HyperCeiler has stopped maintaining MIUI ROMs for Android 11-13 and HyperOS 1.0/
 
 ## Project planning
 
-Xiaomi HyperOS 3 or 4 will be the endpoint of this project. For now, Xiaomi has selectively incorporated some of Xposed's features into its own (user‑unfriendly) devices, and the module's capabilities have been gradually reduced as the system is updated.
+The roadmap proceeds through Native infrastructure and an independent test plugin, a local Native Plugin Runtime, trusted remote distribution, migration of a real launcher Hook, a NestJS/MySQL distribution service, and finally Dex plugins.
 
-I also watched Xiaomi HyperOS evolve, step by step, from something completely unusable without root to something almost usable (except for the Xiaomi Pad).
-
-In the future, this module will be extensively adapted to Xiaomi HyperOS 3.0 and later versions, although there's no guarantee that all features will be available. Xiaomi HyperOS 2 will be discontinued in future maintenance updates due to significant differences compared to the newer versions.
+The first remote Native migration target is the HyperOS 4 launcher dock. Preserve existing functionality and run available builds and tests at each stage. Plugin compatibility requires separate validation; naming this branch Next does not expand supported systems.
 
 ## Supported apps
 

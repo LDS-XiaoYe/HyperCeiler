@@ -2,13 +2,15 @@
 
 <img src="\imgs\icon.webp" width="160" height="160" style="display: block; margin: 0 auto;" alt="icon" />
 
-# HyperCeiler
+# HyperCeiler Next
 
 ### Torne o HyperOS ótimo novamente!
 
 [简体中文](/README.md)&nbsp;&nbsp;|&nbsp;&nbsp;[繁體中文](/README_zh-HK.md)&nbsp;&nbsp;|&nbsp;&nbsp;[English](/README_en-US.md)&nbsp;&nbsp;|&nbsp;&nbsp;[Українська](/README_uk_UA.md)&nbsp;&nbsp;|&nbsp;&nbsp;Português (Brasil)
 
 </div>
+
+> **Branch de desenvolvimento Next.** Os recursos existentes foram preservados. Plugins Native remotos, verificação de assinaturas e recuperação de versões são recursos planejados; suas implementações ainda não estão nesta branch. Consulte o [README em inglês](README_en-US.md) para o estado atual.
 
 ## Versões atualmente suportadas
 
@@ -34,11 +36,9 @@ O HyperCeiler deixou de ser mantido em ROM MIUI para o Android 11-13 e ROM Hyper
 
 ## Planejamento do projeto
 
-O Xiaomi HyperOS 3 ou 4 será o ponto final deste projeto. Por enquanto, a Xiaomi incorporou seletivamente algumas das funções do Xposed em seus próprios dispositivos (pouco intuitivos), e as capacidades do módulo têm sido gradualmente reduzidas à medida que o sistema é atualizado.
+O desenvolvimento seguirá estas etapas: infraestrutura Native e plugin de teste independente, Native Plugin Runtime local, distribuição remota confiável, migração de um Hook real do launcher, serviço NestJS/MySQL e plugins Dex.
 
-Também acompanhei o Xiaomi HyperOS evoluir, passo a passo, de algo completamente inutilizável sem root para algo quase utilizável (exceto Xiaomi Pad).
-
-No futuro, este módulo será amplamente adaptado ao Xiaomi HyperOS 3.0 e versões posteriores, embora não haja garantia de que todas as funcionalidades estarão disponíveis. O Xiaomi HyperOS 2 será descontinuado em futuras manutenções, devido às grandes diferenças em relação às versões mais recentes.
+O primeiro alvo de migração Native será o dock do launcher do HyperOS 4. Os recursos existentes devem ser preservados, com compilações e testes em cada etapa. A compatibilidade dos plugins exige validação própria; o nome Next não amplia o suporte a sistemas.
 
 ## Apps suportados
 
