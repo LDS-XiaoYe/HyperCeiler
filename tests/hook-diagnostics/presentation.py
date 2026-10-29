@@ -21,13 +21,17 @@ test='''
 int main(){
  for(size_t i=0;i<kSlotCount;++i)std::cout<<i<<" "<<diagnostic_feature(i)<<"\\n";
  auto r=std::make_shared<RecentRouting>();
- for(int i=0;i<11;++i)r->plan.sites.push_back({home_layout::features::recent::Action::Scalar,i});
+ for(int i=0;i<15;++i)r->plan.sites.push_back({home_layout::features::recent::Action::Scalar,i});
  g_recent_routing=r;
  assert(std::string(diagnostic_feature(kRecentSlotBase))=="最近任务卡片圆角大小");
  assert(std::string(diagnostic_feature(kRecentSlotBase+1))=="最近任务卡片标题高度");
  assert(std::string(diagnostic_feature(kRecentSlotBase+10))=="最近任务小窗按钮背景颜色");
+ assert(std::string(diagnostic_feature(kRecentSlotBase+11))=="最近任务隐藏图标");
+ assert(std::string(diagnostic_feature(kRecentSlotBase+12))=="最近任务隐藏文本");
+ assert(std::string(diagnostic_feature(kRecentSlotBase+13))=="最近任务划卡移除动画");
+ assert(std::string(diagnostic_feature(kRecentSlotBase+14))=="最近任务上滑关闭卡片振动");
  r->plan.sites[0].action=home_layout::features::recent::Action::Style;
- assert(std::string(diagnostic_feature(kRecentSlotBase))=="最近任务卡片文字大小与颜色");
+ assert(std::string(diagnostic_feature(kRecentSlotBase))=="最近任务应用名称显示与文字样式");
  r->plan.sites[0].action=home_layout::features::recent::Action::ScaleReturn;
  assert(std::string(diagnostic_feature(kRecentSlotBase))=="最近任务横向与纵向卡片缩放");
 }

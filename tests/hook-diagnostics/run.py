@@ -38,7 +38,8 @@ end=hooks.index('\n}\n',start)+3
 sample=hooks[start:end]
 assert re.findall(r'android_diagnostics::counter\("([^"]+)"',sample)==[
  'home.title.custom','home.scale.icon','home.scale.widget','home.folder.preview_return',
- 'home.drawer.search','home.infinite_scroll','home.prestart']
+ 'home.drawer.search','home.infinite_scroll','home.recents.haptic',
+ 'home.recents.close_haptic','home.shortcuts','home.prestart']
 assert all(word not in sample for word in ('ensure_runtime_features','query_config','/proc/','pthread_create','hook_install'))
 monitor=entry[entry.index('void MonitorLoop() {'):entry.index('void FastPatchOnLibraryLoad()')]
 assert 'nextDiagnosticSample=diagnosticNow+5000;' in monitor

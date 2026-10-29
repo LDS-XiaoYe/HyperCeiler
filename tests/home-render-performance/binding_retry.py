@@ -18,6 +18,8 @@ prefix=r'''
 #include "targets/home/home_binding_retry.h"
 home_layout::BindingRetry g_aux_bind_retry;
 #endif
+bool feedback_changed=false;
+bool hc_recents_haptic_changed(){bool previous=feedback_changed;feedback_changed=false;return previous;}
 uint64_t now=0,delays=0;unsigned knobs=0,animations=0,magic=0,binds=0;
 uint64_t monotonic_ms(){return now;}
 void delay_ms(unsigned n){delays+=n;}
@@ -43,7 +45,7 @@ int main(){startup();std::vector<size_t> order;
  assert(knobs==1&&animations==1&&magic==1&&delays==0);
  assert(binds<=25*'''+str(len(functions))+r''');
 #if __has_include("targets/home/home_binding_retry.h")
- auto before=binds;g_aux_bind_retry.reset();arm_hooks(order);assert(binds==before+'''+str(len(functions))+r''');
+ auto before=binds;feedback_changed=true;arm_hooks(order);assert(!feedback_changed);assert(binds==before+'''+str(len(functions))+r''');
  home_layout::BindingRetry retry;assert(retry.due(0));assert(!retry.due(0));assert(!retry.due(499));assert(retry.due(500));assert(!retry.due(501));
  retry.reset();assert(retry.due(UINT64_MAX-1));assert(retry.due(UINT64_MAX));assert(!retry.due(UINT64_MAX));
 #endif

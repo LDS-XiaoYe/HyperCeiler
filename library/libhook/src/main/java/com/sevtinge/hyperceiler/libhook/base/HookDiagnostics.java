@@ -30,8 +30,8 @@ public final class HookDiagnostics {
             process=processName==null?"":processName;
             enabled=isDesktopProcess(process);
             if(!enabled)return;
-            try { boot=Files.readString(new File("/proc/sys/kernel/random/boot_id").toPath()).trim(); } catch (Exception unavailable) { boot=""; }
-            try { String stat=Files.readString(new File("/proc/self/stat").toPath());
+            try { boot=new String(Files.readAllBytes(new File("/proc/sys/kernel/random/boot_id").toPath()), StandardCharsets.UTF_8).trim(); } catch (Exception unavailable) { boot=""; }
+            try { String stat=new String(Files.readAllBytes(new File("/proc/self/stat").toPath()), StandardCharsets.UTF_8);
             start=stat.substring(stat.lastIndexOf(')')+2).split(" ")[19]; } catch (Exception unavailable) { start=""; }
             generation=UUID.randomUUID().toString();
             module="apk-source:"+HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(modulePath.getBytes(StandardCharsets.UTF_8)));

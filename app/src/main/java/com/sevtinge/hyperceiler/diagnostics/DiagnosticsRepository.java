@@ -108,7 +108,16 @@ public final class DiagnosticsRepository {
         // Read this app's APK only, not a process's arbitrary memory. Match the native GNU Build ID.
         try(var zip=new java.util.zip.ZipFile(context.getApplicationInfo().sourceDir)){
             var entry=zip.getEntry("lib/arm64-v8a/libHyperCeilerNative.so");if(entry==null||entry.getSize()>32*1024*1024)return "";
-            byte[] bytes;try(var input=zip.getInputStream(entry)){bytes=input.readNBytes(32*1024*1024);}
+            byte[] bytes;
+            try(var input=zip.getInputStream(entry);var output=new java.io.ByteArrayOutputStream()){
+                byte[] buffer=new byte[8192];int remaining=32*1024*1024;
+                while(remaining>0){
+                    int count=input.read(buffer,0,Math.min(buffer.length,remaining));
+                    if(count<0)break;
+                    output.write(buffer,0,count);remaining-=count;
+                }
+                bytes=output.toByteArray();
+            }
             return ElfBuildId.read(bytes);
         }catch(Exception unavailable){return "";}
     }
