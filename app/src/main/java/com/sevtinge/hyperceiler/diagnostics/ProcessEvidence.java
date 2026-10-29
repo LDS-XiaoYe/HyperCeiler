@@ -4,6 +4,7 @@ package com.sevtinge.hyperceiler.diagnostics;
 import android.content.Context;
 import java.io.File;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
@@ -15,7 +16,7 @@ final class ProcessEvidence {
     static ProcessEvidence query(Context context,Set<Integer> requested){
         ProcessEvidence out=new ProcessEvidence();File result=null;java.lang.Process reader=null;
         try{
-            try {out.boot=Files.readString(new File("/proc/sys/kernel/random/boot_id").toPath()).trim();}catch(Exception unavailable){}
+            try {out.boot=new String(Files.readAllBytes(new File("/proc/sys/kernel/random/boot_id").toPath()), StandardCharsets.UTF_8).trim();}catch(Exception unavailable){}
             List<Integer> ids=requested.stream().filter(p->p>0&&p<Integer.MAX_VALUE).sorted().limit(128).toList();
             StringBuilder script=new StringBuilder("printf 'HC_BEGIN\\nB '; cat /proc/sys/kernel/random/boot_id; ");
             for(int pid:ids)script.append("if [ -r /proc/").append(pid).append("/stat ]; then printf 'P ").append(pid).append(" '; cat /proc/").append(pid).append("/stat; printf 'N ").append(pid).append(" '; tr '\\000' '\\n' < /proc/").append(pid).append("/cmdline | head -n 1; elif [ -d /proc/").append(pid).append(" ]; then printf 'U ").append(pid).append("\\n'; fi; ");
@@ -24,7 +25,7 @@ final class ProcessEvidence {
             reader=new ProcessBuilder("su","-c",script.toString()).redirectErrorStream(true).redirectOutput(result).start();
             if(!reader.waitFor(5,TimeUnit.SECONDS)){reader.destroyForcibly();return out;}
             if(reader.exitValue()!=0||result.length()>131072)return out;
-            String text=Files.readString(result.toPath());
+            String text=new String(Files.readAllBytes(result.toPath()), StandardCharsets.UTF_8);
             out.complete=requested.size()<=128&&text.startsWith("HC_BEGIN\n")&&text.endsWith("HC_END\n");
             for(String line:text.split("\n")){
                 if(line.startsWith("B "))out.boot=line.substring(2).trim();

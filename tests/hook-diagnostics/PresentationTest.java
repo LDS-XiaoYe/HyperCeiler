@@ -9,7 +9,12 @@ public final class PresentationTest {
         for(int i=0;i<expected.size();i++){
             var e=event("home.layout.slot."+i,"桌面布局");
             String name=DiagnosticFeatureNames.forEvent(e);
-            assert name.equals(expected.get(i)):i+" "+name+" != "+expected.get(i);
+            // HCD1's frozen legacy registry predates the appended shortcut/haptic slots.
+            // Old records stay unknown there, while current records carry exact native metadata.
+            if(i<236)assert name.equals(expected.get(i)):i+" "+name+" != "+expected.get(i);
+            else assert name.equals("用途未知的历史原生挂钩"):i+" "+name;
+            assert DiagnosticFeatureNames.forEvent(event("home.layout.slot."+i,expected.get(i)))
+                .equals(expected.get(i)):i+" current native metadata lost";
         }
         assert DiagnosticFeatureNames.forEvent(event("home.layout.slot.99999","桌面布局")).contains("未知");
         assert DiagnosticFeatureNames.forEvent(event("home.layout.slot.-1","桌面布局")).contains("未知");
