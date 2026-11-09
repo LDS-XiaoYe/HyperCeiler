@@ -26,6 +26,8 @@ public final class HomeLayoutPrefsSnapshot {
     public static final String RECENTS_BAR_VERSION = "hc_recents_bar_version";
     public static final String RECENT_CARDS_KEY = "home_recent_hide_card";
     public static final String RECENT_CARDS_VERSION = "hc_recent_cards_version";
+    public static final String XIAOHEIZI_KEY = "home_layout_xiaoheizi_enable";
+    public static final String XIAOHEIZI_VERSION = "hc_xiaoheizi_version";
     private static final String[][] KEYS = {
         {"boolean", "home_drawer_hide_search"},
         {"integer", "task_view_corners"},
@@ -127,10 +129,15 @@ public final class HomeLayoutPrefsSnapshot {
     }
     public static Cursor cursor(SharedPreferences prefs) {
         if (prefs == null) return null;
+        try { return cursorValues(prefs.getAll()); }
+        catch (RuntimeException unavailable) { return null; }
+    }
+
+    /** Build the same schema from one already-captured physical-file revision. */
+    public static Cursor cursorValues(Map<String, ?> snapshot) {
+        if (snapshot == null) return null;
         try {
-            // getAll() snapshots SharedPreferences under its own lock. Do not interleave
-            // contains()/getInt() Binder calls with UI commits or package replacement.
-            Map<String, ?> values = new HashMap<>(prefs.getAll());
+            Map<String, ?> values = new HashMap<>(snapshot);
             String[] columns = new String[KEYS.length + 1];
             columns[0] = "schema";
             for (int i = 0; i < KEYS.length; i++) columns[i + 1] = KEYS[i][1];
@@ -171,6 +178,11 @@ public final class HomeLayoutPrefsSnapshot {
             Object hideBar = values.get("prefs_key_" + RECENTS_BAR_KEY);
             if (hideBar != null && !(hideBar instanceof Boolean)) return null;
             Bundle extras = new Bundle();
+            Object xiaoheizi = values.get("prefs_key_" + XIAOHEIZI_KEY);
+            if (xiaoheizi == null || xiaoheizi instanceof Boolean) {
+                extras.putInt(XIAOHEIZI_VERSION, 1);
+                extras.putInt(XIAOHEIZI_KEY, Boolean.TRUE.equals(xiaoheizi) ? 1 : 0);
+            }
             Object dismiss = values.get("prefs_key_" + DISMISS_KEY);
             if (dismiss == null || dismiss instanceof Boolean) {
                 extras.putInt(DISMISS_VERSION, 1);
