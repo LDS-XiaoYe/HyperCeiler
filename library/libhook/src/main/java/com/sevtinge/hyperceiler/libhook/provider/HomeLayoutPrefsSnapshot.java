@@ -11,6 +11,7 @@ import java.util.Map;
 /** One authoritative physical-file revision; a null cell is a known missing key. */
 public final class HomeLayoutPrefsSnapshot {
     public static final int SCHEMA = 4;
+    public static final String HAPTIC_PROFILE_V1 = "hc_recents_haptic_profile_v1";
     public static final String RECENT_ICON_KEY = "home_recent_remove_icon";
     public static final String RECENT_TEXT_KEY = "home_recent_hide_text";
     public static final String RECENT_HEADER_VERSION = "hc_recent_header_version";
@@ -135,6 +136,10 @@ public final class HomeLayoutPrefsSnapshot {
 
     /** Build the same schema from one already-captured physical-file revision. */
     public static Cursor cursorValues(Map<String, ?> snapshot) {
+        return cursorValues(snapshot, -1);
+    }
+
+    static Cursor cursorValues(Map<String, ?> snapshot, int hapticProfile) {
         if (snapshot == null) return null;
         try {
             Map<String, ?> values = new HashMap<>(snapshot);
@@ -178,6 +183,7 @@ public final class HomeLayoutPrefsSnapshot {
             Object hideBar = values.get("prefs_key_" + RECENTS_BAR_KEY);
             if (hideBar != null && !(hideBar instanceof Boolean)) return null;
             Bundle extras = new Bundle();
+            if (hapticProfile >= 0) extras.putInt(HAPTIC_PROFILE_V1, hapticProfile);
             Object xiaoheizi = values.get("prefs_key_" + XIAOHEIZI_KEY);
             if (xiaoheizi == null || xiaoheizi instanceof Boolean) {
                 extras.putInt(XIAOHEIZI_VERSION, 1);
