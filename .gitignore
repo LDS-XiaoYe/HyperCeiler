@@ -32,3 +32,9 @@ tests/lsposed-log-*/
 
 # AI agent working conventions (kept locally, not tracked)
 AGENTS.md
+
+# Local execution reports; intentionally not committed.
+reports/
+
+# Local proprietary launcher firmware fixtures extracted from a supplied APK.
+/firmware/
