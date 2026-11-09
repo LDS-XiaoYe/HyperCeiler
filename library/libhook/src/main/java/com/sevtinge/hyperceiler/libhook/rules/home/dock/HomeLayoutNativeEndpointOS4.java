@@ -11,6 +11,7 @@ import android.net.Uri;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Parcel;
+import android.os.RemoteException;
 import android.os.SystemClock;
 
 import com.sevtinge.hyperceiler.common.utils.PrefsBridge;
@@ -21,6 +22,8 @@ import com.sevtinge.hyperceiler.libhook.provider.HomeLayoutPrefsSnapshot;
 
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 /** Synchronous, authenticated preference snapshot for the dex-less Rust launcher. */
 public final class HomeLayoutNativeEndpointOS4 {
@@ -39,6 +42,9 @@ public final class HomeLayoutNativeEndpointOS4 {
     public static final int COMBINED_TRANSACTION_CODE = 0x00484353;
     public static final int COMBINED_ACK = 0x48435331;
     public static final int COMBINED_REPLY_BYTES = 188;
+    public static final int OBSERVE_TRANSACTION_CODE = 0x00484358;
+    private static final int OBSERVE_ACK = 0x48435831;
+    private static final String OBSERVER_DESCRIPTOR = "com.sevtinge.hyperceiler.home.ConfigObserver";
     private static final String DESCRIPTOR = "android.view.IWindowManager";
     // LSPosed's remote preference copy can go stale after an APK or daemon restart.
     // Read the physical settings on startup and invalidation, never to renew an idle lease.
@@ -53,7 +59,7 @@ public final class HomeLayoutNativeEndpointOS4 {
     private static volatile String lastDenied;
     private static volatile String lastAccepted;
     // Guarded by refresherLock. Only a live configuration observer can renew a lease.
-    private static boolean observing;
+    private static volatile boolean observing;
     private static Thread refresher;
     private static volatile boolean paused;
     private static long refreshEpoch;
@@ -64,6 +70,77 @@ public final class HomeLayoutNativeEndpointOS4 {
     private static volatile PublishedSnapshot combinedPublished;
     private static final String RELOAD_CACHE_KEY = "OS4.HomeLayout.ProviderSnapshot.v1";
     private static final Object refresherLock = new Object();
+    private static final Map<Integer, ConfigObserver> configObservers = new HashMap<>();
+
+    private static final class ConfigObserver implements IBinder.DeathRecipient {
+        private final IBinder binder;
+        private final int pid;
+
+        ConfigObserver(IBinder binder, int pid) { this.binder = binder; this.pid = pid; }
+
+        @Override public void binderDied() {
+            synchronized (configObservers) { configObservers.remove(pid, this); }
+        }
+
+        boolean notify(boolean retired) {
+            final Parcel message = Parcel.obtain();
+            try {
+                message.writeInterfaceToken(OBSERVER_DESCRIPTOR);
+                return binder.transact(IBinder.FIRST_CALL_TRANSACTION + (retired ? 1 : 0),
+                    message, null, IBinder.FLAG_ONEWAY);
+            } catch (RemoteException unavailable) {
+                return false;
+            } finally {
+                message.recycle();
+            }
+        }
+    }
+
+    private static void notifyConfigObservers(boolean retired) {
+        synchronized (configObservers) {
+            final var observers = configObservers.values().iterator();
+            while (observers.hasNext()) {
+                final ConfigObserver observer = observers.next();
+                observer.notify(retired);
+                if (retired) {
+                    observers.remove();
+                    observer.binder.unlinkToDeath(observer, 0);
+                }
+            }
+        }
+    }
+
+    public void observe(Parcel data, Parcel reply, int flags) throws RemoteException {
+        data.enforceInterface(DESCRIPTOR);
+        final int uid = Binder.getCallingUid();
+        final int pid = Binder.getCallingPid();
+        if ((flags & IBinder.FLAG_ONEWAY) != 0 || uid < 10000 || pid <= 0 || !verifier.isLauncher(uid, pid))
+            throw new SecurityException("Synchronous launcher registration required");
+        final IBinder binder = data.readStrongBinder();
+        if (data.dataAvail() != 0 || binder == null || !OBSERVER_DESCRIPTOR.equals(binder.getInterfaceDescriptor()))
+            throw new IllegalArgumentException("Invalid configuration observer");
+        ensureRefresher();
+        boolean registered = false;
+        synchronized (configObservers) {
+            if (observing && !paused) {
+                final ConfigObserver existing = configObservers.get(pid);
+                final boolean same = existing != null && existing.binder.equals(binder);
+                final ConfigObserver observer = same ? existing : new ConfigObserver(binder, pid);
+                if (!same) binder.linkToDeath(observer, 0);
+                registered = observer.notify(false);
+                if (registered) {
+                    configObservers.put(pid, observer);
+                    if (!same && existing != null) existing.binder.unlinkToDeath(existing, 0);
+                } else {
+                    configObservers.remove(pid, observer);
+                    binder.unlinkToDeath(observer, 0);
+                }
+            }
+        }
+        reply.writeNoException();
+        reply.writeInt(OBSERVE_ACK);
+        reply.writeInt(registered ? 1 : 0);
+    }
 
     /** Every key this endpoint reads, without the module's own key prefix. */
     private static final String[][] PREF_KEYS = HomeLayoutPrefsSnapshot.specs();
@@ -158,9 +235,12 @@ public final class HomeLayoutNativeEndpointOS4 {
     }
 
     private static void invalidatePreferences(long epoch, boolean discardLastGood) {
+        final boolean revoked;
         synchronized (refresherLock) {
             if (paused || refreshEpoch != epoch) return;
             ++notificationVersion;
+            revoked = (combinedPublished != null && combinedPublished.values() != null)
+                || (discardLastGood && cachedValues != null);
             if (discardLastGood) {
                 cachedValues = null;
                 BaseHook.putHotReloadRuntimeState(RELOAD_CACHE_KEY, null);
@@ -168,6 +248,7 @@ public final class HomeLayoutNativeEndpointOS4 {
             invalidateCombinedLocked();
             refresherLock.notifyAll();
         }
+        if (revoked) notifyConfigObservers(false);
     }
 
     private static void watchPreferences(long epoch) {
@@ -252,12 +333,15 @@ public final class HomeLayoutNativeEndpointOS4 {
         } catch (RuntimeException | LinkageError unavailable) {
             com.sevtinge.hyperceiler.common.log.ModuleLog.w(TAG, "Configuration observer unavailable", unavailable);
         } finally {
+            boolean retired = false;
             synchronized (refresherLock) {
                 if (refreshEpoch == epoch) {
                     observing = false;
                     invalidateCombinedLocked();
+                    retired = true;
                 }
             }
+            if (retired) notifyConfigObservers(true);
             if (resolver != null) {
                 try { resolver.unregisterContentObserver(observer); }
                 catch (RuntimeException unavailable) { /* The observer is being retired. */ }
@@ -281,10 +365,11 @@ public final class HomeLayoutNativeEndpointOS4 {
             observing = false;
             invalidateCombinedLocked();
             worker = refresher;
-            if (worker == null) return true;
-            worker.interrupt();
+            if (worker != null) worker.interrupt();
             refresherLock.notifyAll();
         }
+        notifyConfigObservers(true);
+        if (worker == null) return true;
         try { worker.join(500); }
         catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return false; }
         synchronized (refresherLock) {
@@ -347,6 +432,7 @@ public final class HomeLayoutNativeEndpointOS4 {
             combinedPublished = new PublishedSnapshot(complete, source.reason(), source.framework(),
                 layout, source.haptic(), combinedEpoch, ++combinedRevision, deadline, observing);
         }
+        notifyConfigObservers(false);
         return true;
     }
 
