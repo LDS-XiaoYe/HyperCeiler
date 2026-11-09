@@ -214,7 +214,12 @@ public class SharedPrefsProvider extends ContentProvider {
             return HomeRecentsHapticPrefs.cursor(prefs);
         }
         if (AUTHORITY.equals(uri.getAuthority()) && "/home_layout".equals(uri.getPath())) {
-            return HomeLayoutPrefsSnapshot.cursor(prefs);
+            if (prefs == null) return null;
+            try {
+                final var values = prefs.getAll();
+                final var haptic = HomeRecentsHapticPrefs.profile(values);
+                return HomeLayoutPrefsSnapshot.cursorValues(values, haptic == null ? -1 : haptic.encoded());
+            } catch (RuntimeException unavailable) { return null; }
         }
         if (prefs == null) {
             // A missing preference handle is unavailable, not a successful all-keys deletion.

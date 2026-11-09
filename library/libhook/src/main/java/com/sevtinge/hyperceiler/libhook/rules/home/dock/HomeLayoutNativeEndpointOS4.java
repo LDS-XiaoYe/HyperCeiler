@@ -1,7 +1,11 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 package com.sevtinge.hyperceiler.libhook.rules.home.dock;
 
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.ContentObserver;
 import android.net.Uri;
 import android.os.Binder;
@@ -36,63 +40,20 @@ public final class HomeLayoutNativeEndpointOS4 {
     public static final int COMBINED_ACK = 0x48435331;
     public static final int COMBINED_REPLY_BYTES = 188;
     private static final String DESCRIPTOR = "android.view.IWindowManager";
-    /**
-     * Where the current values come from.
-     *
-     * This endpoint runs in system_server, which cannot read the module's own preference file
-     * (the app's data directory is not readable from here), so a file-based read silently falls
-     * back to the LSPosed snapshot - and that snapshot only carries values that were pushed while
-     * the module app was connected to its service, which is why a switch flipped in the settings
-     * page used to have no effect until much later.
-     *
-     * The reliable source is the module app itself: it exposes the very same preferences through
-     * its provider, and reading our own file is something it can always do. A background thread
-     * pulls those values into a cache so that the launcher's synchronous transaction never waits
-     * on a binder call. A refresh can start the module app, so idle refreshes must be sparse.
-     */
-    private static final String PREFS_AUTHORITY = "com.sevtinge.hyperceiler.provider.sharedprefs";
-    // HCS1 authorization expires after five BOOTTIME seconds, even without a settings write.
-    // Renew on the existing worker; notifications still coalesce slider updates promptly.
-    private static final long PREFS_REFRESH_MS = 1500;
+    // LSPosed's remote preference copy can go stale after an APK or daemon restart.
+    // Read the physical settings on startup and invalidation, never to renew an idle lease.
+    private static final String MODULE_PACKAGE = "com.sevtinge.hyperceiler";
+    private static final String PREFS_AUTHORITY = MODULE_PACKAGE + ".provider.sharedprefs";
     private static final long INITIAL_RETRY_MS = 1500;
+    private static final int MAX_RETRIES = 3;
     private static final long CHANGE_MIN_INTERVAL_NS = 150_000_000L;
-    /**
-     * Cap on retries after failed cycles. Change notifications provide the prompt path while
-     * this bounded retry also recovers from a provider that was unavailable during an update.
-     */
-    private static final long MAX_REFRESH_BACKOFF_MS = 30000;
-    /**
-     * Cadence while the panel is non-interactive.
-     *
-     * Every cycle costs a cross-process query into the module app, and that app is the one the
-     * platform is most likely to have reclaimed already, so an idle cycle can be a cold start of
-     * another process. A doze panel cannot serve a fresher lease either: the launcher is not
-     * drawing, and {@link #tryReadCombinedSnapshot()} answers the same fallback it would answer for
-     * any other expired lease. 30 s is the cap this class already uses for provider failure, and it
-     * matches {@code HomeDockWindow.SWEEP_DOZE_INTERVAL_MS}, which gates the same cost for the same
-     * reason on this ROM.
-     */
-    private static final long DOZE_REFRESH_MS = 30000;
-    /**
-     * The idle cadence is waited out in slices this long, so that the first interactive cycle starts
-     * - and republishes a live lease - within a slice of the wake instead of up to
-     * {@link #DOZE_REFRESH_MS} after it. A slice is a local read of this process's own power
-     * service; a cycle is a query that can cold start another app, so slicing is what keeps the
-     * reduced cadence from being paid for at every unlock.
-     */
-    private static final long IDLE_SLICE_MS = 1000;
     private static final String TAG = "HyperCeiler.HomeLayoutEndpoint";
     private static volatile java.util.Map<String, Object> cachedValues;
-    // Published with the same provider revision, never restored as live authorization.
-    private static String cachedFrameworkReason;
-    private static FrameworkHookGate.Fingerprint cachedFrameworkFingerprint;
-    private static boolean hyosSnapshotLive;
-    private static long hyosSnapshotAtNanos;
     private static final long HYOS_MAX_SNAPSHOT_AGE_NANOS = 5_000_000_000L;
     private static volatile String lastDenied;
     private static volatile String lastAccepted;
-    /** This endpoint runs in system_server, so the panel state is read from a local service. */
-    private static volatile android.os.PowerManager powerManager;
+    // Guarded by refresherLock. Only a live configuration observer can renew a lease.
+    private static boolean observing;
     private static Thread refresher;
     private static volatile boolean paused;
     private static long refreshEpoch;
@@ -109,8 +70,8 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     // One immutable provider revision owns both authorization and the decoded layout.
     private record PublishedSnapshot(java.util.Map<String, Object> values, String reason,
-        FrameworkHookGate.Fingerprint framework, Snapshot layout, long epoch, long revision,
-        long deadline) { }
+        FrameworkHookGate.Fingerprint framework, Snapshot layout, int haptic,
+        long epoch, long revision, long deadline, boolean observed) { }
 
     public record CombinedSnapshot(int available, int flags, long epoch, long revision,
         long deadline, Snapshot layout) {
@@ -137,10 +98,9 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     /** Caller holds refresherLock. Revocation advances the same publication sequence. */
     private static void invalidateCombinedLocked() {
-        hyosSnapshotLive = false;
         if (combinedEpoch == 0) { combinedPublished = null; return; }
-        combinedPublished = new PublishedSnapshot(null, null, null, null, combinedEpoch,
-            ++combinedRevision, 0);
+        combinedPublished = new PublishedSnapshot(null, null, null, null, -1, combinedEpoch,
+            ++combinedRevision, 0, false);
     }
 
     public static void startCombinedPrefetch() { ensureRefresher(); }
@@ -152,7 +112,9 @@ public final class HomeLayoutNativeEndpointOS4 {
         final String segment = path.substring(slash + 1);
         final String key = segment.startsWith("prefs_key_")
             ? segment.substring("prefs_key_".length()) : segment;
-        if (HomeLayoutPrefsSnapshot.XIAOHEIZI_KEY.equals(key)
+        if (key.equals("pref") || key.startsWith("home_recent_card_haptic")
+            || key.equals("home_recent_card_close_haptic")
+            || HomeLayoutPrefsSnapshot.XIAOHEIZI_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.DISMISS_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.RECENT_ICON_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.RECENT_TEXT_KEY.equals(key)
@@ -184,143 +146,129 @@ public final class HomeLayoutNativeEndpointOS4 {
         }
     }
 
-    /**
-     * Whether the panel is interactive. Fail-open on purpose: a context or a service that cannot be
-     * resolved keeps the interactive cadence, so a resolution failure costs queries rather than
-     * silently freezing the published lease for a whole boot.
-     */
-    private static boolean screenInteractive() {
-        try {
-            android.os.PowerManager manager = powerManager;
-            if (manager == null) {
-                final android.content.Context context =
-                    com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
-                        com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID);
-                if (context == null) return true;
-                manager = context.getSystemService(android.os.PowerManager.class);
-                if (manager == null) return true;
-                powerManager = manager;
-            }
-            return manager.isInteractive();
-        } catch (RuntimeException | Error unavailable) {
-            return true;
-        }
-    }
-
-    /**
-     * How long to wait before the next cycle: unchanged while the panel is interactive, floored at
-     * {@link #DOZE_REFRESH_MS} while it is not. Kept separate from the retry ladder so the two
-     * effects cannot hide each other.
-     */
-    static long idlePeriod(long period, boolean interactive) {
-        return interactive ? period : Math.max(period, DOZE_REFRESH_MS);
-    }
-
-    /**
-     * Wait out one idle period in {@link #IDLE_SLICE_MS} slices. Returns as soon as the panel is
-     * interactive, so the caller's next cycle republishes a lease the wake can use; a settings write
-     * observed during the wait is left to the caller's revision check, which still refreshes
-     * promptly. {@code period} is consumed entirely when the panel stays in doze.
-     */
-    private static boolean idleGateElapsed(long period, long epoch) throws InterruptedException {
-        if (period <= IDLE_SLICE_MS || screenInteractive()) {
-            refresherLock.wait(period);
-            return true;
-        }
-        long remaining = period;
-        while (remaining > 0) {
-            refresherLock.wait(Math.min(remaining, IDLE_SLICE_MS));
-            if (paused || refreshEpoch != epoch) return false;
-            if (screenInteractive()) return true;
-            remaining -= IDLE_SLICE_MS;
-        }
-        return true;
-    }
-
     private static void ensureRefresher() {
         restoreProviderSnapshot();
         synchronized (refresherLock) {
             if (refresher != null || paused) return;
             final long epoch = refreshEpoch;
-            refresher = new Thread(() -> {
-                ContentResolver resolver = null;
-                ContentObserver observer = null;
-                long retry = INITIAL_RETRY_MS;
-                long lastQueryAtNanos = 0;
-                try {
-                    try {
-                        final android.content.Context context =
-                            com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
-                                com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID);
-                        if (context != null) {
-                            resolver = context.getContentResolver();
-                        }
-                        if (resolver != null) {
-                            final ContentObserver candidate = new ContentObserver(null) {
-                                @Override public void onChange(boolean selfChange, Uri uri) {
-                                    if (!isLayoutChange(uri)) return;
-                                    synchronized (refresherLock) {
-                                        ++notificationVersion;
-                                        invalidateCombinedLocked();
-                                        refresherLock.notifyAll();
-                                    }
-                                }
-                            };
-                            resolver.registerContentObserver(Uri.parse(
-                                "content://" + PREFS_AUTHORITY + "/pref"), true, candidate);
-                            observer = candidate;
-                        }
-                    } catch (RuntimeException | Error unavailable) {
-                        // A broken content service must not crash system_server's worker.
-                        // Unobserved systems continue with a bounded five-second fallback.
-                    }
-                    for (;;) {
-                        final long beforeQuery;
-                        synchronized (refresherLock) {
-                            if (paused || refreshEpoch != epoch) return;
-                            // Slider drags may emit dozens of writes per second. Coalesce them
-                            // without delaying the first write or making the UI wait for release.
-                            if (lastQueryAtNanos != 0) {
-                                final long remaining = CHANGE_MIN_INTERVAL_NS
-                                    - (System.nanoTime() - lastQueryAtNanos);
-                                if (remaining > 0) {
-                                    refresherLock.wait(Math.max(1, (remaining + 999_999) / 1_000_000));
-                                    continue;
-                                }
-                            }
-                            beforeQuery = notificationVersion;
-                        }
-                        final boolean success = refreshFromProvider();
-                        lastQueryAtNanos = System.nanoTime();
-                        final long period;
-                        if (success) {
-                            retry = INITIAL_RETRY_MS;
-                            period = PREFS_REFRESH_MS;
-                        } else {
-                            retry = Math.min(retry * 2, MAX_REFRESH_BACKOFF_MS);
-                            period = retry;
-                        }
-                        synchronized (refresherLock) {
-                            if (paused || refreshEpoch != epoch) return;
-                            // A write during the query needs a new whole-file revision now.
-                            if (notificationVersion != beforeQuery) continue;
-                            idleGateElapsed(idlePeriod(period, screenInteractive()), epoch);
-                        }
-                    }
-                } catch (InterruptedException cancelled) {
-                    Thread.currentThread().interrupt();
-                } finally {
-                    if (resolver != null && observer != null) {
-                        try { resolver.unregisterContentObserver(observer); }
-                        catch (RuntimeException | Error unavailable) { /* Retiring after provider death. */ }
-                    }
-                    synchronized (refresherLock) {
-                        if (refresher == Thread.currentThread()) refresher = null;
-                    }
-                }
-            }, "hc-layout-prefs");
+            refresher = new Thread(() -> watchPreferences(epoch), "hc-layout-prefs");
             refresher.setDaemon(true);
             refresher.start();
+        }
+    }
+
+    private static void invalidatePreferences(long epoch, boolean discardLastGood) {
+        synchronized (refresherLock) {
+            if (paused || refreshEpoch != epoch) return;
+            ++notificationVersion;
+            if (discardLastGood) {
+                cachedValues = null;
+                BaseHook.putHotReloadRuntimeState(RELOAD_CACHE_KEY, null);
+            }
+            invalidateCombinedLocked();
+            refresherLock.notifyAll();
+        }
+    }
+
+    private static void watchPreferences(long epoch) {
+        Context context = null;
+        ContentResolver resolver = null;
+        boolean watchingPackage = false;
+        final ContentObserver observer = new ContentObserver(null) {
+            @Override public void onChange(boolean selfChange, Uri uri) {
+                if (isLayoutChange(uri)) invalidatePreferences(epoch, false);
+            }
+        };
+        final BroadcastReceiver packageObserver = new BroadcastReceiver() {
+            @Override public void onReceive(Context receiverContext, Intent intent) {
+                final Uri packageUri = intent.getData();
+                if (packageUri == null || !MODULE_PACKAGE.equals(packageUri.getSchemeSpecificPart())) return;
+                final String action = intent.getAction();
+                final boolean dataRemoved = Intent.ACTION_PACKAGE_DATA_CLEARED.equals(action)
+                    || (Intent.ACTION_PACKAGE_REMOVED.equals(action)
+                        && !intent.getBooleanExtra(Intent.EXTRA_REPLACING, false));
+                invalidatePreferences(epoch, dataRemoved);
+            }
+        };
+        try {
+            // Register before the initial query so a concurrent edit or package change cannot be
+            // missed. Waiting for Android's context performs no calls to the module process.
+            while (context == null) {
+                context = systemContext();
+                if (context == null) Thread.sleep(INITIAL_RETRY_MS);
+            }
+            final IntentFilter packages = new IntentFilter();
+            packages.addAction(Intent.ACTION_PACKAGE_ADDED);
+            packages.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            packages.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            packages.addAction(Intent.ACTION_PACKAGE_DATA_CLEARED);
+            packages.addDataScheme("package");
+            context.registerReceiver(packageObserver, packages, Context.RECEIVER_NOT_EXPORTED);
+            watchingPackage = true;
+            resolver = context.getContentResolver();
+            resolver.registerContentObserver(
+                Uri.parse("content://" + PREFS_AUTHORITY + "/pref"), true, observer);
+            synchronized (refresherLock) {
+                if (paused || refreshEpoch != epoch) return;
+                observing = true;
+            }
+
+            long attemptedVersion = -1;
+            long lastQueryAtNanos = 0;
+            int retries = 0;
+            boolean success = false;
+            for (;;) {
+                synchronized (refresherLock) {
+                    if (paused || refreshEpoch != epoch) return;
+                    if (notificationVersion == attemptedVersion) {
+                        if (success || retries == MAX_RETRIES) {
+                            refresherLock.wait();
+                            continue;
+                        }
+                        final long elapsed = System.nanoTime() - lastQueryAtNanos;
+                        final long remaining = ((INITIAL_RETRY_MS << retries) * 1_000_000L) - elapsed;
+                        if (remaining > 0) {
+                            refresherLock.wait((remaining + 999_999L) / 1_000_000L);
+                            continue;
+                        }
+                        ++retries;
+                    } else {
+                        // Coalesce slider edits without missing a notification during the read.
+                        final long remaining = CHANGE_MIN_INTERVAL_NS
+                            - (System.nanoTime() - lastQueryAtNanos);
+                        if (lastQueryAtNanos != 0 && remaining > 0) {
+                            refresherLock.wait((remaining + 999_999L) / 1_000_000L);
+                            continue;
+                        }
+                        attemptedVersion = notificationVersion;
+                        retries = 0;
+                    }
+                }
+                success = refreshFromProvider();
+                lastQueryAtNanos = System.nanoTime();
+            }
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException | LinkageError unavailable) {
+            com.sevtinge.hyperceiler.common.log.ModuleLog.w(TAG, "Configuration observer unavailable", unavailable);
+        } finally {
+            synchronized (refresherLock) {
+                if (refreshEpoch == epoch) {
+                    observing = false;
+                    invalidateCombinedLocked();
+                }
+            }
+            if (resolver != null) {
+                try { resolver.unregisterContentObserver(observer); }
+                catch (RuntimeException unavailable) { /* The observer is being retired. */ }
+            }
+            if (watchingPackage) {
+                try { context.unregisterReceiver(packageObserver); }
+                catch (RuntimeException unavailable) { /* The receiver is being retired. */ }
+            }
+            synchronized (refresherLock) {
+                if (refresher == Thread.currentThread()) refresher = null;
+            }
         }
     }
 
@@ -330,6 +278,7 @@ public final class HomeLayoutNativeEndpointOS4 {
         synchronized (refresherLock) {
             paused = true;
             ++refreshEpoch; // A query already in flight must not publish after retirement.
+            observing = false;
             invalidateCombinedLocked();
             worker = refresher;
             if (worker == null) return true;
@@ -352,8 +301,8 @@ public final class HomeLayoutNativeEndpointOS4 {
     /** A missing provider revision is NOT an authoritative zero/default native configuration. */
     private static Snapshot readReadyPreferences() {
         ensureRefresher();
-        if (cachedValues == null) return null;
-        return readPreferences();
+        final java.util.Map<String, Object> values = cachedValues;
+        return values == null ? null : decodeLayout(values);
     }
 
     /** One Binder query / one physical settings revision, including an explicit empty reset. */
@@ -374,7 +323,6 @@ public final class HomeLayoutNativeEndpointOS4 {
         catch (RuntimeException | Error unavailable) { success = false; }
         synchronized (refresherLock) {
             if (!success && refreshEpoch == epoch && refreshTicket == ticket) {
-                hyosSnapshotLive = false;
                 invalidateCombinedLocked();
             }
         }
@@ -384,7 +332,7 @@ public final class HomeLayoutNativeEndpointOS4 {
     private static boolean tryRefreshFromProvider(long epoch, long ticket, long notificationAtQuery, long started) {
         if (started <= 0 || started > Long.MAX_VALUE - HYOS_MAX_SNAPSHOT_AGE_NANOS) return false;
         if (!ensurePublicationEpoch(epoch, ticket)) return false;
-        final ProviderSnapshot source = queryProviderSnapshot();
+        final ProviderSnapshot source = queryProviderSnapshot(systemContext());
         if (source == null) return false;
         final java.util.Map<String, Object> complete = source.values();
         final Snapshot layout = decodeLayout(complete);
@@ -396,12 +344,8 @@ public final class HomeLayoutNativeEndpointOS4 {
             // Boot-classloader Map/String/Integer only; no endpoint, callback or Thread crosses reload.
             BaseHook.putHotReloadRuntimeState(RELOAD_CACHE_KEY, complete);
             cachedValues = complete;
-            cachedFrameworkReason = source.reason();
-            cachedFrameworkFingerprint = source.framework();
-            hyosSnapshotAtNanos = System.nanoTime();
-            hyosSnapshotLive = true;
-            combinedPublished = new PublishedSnapshot(complete, cachedFrameworkReason,
-                cachedFrameworkFingerprint, layout, combinedEpoch, ++combinedRevision, deadline);
+            combinedPublished = new PublishedSnapshot(complete, source.reason(), source.framework(),
+                layout, source.haptic(), combinedEpoch, ++combinedRevision, deadline, observing);
         }
         return true;
     }
@@ -425,12 +369,11 @@ public final class HomeLayoutNativeEndpointOS4 {
     }
 
     private record ProviderSnapshot(java.util.Map<String, Object> values, String reason,
-        FrameworkHookGate.Fingerprint framework) { }
+        FrameworkHookGate.Fingerprint framework, int haptic) { }
 
-    private static ProviderSnapshot queryProviderSnapshot() {
-        return queryProviderSnapshot(
-            com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
-                com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID));
+    private static Context systemContext() {
+        return com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
+            com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID);
     }
 
     public record LocalSnapshot(Snapshot layout, int[] gestures) { }
@@ -522,7 +465,8 @@ public final class HomeLayoutNativeEndpointOS4 {
         return new ProviderSnapshot(java.util.Collections.unmodifiableMap(values),
             frameworkText.get("framework_check_reason"),
             new FrameworkHookGate.Fingerprint(frameworkText.get("framework_check_name"),
-                frameworkText.get("framework_check_version"), frameworkVersionCode));
+                frameworkText.get("framework_check_version"), frameworkVersionCode),
+            extras == null ? -1 : extras.getInt(HomeLayoutPrefsSnapshot.HAPTIC_PROFILE_V1, -1));
     }
 
     private static boolean isProviderSchema(android.database.Cursor cursor) {
@@ -691,20 +635,18 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     static int readHyosFlags() {
         ensureRefresher();
-        final java.util.Map<String, Object> values;
-        final String frameworkReason;
-        final FrameworkHookGate.Fingerprint checkedFramework;
-        synchronized (refresherLock) {
-            if (!hyosSnapshotLive || paused
-                || System.nanoTime() - hyosSnapshotAtNanos > HYOS_MAX_SNAPSHOT_AGE_NANOS) return -1;
-            values = cachedValues;
-            frameworkReason = cachedFrameworkReason;
-            checkedFramework = cachedFrameworkFingerprint;
-        }
-        // No JNI/remote-preference fallback in a Rust child. Activation requires
-        // the module application's authoritative snapshot and normal hook gates.
-        if (values == null) return -1;
-        return deriveHyosFlags(values, frameworkReason, checkedFramework);
+        final PublishedSnapshot value = combinedPublished;
+        if (leaseDeadline(value, SystemClock.elapsedRealtimeNanos()) == 0) return -1;
+        final int flags = deriveHyosFlags(value.values(), value.reason(), value.framework());
+        return combinedPublished == value && !paused ? flags : -1;
+    }
+
+    /** Card feedback reads the same physical revision as layout, with no Provider IPC. */
+    public static int recentsHapticProfileWord() {
+        ensureRefresher();
+        final PublishedSnapshot value = combinedPublished;
+        return leaseDeadline(value, SystemClock.elapsedRealtimeNanos()) != 0
+            ? value.haptic() : -1;
     }
 
     private static int deriveHyosFlags(java.util.Map<String, Object> values, String frameworkReason,
@@ -751,40 +693,44 @@ public final class HomeLayoutNativeEndpointOS4 {
     }
 
     /** Null means the publication changed while its framework gate was inspected. */
-    // A refreshed record with equal contents is still a new publication; validate its identity.
     @SuppressWarnings("PMD.CompareObjectsWithEquals")
     private static CombinedSnapshot tryReadCombinedSnapshot() {
         final PublishedSnapshot value = combinedPublished;
         final long now = SystemClock.elapsedRealtimeNanos();
-        if (!isCombinedLeaseLive(value, now)) return unavailableCombined(value);
+        final long deadline = leaseDeadline(value, now);
+        if (deadline == 0) return unavailableCombined(value);
         final int flags = deriveHyosFlags(value.values(), value.reason(), value.framework());
         final long finished = SystemClock.elapsedRealtimeNanos();
         if (combinedPublished != value || paused) return null;
-        if (finished < now || finished >= value.deadline()) return unavailableCombined(value);
+        if (finished < now || finished >= deadline) return unavailableCombined(value);
         if (flags == 0) return new CombinedSnapshot(1, 0, value.epoch(), value.revision(), 0, null);
         if (!validCombinedLayout(value.layout())) return unavailableCombined(value);
         return new CombinedSnapshot(1, flags, value.epoch(), value.revision(),
-            value.deadline(), value.layout());
+            deadline, value.layout());
     }
 
     /** Same immutable physical-file publication and authorization as combined layout. */
     public record RecentsBarPreference(boolean available, boolean enabled, long deadline) { }
     public static RecentsBarPreference recentsBarPreference() {
         final PublishedSnapshot value = combinedPublished;
-        final long now = SystemClock.elapsedRealtimeNanos();
-        if (!isCombinedLeaseLive(value, now)
-            || !value.values().containsKey(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY))
+        final long deadline = leaseDeadline(value, SystemClock.elapsedRealtimeNanos());
+        if (deadline == 0 || !value.values().containsKey(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY))
             return new RecentsBarPreference(false, false, 0);
         final int flags = deriveHyosFlags(value.values(), value.reason(), value.framework());
-        if (combinedPublished != value || !isCombinedLeaseLive(value, SystemClock.elapsedRealtimeNanos()))
+        if (combinedPublished != value || paused || SystemClock.elapsedRealtimeNanos() >= deadline)
             return new RecentsBarPreference(false, false, 0);
         return new RecentsBarPreference(true, (flags & HYOS_ALLOWED) != 0
-            && readBoolean(value.values(), HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, false), value.deadline());
+            && readBoolean(value.values(), HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, false), deadline);
     }
 
-    private static boolean isCombinedLeaseLive(PublishedSnapshot value, long now) {
-        return value != null && !paused && value.values() != null && now > 0
-            && now < value.deadline() && value.deadline() - now <= HYOS_MAX_SNAPSHOT_AGE_NANOS;
+    private static long leaseDeadline(PublishedSnapshot value, long now) {
+        if (value == null || paused || value.values() == null || now <= 0
+            || now > Long.MAX_VALUE - HYOS_MAX_SNAPSHOT_AGE_NANOS
+            || now < value.deadline() - HYOS_MAX_SNAPSHOT_AGE_NANOS) return 0;
+        // The observer revokes the revision before re-reading changed settings. The lease still
+        // bounds a client if WMS or the observer stops serving replies; a lease is never restored.
+        if (value.observed()) return now + HYOS_MAX_SNAPSHOT_AGE_NANOS;
+        return now < value.deadline() ? value.deadline() : 0;
     }
 
     private static boolean validCombinedLayout(Snapshot value) {

@@ -27,6 +27,11 @@ public final class HomeRecentsHapticPrefs {
         if(type<0||type>3||strength<10||strength>100)return null;
         return new Profile(enabled,close,type,strength);
     }
+    public static Profile decodeProfile(int word) {
+        int strength = word >> 4;
+        if (strength < 10 || strength > 100) return null;
+        return new Profile((word & 1) != 0, (word & 8) != 0, (word >> 1) & 3, strength);
+    }
     public static Cursor cursor(SharedPreferences prefs) {
         if(prefs==null)return null;
         var profile=profile(prefs.getAll());
