@@ -7,10 +7,16 @@ project(HyperCeilerNative LANGUAGES CXX)
 # The library name is the LSPosed native-hook contract: it must match the
 # `libHyperCeilerNative.so` entry of META-INF/xposed/native_init.list and the
 # `System.loadLibrary` name in NativeHomeHooksOS4.
-add_library(HyperCeilerNative SHARED targets/home/hyperceiler_home.cpp)
+add_library(HyperCeilerNative SHARED
+    nativehook/native_log.cpp
+    nativehook/safe_mode.cpp
+    targets/home/hyperceiler_home.cpp)
 
 option(HYPERCEILER_HYOS_BACKEND "Build the separate Zygisk Next native-only companion" OFF)
 if(HYPERCEILER_HYOS_BACKEND)
+    if(NOT HYPERCEILER_ZYGISK_NEXT_API_DIR)
+        set(HYPERCEILER_ZYGISK_NEXT_API_DIR "${CMAKE_CURRENT_SOURCE_DIR}/nativehook")
+    endif()
     set_target_properties(HyperCeilerNative PROPERTIES OUTPUT_NAME HyperCeilerHyos)
     if(NOT EXISTS "${HYPERCEILER_ZYGISK_NEXT_API_DIR}/zygisk_next_api.h")
         message(FATAL_ERROR "Supply the pinned Zygisk Next API 4 SDK header directory")
