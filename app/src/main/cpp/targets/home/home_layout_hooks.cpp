@@ -103,7 +103,8 @@ bool refresh_dock_screen_state();
 bool dock_motion_screen_active();
 // The dock translation unit owns the madvise guard used by every launcher
 // code patch. It checks readiness and registers the range atomically.
-bool home_madvise_protect_range(uintptr_t address, size_t bytes);
+bool home_madvise_prepare_first_render();
+bool home_madvise_protect_range(uintptr_t address, size_t bytes, bool first_render);
 #endif
 
 #include <algorithm>
@@ -1202,6 +1203,7 @@ uint64_t process_age_or_zero() {
 }
 
 const char* diagnostic_feature(size_t slot);
+thread_local bool g_first_render_discovery=false;
 
 nhk::InlineHookHost<kPatchWords> &slot_host() {
     static nhk::InlineHookHost<kPatchWords> host = [] {
@@ -1244,7 +1246,7 @@ nhk::InlineHookHost<kPatchWords> &slot_host() {
             // The dock health worker owns the madvise guard. Ask it to settle
             // first; a pending/unavailable/residual guard must leave the
             // layout patch stock rather than register an effective no-op page.
-            return home_madvise_protect_range(address, bytes);
+            return home_madvise_protect_range(address, bytes, g_first_render_discovery);
 #else
             (void)address; (void)bytes;
             return false;
@@ -1495,7 +1497,6 @@ void reset_binding_retries(){
 }
 bool g_first_render_features_scanned=false;
 std::atomic_bool g_first_render_finished{false};
-thread_local bool g_first_render_discovery=false;
 
 void report_layout_image_failure(const char *reason) {
     static std::atomic<const char *> previous{nullptr};
@@ -7312,7 +7313,12 @@ void prime_home_layout_first_render_locked() {
     if(workspace_requested)for(size_t i=2;i<=3;++i)
         if(g_slots[kKnobHookSlotBase+i].address)order.push_back(kKnobHookSlotBase+i);
     for(size_t i=kDrawerSearchSlot;i<kDrawerSearchSlot+2;++i)if(g_slots[i].address)order.push_back(i);
+#ifdef HYPERCEILER_DOCK_NATIVE_MOTION
+    if(!order.empty() && home_madvise_prepare_first_render())
+        (void)nhk::ensure_slots_live(g_slots,slot_host(),order);
+#else
     if(!order.empty())(void)nhk::ensure_slots_live(g_slots,slot_host(),order);
+#endif
     knob.hook_armed=nhk::slot_ready(g_slots[kKnobHookSlotBase]);
     for(size_t i=2;i<=3;++i)g_knobs[i].hook_armed=nhk::slot_ready(g_slots[kKnobHookSlotBase+i]);
     (void)publish_hooks();
