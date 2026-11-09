@@ -620,6 +620,16 @@ class HomeDockWindow : BaseHook() {
                         // endpoint can observe the same frame, including the newest hook.
                         if (stopped) return@createBeforeHook
                         val code = param.args[0] as Int
+                        if (code == HomeLayoutNativeEndpointOS4.OBSERVE_TRANSACTION_CODE) {
+                            val reply = param.args[2] as? Parcel ?: return@createBeforeHook
+                            try {
+                                layoutEndpoint.observe(param.args[1] as Parcel, reply, param.args[3] as Int)
+                            } catch (error: Exception) {
+                                reply.writeException(error)
+                            }
+                            param.result = true
+                            return@createBeforeHook
+                        }
                         if (code == HomeRecentsStatusBarOS4.TRANSACTION) {
                             val reply = param.args[2] as? Parcel ?: return@createBeforeHook
                             recentsStatusBar.receive(param.args[1] as Parcel, reply, param.args[3] as Int)

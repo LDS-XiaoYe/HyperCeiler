@@ -2,6 +2,8 @@
 #include "home_layout_config.h"
 #include "home_widget_move.h"
 #include "home_endpoint_diagnostics.h"
+#include <cerrno>
+#include <time.h>
 
 #ifdef HYPERCEILER_HYOS_BACKEND
 #include "targets/hyos/hyos_control.h"
@@ -13,6 +15,10 @@
 #include <android/binder_parcel_jni.h>
 #include "home_local_config_channel.h"
 #include "home_local_config_protocol.h"
+#include "home_native_binder_watch.h"
+#include "home_native_window.h"
+#include <poll.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 #endif
 #include <android/binder_status.h>
@@ -32,11 +38,140 @@
 #include <string>
 #include <cstdarg>
 #include <vector>
-#include <cerrno>
 #include <sys/stat.h>
 #endif
 
 namespace home_layout {
+
+#if defined(__ANDROID__) && !defined(HYPERCEILER_HYOS_BACKEND)
+namespace {
+using home_native_glass::BinderWatch;
+using home_native_platform::Binder;
+
+constexpr transaction_code_t kObserveConfig = 0x00484358;
+constexpr int32_t kObserveAck = 0x48435831;
+struct ConfigObserver {
+    std::atomic<uint64_t> revision{0};
+    std::atomic<bool> retired{false};
+};
+Binder config_observer{nullptr, AIBinder_decStrong};
+std::shared_ptr<BinderWatch::Signal> config_server;
+std::unique_ptr<BinderWatch> config_server_watch;
+int64_t next_config_registration = 0;
+bool reported_config_observer = false;
+
+int config_event() {
+    // Allocated by the layout worker before handing a callback to WMS.
+    static const int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    return fd;
+}
+
+void wake_config_worker() {
+    const int fd = config_event();
+    if (fd >= 0) (void)eventfd_write(fd, 1);
+}
+
+const AIBinder_Class* config_observer_class() {
+    static const auto* type = AIBinder_Class_define("com.sevtinge.hyperceiler.home.ConfigObserver",
+        [](void*) -> void* { return new ConfigObserver; },
+        [](void* state) { delete static_cast<ConfigObserver*>(state); },
+        [](AIBinder* binder, transaction_code_t code, const AParcel* input, AParcel*) -> binder_status_t {
+            if (AIBinder_getCallingUid() != 1000) return STATUS_PERMISSION_DENIED;
+            if (AParcel_getDataPosition(input) != AParcel_getDataSize(input)) return STATUS_BAD_VALUE;
+            auto& state = *static_cast<ConfigObserver*>(AIBinder_getUserData(binder));
+            if (code == FIRST_CALL_TRANSACTION) {
+                // Shared across registrations, so a reconnect cannot reuse a worker's revision.
+                static std::atomic<uint64_t> sequence{0};
+                state.revision.store(sequence.fetch_add(1, std::memory_order_relaxed) + 1,
+                    std::memory_order_release);
+                wake_config_worker();
+                return STATUS_OK;
+            }
+            if (code != FIRST_CALL_TRANSACTION + 1) return STATUS_UNKNOWN_TRANSACTION;
+            state.retired.store(true, std::memory_order_release);
+            wake_config_worker();
+            return STATUS_OK;
+        });
+    return type;
+}
+}
+
+uint64_t config_observer_revision() {
+    if (!config_observer || config_server->dead.load(std::memory_order_acquire)) return 0;
+    const auto& state = *static_cast<ConfigObserver*>(AIBinder_getUserData(config_observer.get()));
+    return state.retired.load(std::memory_order_acquire) ? 0 : state.revision.load(std::memory_order_acquire);
+}
+
+void refresh_config_observer() {
+    if (home_local_config::requested() || config_event() < 0) return;
+    timespec clock{};
+    if (clock_gettime(CLOCK_MONOTONIC, &clock) != 0) return;
+    const int64_t now = int64_t(clock.tv_sec) * 1000 + clock.tv_nsec / 1000000;
+    if (config_observer_revision() != 0) {
+        if (!reported_config_observer) {
+            reported_config_observer = true;
+            __android_log_print(ANDROID_LOG_INFO, "HyperCeiler.HomeConfig",
+                "WMS preference observer active; layout and haptic refresh on publication");
+        }
+        return;
+    }
+    if (config_observer) {
+        const auto& state = *static_cast<ConfigObserver*>(AIBinder_getUserData(config_observer.get()));
+        if (!state.retired.load(std::memory_order_acquire)
+            && !config_server->dead.load(std::memory_order_acquire) && now < next_config_registration) return;
+        config_observer.reset();
+        config_server_watch.reset();
+        config_server.reset();
+        reported_config_observer = false;
+    } else if (now < next_config_registration) return;
+
+    next_config_registration = now + 5000;
+    std::string reason;
+    const auto window = home_native_platform::window(reason);
+    if (!window || !home_native_platform::callbacks(reason)) return;
+    const auto* type = config_observer_class();
+    Binder observer(type ? AIBinder_new(type, nullptr) : nullptr, AIBinder_decStrong);
+    if (!observer) return;
+    auto signal = std::make_shared<BinderWatch::Signal>();
+    auto watch = BinderWatch::bind(window.get(), signal, wake_config_worker);
+    if (!watch) return;
+    bool unsupported = false;
+    const auto reply = home_native_platform::call(window.get(), kObserveConfig, [&](AParcel* data) {
+        return AParcel_writeStrongBinder(data, observer.get());
+    }, reason, &unsupported);
+    if (unsupported) next_config_registration = now + 30000;
+    int32_t marker = 0, accepted = 0;
+    if (!reply || AParcel_readInt32(reply.get(), &marker) != STATUS_OK || marker != kObserveAck
+        || AParcel_readInt32(reply.get(), &accepted) != STATUS_OK || accepted != 1
+        || AParcel_getDataPosition(reply.get()) != AParcel_getDataSize(reply.get())) return;
+    config_server = std::move(signal);
+    config_server_watch = std::move(watch);
+    config_observer = std::move(observer);
+}
+#else
+uint64_t config_observer_revision() { return 0; }
+void refresh_config_observer() {}
+#endif
+
+bool wait_for_config_event(long milliseconds) {
+#if defined(__ANDROID__) && !defined(HYPERCEILER_HYOS_BACKEND)
+    const int fd = config_event();
+    if (fd >= 0) {
+        pollfd descriptor{fd, POLLIN, 0};
+        int ready;
+        do { ready = poll(&descriptor, 1, static_cast<int>(milliseconds)); } while (ready < 0 && errno == EINTR);
+        if (ready == 0) return false;
+        if (ready > 0 && (descriptor.revents & POLLIN)) {
+            eventfd_t count = 0;
+            return eventfd_read(fd, &count) == 0;
+        }
+    }
+#endif
+    timespec remaining{milliseconds / 1000, (milliseconds % 1000) * 1000000};
+    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
+    return false;
+}
+
 #ifndef HYPERCEILER_HYOS_BACKEND
 namespace {
 constexpr transaction_code_t kLayoutTransaction = 0x0048434C;
@@ -811,8 +946,9 @@ bool commit_local_recent_cards(std::span<void*> groups,const cards::Plan& plan,
 #endif
 }
 
-bool query_config(Config &result) {
+bool query_config(Config &result, bool on_change) {
 #ifdef HYPERCEILER_HYOS_BACKEND
+    (void)on_change;
     // Unavailable/expired authorization publishes neutral values, never an old
     // JNI/property/disk configuration or a second independent Binder revision.
     (void) hyos_control::layout_config(result);
@@ -839,8 +975,16 @@ bool query_config(Config &result) {
         result = std::move(candidate);
         return true;
     }
+    static uint64_t applied_revision = 0;
+    const auto revision = config_observer_revision();
+    const bool debug_override = debug_override_enabled();
+    if (on_change && revision != 0 && revision == applied_revision && !debug_override && g_process_config.latest) {
+        result = *g_process_config.latest;
+        return true;
+    }
     const bool from_binder = query_binder(candidate);
-    if (debug_override_enabled()) {
+    applied_revision = from_binder && !debug_override ? revision : 0;
+    if (debug_override) {
         // Calibration never changes the authoritative in-memory or disk snapshot.
         apply_debug_override(candidate);
         config_diagnostic(2,ANDROID_LOG_WARN,"CONFIG_SOURCE: debug property override (not persisted)");

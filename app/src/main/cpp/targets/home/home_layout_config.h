@@ -126,6 +126,10 @@ bool commit_local_recent_cards(std::span<void*> groups,const cards::Plan& plan,
 bool query_bootstrap_config(Config &result);
 
 /** Worker only: read the snapshot through the authenticated WMS Binder endpoint. */
-bool query_config(Config &result);
+bool query_config(Config &result, bool on_change = false);
+// The layout worker owns registration. Zero means retain compatibility polling.
+void refresh_config_observer();
+uint64_t config_observer_revision();
+bool wait_for_config_event(long milliseconds);
 
 } // namespace home_layout

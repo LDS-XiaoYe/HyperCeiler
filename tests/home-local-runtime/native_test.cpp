@@ -37,11 +37,14 @@ bool publication_current(uint64_t generation){return live.current(generation,clo
 namespace home_layout {
 static int binder_reads=0, disk_writes=0;
 static bool disk_available=false;
+static bool binder_available=true;
+static uint64_t observer_revision=0;
 static Config disk;
 static void config_diagnostic(int,int,const char*,...) { }
 static bool debug_override_enabled(){return false;}
 static void apply_debug_override(Config&) { }
-static bool query_binder(Config& value){++binder_reads;value={};return true;}
+static bool query_binder(Config& value){++binder_reads;value={};return binder_available;}
+uint64_t config_observer_revision(){return observer_revision;}
 static bool read_config_cache(Config& value){if(!disk_available)return false;value=disk;return true;}
 static bool write_config_cache(const Config& value){++disk_writes;disk=value;disk.local_haptic={};disk.local_dock={};disk.local_recent_cards.reset();disk.local_cards_generation=0;disk_available=true;return true;}
 }
@@ -77,6 +80,24 @@ int main(int argc,char** argv) {
     }
     AParcel trailing=enabled;trailing.position=0;trailing.bytes.push_back(0);
     assert(!read_layout_reply(&trailing,decoded,true));
+
+    // Observe the production layout cache with transport events at its boundary.
+    observer_revision=1;
+    assert(query_config(decoded,true)&&binder_reads==1);
+    for(int pass=0;pass<10;++pass) assert(query_config(decoded,true)&&binder_reads==1);
+    observer_revision=2;
+    assert(query_config(decoded,true)&&binder_reads==2);
+    observer_revision=3;binder_available=false;
+    assert(query_config(decoded,true)&&binder_reads==3); // Last good layout, still retry this revision.
+    binder_available=true;
+    assert(query_config(decoded,true)&&binder_reads==4);
+    assert(query_config(decoded,true)&&binder_reads==4);
+    observer_revision=0;
+    assert(query_config(decoded,true)&&binder_reads==5); // Retired or unsupported endpoint.
+    assert(query_config(decoded,true)&&binder_reads==6);
+    g_process_config.latest.reset();g_process_config.persisted.clear();
+    binder_reads=0;disk_writes=0;disk_available=false;
+
     enabled.position=0;
     assert(!publish_local_reply(&enabled,1)); // No second backend may seize ownership implicitly.
     g_process_config.local_owned=true;

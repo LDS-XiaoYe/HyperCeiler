@@ -5674,6 +5674,7 @@ void *worker(void *) {
      */
     uint64_t last_panel_query = 0;
     uint64_t last_generation_check = 0;
+    bool resume_sync = false;
     for (;;) {
         const uint64_t now = monotonic_ms();
         /*
@@ -5692,6 +5693,7 @@ void *worker(void *) {
         if (interval_due(last_panel_query, now, kPanelQueryIntervalMs)) {
             last_panel_query = now;
             if (!layout_panel_refresh_and_check()) {
+                resume_sync = true;
                 if(home_local_config::requested()) {
                     // The local execution lease is three seconds. Keep its
                     // socket publication alive without walking hooks or
@@ -5713,14 +5715,15 @@ void *worker(void *) {
                 continue;
             }
         }
-        delay_ms(kPassIntervalMs);
+        const bool config_event = home_layout::wait_for_config_event(kPassIntervalMs);
         // A late libapp mapping can still arrive through the loader/property
         // callback after the Rust bank was initialized. Share the setup lease
         // with that first-render pass so neither side replaces live slot state.
         if(g_loader_priming.test_and_set(std::memory_order_acquire))continue;
         struct PassLease {~PassLease(){g_loader_priming.clear(std::memory_order_release);}} pass_lease;
         ++iterations;
-        hc_recents_haptic_refresh();
+        home_layout::refresh_config_observer();
+        hc_recents_haptic_refresh(resume_sync);
         hc_native_context_refresh();
         hc_native_provider_refresh();
         hc_recent_cards_refresh();
@@ -5746,14 +5749,10 @@ void *worker(void *) {
             }
         }
         /*
-         * Re-read the preference snapshot every second (kPassIntervalMs keeps this loop at
-         * 500 ms). Five seconds used to make a card corner or card height change look dead on
-         * the first entry into recents: the cards are built from whatever revision was live at
-         * that moment, and the next query only landed one build later. The query is a single
-         * synchronous transaction against system_server and stays behind the doze gate, so the
-         * extra four calls per five seconds cost nothing measurable.
+         * Read a new WMS publication at the existing worker cadence. A server without
+         * a working notification channel retains the previous one-second query.
          */
-        if (iterations % 2 == 0) {
+        if (resume_sync || config_event || iterations % 2 == 0) {
             // Rust back-region hooks can make locate() succeed before libapp.so
             // is mapped. If the one-shot loader callback then misses the setup
             // lease, no Dart binder below can recover by itself. Discover the
@@ -5770,7 +5769,7 @@ void *worker(void *) {
                 prime_home_layout_first_render_locked();
             }
             home_layout::Config latest;
-            if (home_layout::query_config(latest)) {
+            if (home_layout::query_config(latest, !resume_sync)) {
                 sync_title_config(latest);
                 if (latest.grid_enabled && located && located->x != 0 && located->y != 0
                     && std::find(order.begin(), order.end(), size_t{0}) == order.end()) {
@@ -5835,6 +5834,7 @@ void *worker(void *) {
                 (void) sync_dock_titles(config.dock_show_title);
                 (void) knobs_changed;
             }
+            resume_sync = false;
             any_knob = sync_requested();
             if(g_scale_bind_retry.due(monotonic_ms())) {
                 (void) bind_title_color();

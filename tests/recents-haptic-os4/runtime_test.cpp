@@ -21,11 +21,13 @@ std::mutex capture_mutex;std::condition_variable capture_changed;
 struct Packet {int operation;int64_t time;int count;bool extended;};
 std::vector<Packet> packets;
 bool scroll=true,closing=true,v1=false,local=false,available=true,performed=true;
+uint64_t observer_revision=0;
 template<class T> void put(AParcel* p,T value){auto offset=p->bytes.size();p->bytes.resize(offset+sizeof(value));std::memcpy(p->bytes.data()+offset,&value,sizeof(value));}
 template<class T> T get(const AParcel* p){auto* writable=const_cast<AParcel*>(p);assert(writable->position+sizeof(T)<=p->bytes.size());T value;std::memcpy(&value,p->bytes.data()+writable->position,sizeof(T));writable->position+=sizeof(T);return value;}
 void wait_worker(){for(unsigned i=0;i<2000;++i){if(scroll?__atomic_load_n(&hc_recents_haptic_gate,__ATOMIC_ACQUIRE):hc_recents_close_haptic_active())return;std::this_thread::sleep_for(std::chrono::milliseconds(1));}assert(false);}
 }
 namespace home_layout {
+uint64_t config_observer_revision(){return observer_revision;}
 bool local_haptic_profile(haptic::Profile& value){
     if(!local)return false;
     value={available,scroll,closing,3,70};return true;
@@ -68,6 +70,25 @@ binder_status_t AIBinder_transact(AIBinder*,transaction_code_t code,AParcel** in
 }
 int main(int argc,char** argv){
     assert(argc==2);std::string scenario=argv[1];local=scenario.starts_with("local");available=scenario!="local-unavailable";performed=scenario!="local-failure";v1=scenario=="v1";scroll=scenario!="close"&&scenario!="off";closing=!v1&&scenario!="scroll"&&scenario!="off"&&scenario!="local-scroll";
+    if(scenario=="observer") {
+        observer_revision=1;
+        hc_recents_haptic_refresh();
+        assert(packets.size()==1&&hc_recents_haptic_scroll_enabled()&&hc_recents_close_haptic_enabled());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        hc_recents_haptic_refresh();
+        assert(packets.size()==1);
+        observer_revision=2;scroll=closing=false;
+        hc_recents_haptic_refresh();
+        assert(packets.size()==2&&!hc_recents_haptic_scroll_enabled()&&!hc_recents_close_haptic_enabled());
+        scroll=true;
+        hc_recents_haptic_refresh(true);
+        assert(packets.size()==3&&hc_recents_haptic_scroll_enabled());
+        observer_revision=0;
+        hc_recents_haptic_refresh();
+        assert(packets.size()==4);
+        std::cout<<"native haptic observer PASS initial sync, idle, changed, resume and fallback\n";
+        return 0;
+    }
     if(!available)scroll=closing=false;
     if(scenario=="local-close")scroll=false;
     hc_recents_haptic_refresh();hc_recents_haptic_ready(true);hc_recents_close_haptic_ready(true);
