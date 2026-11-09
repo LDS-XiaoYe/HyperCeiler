@@ -56,15 +56,16 @@ inline void emit(const char* hook,const char* feature,const char* type,const cha
         __android_log_write(ANDROID_LOG_INFO,"HyperCeiler.HookDiagnostics",out.c_str());
     }catch(...){}
 }
-inline void counter(const char* id,const char* feature,uint64_t hits,uint64_t applied=0) noexcept {
+inline void counter(const char* id,const char* feature,uint64_t hits,uint64_t applied=0,
+    const char* type="NATIVE_INLINE",const char* generation="counter") noexcept {
     try {
         struct Seen {const char* id=nullptr;uint8_t flags=0;};
         static thread_local std::array<Seen,32> seen{};
         auto* record=seen.data();
         for(;record!=seen.data()+seen.size();++record)if(!record->id||!std::strcmp(record->id,id))break;
         if(record==seen.data()+seen.size())return;record->id=id;
-        if(hits&&!(record->flags&1)){record->flags|=1;emit(id,feature,"NATIVE_INLINE","EXECUTED","COUNTER","EXECUTED","counter","Existing runtime hit counter is nonzero; final effect unverified");}
-        if(applied&&!(record->flags&2)){record->flags|=2;emit(id,feature,"NATIVE_INLINE","APPLIED","COUNTER","INTERNAL_APPLIED","counter","Existing applied counter is nonzero; user-visible effect still requires separate verification");}
+        if(hits&&!(record->flags&1)){record->flags|=1;emit(id,feature,type,"EXECUTED","COUNTER","EXECUTED",generation,"Existing runtime hit counter is nonzero; final effect unverified");}
+        if(applied&&!(record->flags&2)){record->flags|=2;emit(id,feature,type,"APPLIED","COUNTER","INTERNAL_APPLIED",generation,"Existing applied counter is nonzero; user-visible effect still requires separate verification");}
     }catch(...){}
 }
 inline void bank(const char* bank,size_t slot,const DiagnosticEvent& event,const char* feature=nullptr){

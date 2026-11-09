@@ -1225,6 +1225,10 @@
     <string name="home_layout_home_title">Home screen</string>
     <string name="home_layout_indicator_title">Desktop search</string>
     <string name="home_layout_indicator_margin_bottom_desc">Adjust the distance between desktop search and the bottom of the screen.</string>
+    <string name="home_layout_xiaoheizi_title">Xiaoheizi mode</string>
+    <string name="home_layout_xiaoheizi_desc">When you return to the Home screen, a basketball-headed character dribbles across the Ask XiaoAi capsule. Its outline bounces with the ball before the character dances on the right.</string>
+    <string name="home_layout_xiaoheizi_rage_title">Xiaoheizi rage mode</string>
+    <string name="home_layout_xiaoheizi_rage_desc">Continuously dance and move across the Home screen in a row</string>
     <string name="home_layout_hotseats_title">Dock icons</string>
     <string name="home_layout_searchbar_title">Search bar</string>
     <string name="home_layout_searchbar_os4_hint">On OS4, adjust the search capsule under Layout → Desktop search.</string>

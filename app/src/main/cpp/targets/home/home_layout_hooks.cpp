@@ -20,6 +20,10 @@ extern "C" void hc_home_diagnostic_sample();
 #include "home_indicator_feature_resolver.h"
 #include "home_widget_move_feature_resolver.h"
 #include "home_recent_render.h"
+#include "home_recent_cards_runtime.h"
+#include "home_native_context.h"
+#include "home_native_provider.h"
+#include "home_local_config_channel.h"
 #include "home_prestart_feature_resolver.h"
 #include "home_prestart_policy.h"
 #include "home_drawer_feature_resolver.h"
@@ -5322,6 +5326,9 @@ void *worker(void *) {
         delay_ms(100);
     }
     hc_recents_haptic_refresh();
+    hc_native_context_refresh();
+    hc_native_provider_refresh();
+    hc_recent_cards_refresh();
     if (queried) {
         sync_title_config(config);
         if(!config.dock_show_title)(void)sync_dock_titles(false);
@@ -5680,6 +5687,16 @@ void *worker(void *) {
         if (interval_due(last_panel_query, now, kPanelQueryIntervalMs)) {
             last_panel_query = now;
             if (!layout_panel_refresh_and_check()) {
+                if(home_local_config::requested()) {
+                    // The local execution lease is three seconds. Keep its
+                    // socket publication alive without walking hooks or
+                    // querying WMS configuration while home is covered.
+                    home_layout::Config background;
+                    (void)home_layout::query_config(background);
+                    hc_native_provider_refresh();
+                    delay_ms(1000);
+                    continue;
+                }
                 /*
                  * A shorter doze pause than the dock's 30 s. The dock maintains a hook chain that
                  * only matters while a gesture is running, while this one owns on-screen geometry: a
@@ -5699,6 +5716,9 @@ void *worker(void *) {
         struct PassLease {~PassLease(){g_loader_priming.clear(std::memory_order_release);}} pass_lease;
         ++iterations;
         hc_recents_haptic_refresh();
+        hc_native_context_refresh();
+        hc_native_provider_refresh();
+        hc_recent_cards_refresh();
         /*
          * Probe readout: the passthrough stub records every call into these globals, and this is
          * where they get printed. The caller is reported as an image-relative address so it can be

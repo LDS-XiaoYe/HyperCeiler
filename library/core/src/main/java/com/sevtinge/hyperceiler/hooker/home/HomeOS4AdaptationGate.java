@@ -56,6 +56,7 @@ public final class HomeOS4AdaptationGate {
 
     public static void apply(PreferenceGroup screen, int xml) {
         if (!isHyperOSVersion(4f)) return;
+        HomeOS4FrameworkLabel.apply(screen);
         if (xml == R.xml.home_title_new) {
             disableLeaves(screen, ADAPTED_TITLE_KEYS);
         } else if (xml == R.xml.home_recent) {

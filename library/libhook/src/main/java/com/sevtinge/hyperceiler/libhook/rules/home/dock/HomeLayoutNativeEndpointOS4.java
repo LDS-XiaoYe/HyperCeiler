@@ -152,7 +152,8 @@ public final class HomeLayoutNativeEndpointOS4 {
         final String segment = path.substring(slash + 1);
         final String key = segment.startsWith("prefs_key_")
             ? segment.substring("prefs_key_".length()) : segment;
-        if (HomeLayoutPrefsSnapshot.DISMISS_KEY.equals(key)
+        if (HomeLayoutPrefsSnapshot.XIAOHEIZI_KEY.equals(key)
+            || HomeLayoutPrefsSnapshot.DISMISS_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.RECENT_ICON_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.RECENT_TEXT_KEY.equals(key)
             || HomeLayoutPrefsSnapshot.INFINITE_KEY.equals(key)
@@ -427,68 +428,97 @@ public final class HomeLayoutNativeEndpointOS4 {
         FrameworkHookGate.Fingerprint framework) { }
 
     private static ProviderSnapshot queryProviderSnapshot() {
-        final android.content.Context context =
+        return queryProviderSnapshot(
             com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
-                com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID);
+                com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID));
+    }
+
+    public record LocalSnapshot(Snapshot layout, int[] gestures) { }
+
+    /** A launcher-owned query, with no WMS worker or cross-process cache publication. */
+    public static LocalSnapshot readLocalSnapshot(android.content.Context context) {
+        final ProviderSnapshot source = queryProviderSnapshot(context);
+        if (source == null) return null;
+        final Snapshot layout = decodeLayout(source.values());
+        if (!validCombinedLayout(layout)) return null;
+        return new LocalSnapshot(layout, gestureConfig(source.values(), context));
+    }
+
+    private static ProviderSnapshot queryProviderSnapshot(android.content.Context context) {
         if (context == null) return null;
+        try (final android.database.Cursor cursor = context.getContentResolver().query(android.net.Uri.parse(
+                "content://" + PREFS_AUTHORITY + "/home_layout"), null, null, null, null)) {
+            return decodeProviderSnapshot(cursor);
+        } catch (RuntimeException | Error unavailable) { return null; }
+    }
+
+    /** Root file publisher reuses the exact Provider decoder without impersonating a Context. */
+    public static LocalSnapshot readLocalSnapshot(android.content.Context context, android.database.Cursor cursor) {
+        try {
+            final ProviderSnapshot source = decodeProviderSnapshot(cursor);
+            if (source == null) return null;
+            final Snapshot layout = decodeLayout(source.values());
+            if (!validCombinedLayout(layout)) return null;
+            return new LocalSnapshot(layout, gestureConfig(source.values(), context));
+        } catch (RuntimeException | Error unavailable) { return null; }
+    }
+
+    private static ProviderSnapshot decodeProviderSnapshot(android.database.Cursor cursor) {
         final java.util.Map<String, Object> values = new java.util.HashMap<>();
         final java.util.Map<String, String> frameworkText = new java.util.HashMap<>();
         long frameworkVersionCode = Long.MIN_VALUE;
-        try {
-            final android.content.ContentResolver resolver = context.getContentResolver();
-            if (resolver == null) return null;
-            try (final android.database.Cursor cursor = resolver.query(android.net.Uri.parse(
-                    "content://" + PREFS_AUTHORITY + "/home_layout"), null, null, null, null)) {
-                // Older providers return an empty / one-column cursor for an unknown path.
-                // It must not erase a complete cache, especially while an APK is being replaced.
-                if (!isProviderSchema(cursor)) return null;
-                final android.os.Bundle extras = cursor.getExtras();
-                if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.DISMISS_VERSION, 0) == 1) {
-                    int dismiss = extras.getInt(HomeLayoutPrefsSnapshot.DISMISS_KEY, -1);
-                    if (dismiss == 0 || dismiss == 1) values.put(HomeLayoutPrefsSnapshot.DISMISS_KEY, dismiss);
-                }
-                if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.RECENTS_BAR_VERSION, 0) == 1) {
-                    int hidden = extras.getInt(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, -1);
-                    if (hidden == 0 || hidden == 1)
-                        values.put(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, hidden);
-                }
-                if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_VERSION, 0) == 1) {
-                    int margin = extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY, -1);
-                    int enabled = extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY + "_enable", -1);
-                    if (margin >= 0 && margin <= 100 && (enabled == 0 || enabled == 1)) {
-                        values.put(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY, margin);
-                        values.put(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY + "_enable", enabled);
-                    }
-                }
-                if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.INFINITE_VERSION, 0) == 1) {
-                    int infinite = extras.getInt(HomeLayoutPrefsSnapshot.INFINITE_KEY, -1);
-                    if (infinite == 0 || infinite == 1) values.put(HomeLayoutPrefsSnapshot.INFINITE_KEY, infinite);
-                }
-                if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.RECENT_HEADER_VERSION, 0) == 1) {
-                    int flags = extras.getInt(HomeLayoutPrefsSnapshot.RECENT_HEADER_FLAGS, -1);
-                    if (flags >= 0 && (flags & ~3) == 0) {
-                        values.put(HomeLayoutPrefsSnapshot.RECENT_ICON_KEY, flags & 1);
-                        values.put(HomeLayoutPrefsSnapshot.RECENT_TEXT_KEY, (flags >> 1) & 1);
-                    }
-                }
-                for (int index = 0; index < PREF_KEYS.length; ++index) {
-                    final String key = PREF_KEYS[index][1];
-                    final int column = index + 1;
-                    if (!key.equals(cursor.getColumnName(column))) return null;
-                    if (cursor.isNull(column)) continue;
-                    switch (PREF_KEYS[index][0]) {
-                        case "text" -> frameworkText.put(key, cursor.getString(column));
-                        case "stringset" -> {
-                            final String packet = cursor.getString(column);
-                            HomeLayoutPrefsSnapshot.decodeTitleRecords(packet);
-                            values.put(key, packet);
-                        }
-                        case "long" -> frameworkVersionCode = cursor.getLong(column);
-                        default -> values.put(key, cursor.getInt(column));
-                    }
-                }
+        // Older providers return an empty / one-column cursor for an unknown path.
+        // It must not erase a complete cache, especially while an APK is being replaced.
+        if (!isProviderSchema(cursor)) return null;
+        final android.os.Bundle extras = cursor.getExtras();
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.XIAOHEIZI_VERSION, 0) == 1) {
+            int enabled = extras.getInt(HomeLayoutPrefsSnapshot.XIAOHEIZI_KEY, -1);
+            if (enabled == 0 || enabled == 1) values.put(HomeLayoutPrefsSnapshot.XIAOHEIZI_KEY, enabled);
+        }
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.DISMISS_VERSION, 0) == 1) {
+            int dismiss = extras.getInt(HomeLayoutPrefsSnapshot.DISMISS_KEY, -1);
+            if (dismiss == 0 || dismiss == 1) values.put(HomeLayoutPrefsSnapshot.DISMISS_KEY, dismiss);
+        }
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.RECENTS_BAR_VERSION, 0) == 1) {
+            int hidden = extras.getInt(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, -1);
+            if (hidden == 0 || hidden == 1)
+                values.put(HomeLayoutPrefsSnapshot.RECENTS_BAR_KEY, hidden);
+        }
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_VERSION, 0) == 1) {
+            int margin = extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY, -1);
+            int enabled = extras.getInt(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY + "_enable", -1);
+            if (margin >= 0 && margin <= 100 && (enabled == 0 || enabled == 1)) {
+                values.put(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY, margin);
+                values.put(HomeLayoutPrefsSnapshot.DOCK_HORIZONTAL_KEY + "_enable", enabled);
             }
-        } catch (RuntimeException | Error unavailable) { return null; }
+        }
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.INFINITE_VERSION, 0) == 1) {
+            int infinite = extras.getInt(HomeLayoutPrefsSnapshot.INFINITE_KEY, -1);
+            if (infinite == 0 || infinite == 1) values.put(HomeLayoutPrefsSnapshot.INFINITE_KEY, infinite);
+        }
+        if (extras != null && extras.getInt(HomeLayoutPrefsSnapshot.RECENT_HEADER_VERSION, 0) == 1) {
+            int flags = extras.getInt(HomeLayoutPrefsSnapshot.RECENT_HEADER_FLAGS, -1);
+            if (flags >= 0 && (flags & ~3) == 0) {
+                values.put(HomeLayoutPrefsSnapshot.RECENT_ICON_KEY, flags & 1);
+                values.put(HomeLayoutPrefsSnapshot.RECENT_TEXT_KEY, (flags >> 1) & 1);
+            }
+        }
+        for (int index = 0; index < PREF_KEYS.length; ++index) {
+            final String key = PREF_KEYS[index][1];
+            final int column = index + 1;
+            if (!key.equals(cursor.getColumnName(column))) return null;
+            if (cursor.isNull(column)) continue;
+            switch (PREF_KEYS[index][0]) {
+                case "text" -> frameworkText.put(key, cursor.getString(column));
+                case "stringset" -> {
+                    final String packet = cursor.getString(column);
+                    HomeLayoutPrefsSnapshot.decodeTitleRecords(packet);
+                    values.put(key, packet);
+                }
+                case "long" -> frameworkVersionCode = cursor.getLong(column);
+                default -> values.put(key, cursor.getInt(column));
+            }
+        }
         return new ProviderSnapshot(java.util.Collections.unmodifiableMap(values),
             frameworkText.get("framework_check_reason"),
             new FrameworkHookGate.Fingerprint(frameworkText.get("framework_check_name"),
@@ -1144,15 +1174,18 @@ public final class HomeLayoutNativeEndpointOS4 {
 
     /** Uses one complete revision from the existing provider cache, without a second gesture poller. */
     public static int[] gestureConfig() {
-        final java.util.Map<String, Object> values = cachedValues;
+        return gestureConfig(cachedValues,
+            com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
+                com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID));
+    }
+
+    private static int[] gestureConfig(java.util.Map<String, Object> values, android.content.Context context) {
         int mask=0;
         String[] actions=com.sevtinge.hyperceiler.libhook.provider.HomeGesturePrefsSnapshot.ACTIONS;
         for(int i=0;i<com.sevtinge.hyperceiler.libhook.provider.HomeGesturePrefsSnapshot.NATIVE_ACTION_COUNT;i++) {
             int action=readInt(values,actions[i]+"_action",0);
             if(action>0 && action<=100)mask|=1<<i;
         }
-        final android.content.Context context=com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.getContextNoError(
-            com.sevtinge.hyperceiler.libhook.utils.api.ContextUtils.FlAG_ONLY_ANDROID);
         final android.util.DisplayMetrics dm=context!=null?context.getResources().getDisplayMetrics():null;
         return new int[]{readBoolean(values,"home_gesture_enable",false)?1:0,
             readBoolean(values,"home_navigation_quick_back",false)?1:0,mask,

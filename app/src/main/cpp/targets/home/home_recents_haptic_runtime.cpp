@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
 #include "home_recents_haptic_runtime.h"
 #include "home_recents_haptic_protocol.h"
+#include "home_layout_config.h"
+#include "home_local_config_channel.h"
 #include <android/log.h>
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
@@ -80,17 +82,22 @@ void* worker(void*){
         if(r.config!=config.load(std::memory_order_acquire)||!(r.config&(closing?8:1))||age<0||age>160
             ||!(closing?close_ready:ready).load(std::memory_order_acquire)){skipped.fetch_add(r.count,std::memory_order_relaxed);continue;}
         home_layout::haptic::Reply result;
-        const auto status=exchange(static_cast<int>(r.operation),r.time,r.count,result,(r.config&0x1000)!=0);
+        const bool local=(r.config&0x2000)!=0;
+        binder_status_t status=STATUS_OK;
+        if(local) {
+            result={true,(r.config&1)!=0,false,int((r.config>>1)&3),int((r.config>>4)&0x7f),(r.config&8)!=0};
+            result.performed=home_local_config::perform_haptic(uint32_t(r.config&0xfff),static_cast<int>(r.operation),r.time,r.count);
+        } else status=exchange(static_cast<int>(r.operation),r.time,r.count,result,(r.config&0x1000)!=0);
         const bool ok=status==STATUS_OK&&result.available&&(closing?result.close:result.enabled)&&result.performed;
         if(ok)done.fetch_add(r.count,std::memory_order_relaxed);else skipped.fetch_add(r.count,std::memory_order_relaxed);
         if(reports++<8)__android_log_print(ANDROID_LOG_INFO,"HyperCeiler.HomeLayout",
-            "recents card haptic event=%s delivered=%d cards=%u type=%d strength=%d status=%d; native-only WMS path, no launcher JVM required",
-            closing?"close":"scroll",ok,r.count,result.type,result.strength,status);
+            "recents card haptic event=%s delivered=%d cards=%u type=%d strength=%d status=%d source=%s; no launcher JVM required",
+            closing?"close":"scroll",ok,r.count,result.type,result.strength,status,local?"local-channel":"WMS");
     }
     worker_alive.store(false,std::memory_order_release);publish();return nullptr;
 }
-void configure(bool enabled,int type,int strength,bool close_enabled=false,bool extended=false){
-    const uint64_t values=(enabled?1u:0u)|(unsigned(type)<<1)|(unsigned(strength)<<4)|(close_enabled?8u:0u)|(extended?0x1000u:0u);
+void configure(bool enabled,int type,int strength,bool close_enabled=false,bool extended=false,bool local=false){
+    const uint64_t values=(enabled?1u:0u)|(unsigned(type)<<1)|(unsigned(strength)<<4)|(close_enabled?8u:0u)|(extended?0x1000u:0u)|(local?0x2000u:0u);
     const auto old=config.load(std::memory_order_acquire);if((old&0xffff)==values)return;
     if((enabled||close_enabled)&&output<0){
         int fds[2];if(pipe2(fds,O_CLOEXEC)!=0)return;
@@ -102,10 +109,15 @@ void configure(bool enabled,int type,int strength,bool close_enabled=false,bool 
     }
     config.store((((old>>16)+1)<<16)|values,std::memory_order_release);
     changed.store(true,std::memory_order_release);publish();
-    __android_log_print(ANDROID_LOG_INFO,"HyperCeiler.HomeLayout","recents card haptic config enabled=%d close=%d type=%d strength=%d source=physical-provider-via-WMS",enabled,close_enabled,type,strength);
+    __android_log_print(ANDROID_LOG_INFO,"HyperCeiler.HomeLayout","recents card haptic config enabled=%d close=%d type=%d strength=%d source=%s",enabled,close_enabled,type,strength,local?"local-snapshot":"physical-provider-via-WMS");
 }
 }
 void hc_recents_haptic_refresh(){
+    home_layout::haptic::Profile local;
+    if(home_layout::local_haptic_profile(local)||home_local_config::requested()) {
+        configure(local.available&&local.enabled,local.type,local.strength,local.available&&local.close,true,true);
+        return;
+    }
     // Owned by the existing layout worker/lease. No new polling thread and no
     // framework-layout protocol migration. Old servers disable only this feature.
     static int64_t next=0,v2_retry=0;static bool reported=false;

@@ -16,8 +16,8 @@ with tempfile.TemporaryDirectory(prefix='hc-independent-scale-') as temp:
 
 # Compile the production endpoint and complete provider against the existing host Android stubs.
 with tempfile.TemporaryDirectory(prefix='hc-scale-endpoint-') as temp:
-    sources=list((root/'tests/home-layout-native/stubs').rglob('*.java'))
-    sources+=list((root/'tests/home-dock-window/stubs').rglob('*.java'))
+    sources=[p for p in (root/'tests/home-layout-native/stubs').rglob('*.java') if p.name!='ModuleLog.java']
+    sources+=[p for p in (root/'tests/home-dock-window/stubs').rglob('*.java') if p.name!='ModuleLog.java']
     lib=root/'library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook'
     sources += [lib/'provider/HomeLayoutPrefsSnapshot.java',lib/'provider/HomeGesturePrefsSnapshot.java',
         lib/'base/FrameworkHookGate.java',

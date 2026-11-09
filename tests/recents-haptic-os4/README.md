@@ -92,3 +92,29 @@ queue field remained 0 on scroll requests, but now meant query, so WMS rejected
 query/count 1 and no vibration was delivered. The private request now uses a
 typed Scroll/Close enum and defaults to Scroll; arbitrary integer 0 cannot be
 supplied as feedback. Android hardware waveform perception still needs a phone.
+
+The runtime test also covers the opt-in local helper backend for scroll-only,
+close-only, both enabled, unavailable and failed playback. Local ownership
+remains authoritative even if the debug property changes; the fixture fails
+if any WMS lookup occurs. The actual nonblocking callback queue, worker, profile
+checks and delivery/drop counters run unchanged.
+
+The optional launcher playback backend uses the authenticated root configuration
+channel with `debug.hyperceiler.home_haptic_backend=launcher`. The helper checks
+the current physical profile and screen state, then serializes the platform
+waveform in memory. The launcher submits the bytes with its own Binder token.
+A prepared request and a legacy play request use separate wire commands, and a
+failed prepared request is never replayed through the legacy player.
+
+The SDK dispatch probe takes a read-only copy of the device's
+`libhyper_os_aidl.dylib.so`. Build it with C++20 and the app native include
+directory, then pass the library path as its only argument. The Android probe
+additionally links Binder NDK and calls the dynamically resolved read-only
+vibrator inventory operation. It does not play a vibration.
+
+The `launcher-cached` experiment reuses a successfully submitted waveform
+within the same authenticated configuration revision, profile and pulse count.
+A cache miss uses the prepared playback path. On a hit, two read-only system
+queries verify interactivity and keyguard state on the action worker. The live
+SDK proxy instructions supply both transaction numbers. A known blocked state
+drops the event, and an unavailable query leaves the decision to the helper.
