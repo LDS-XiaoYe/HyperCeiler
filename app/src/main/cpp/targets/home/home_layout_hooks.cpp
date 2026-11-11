@@ -472,6 +472,16 @@ constexpr uint64_t kPassIntervalMs = 500;
 constexpr uint64_t kPanelQueryIntervalMs = 1000;
 constexpr uint64_t kDozingIterationMs = 10000;
 constexpr uint64_t kGenerationCheckMs = 30000;
+/*
+ * Repair retry cadence after an unhealthy bank. A refused patch (observed: one intermittent
+ * kernel mprotect refusal on the recents haptic slot) used to quit this worker, and nothing
+ * restarted it, so every still-armed patch lost its maintenance while the environment keeps
+ * reclaiming patched pages. The retries reuse the existing repair path on this same thread and
+ * stop at the generation-check ceiling; the desktop-drawable gate ahead of them still skips
+ * the whole pass while home is covered, so a stopped bank costs nothing while dozing.
+ */
+constexpr uint64_t kRepairRetryFirstMs = 500;
+constexpr uint64_t kRepairRetryCeilingMs = kGenerationCheckMs;
 constexpr uint32_t kDartPrologue = 0xA9BF79FDu;
 /* Slots: 0/1 the Rust grid handlers, 2/3 the two Dart object captures, then one per hook knob. */
 constexpr size_t kConfigCaptureSlot = 2;
@@ -5674,6 +5684,8 @@ void *worker(void *) {
      */
     uint64_t last_panel_query = 0;
     uint64_t last_generation_check = 0;
+    /* Backoff between repair attempts once the bank went unhealthy; 0 = retry on the next pass. */
+    uint64_t repair_retry_delay = 0;
     bool resume_sync = false;
     for (;;) {
         const uint64_t now = monotonic_ms();
@@ -6092,6 +6104,7 @@ void *worker(void *) {
             if (nhk::ensure_slots_live(g_slots, slot_host(), order) && bank_live(order)) {
                 live = true;
                 publish_hooks();
+                repair_retry_delay = 0;
                 __android_log_print(ANDROID_LOG_INFO, kTag, "layout hook bank re-armed");
             }
         }
@@ -6102,9 +6115,20 @@ void *worker(void *) {
             g_ready.store(false, std::memory_order_release);
             g_dart_ready.store(false, std::memory_order_release);
             g_captures_armed = false;
+            /*
+             * Stay on this worker and retry with backoff instead of quitting: an intermittent
+             * kernel refusal (one slot's mprotect) once killed the only thread that maintains
+             * patches, and with the environment reclaiming patched pages every still-armed
+             * feature then decayed until the launcher was restarted. The retry cadence is
+             * 0/500ms/2s/10s, capped at 30s; each retry reuses exactly this repair path, and
+             * the dozing gate above still skips it entirely while home is not drawable.
+             */
             __android_log_print(ANDROID_LOG_ERROR, kTag,
-                "layout hook bank unhealthy; stopped overriding");
-            return attempt_finished();
+                "layout hook bank unhealthy; stopped overriding; repair retry in %llu ms",
+                static_cast<unsigned long long>(repair_retry_delay));
+            delay_ms(static_cast<long>(repair_retry_delay));
+            repair_retry_delay = repair_retry_delay == 0 ? kRepairRetryFirstMs
+                : std::min(repair_retry_delay * 4, kRepairRetryCeilingMs);
         }
     }
 }
